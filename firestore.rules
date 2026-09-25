@@ -1,0 +1,121 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper to check if request is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Root shops metadata
+    match /shops/{shopId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+
+      // Nested users subcollection
+      match /users/{userId} {
+        allow read, write: if true;
+      }
+
+      // Brands subcollection
+      match /brands/{brandId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.createdBy.userId != null
+          && request.resource.data.createdAt != null;
+        allow update: if request.resource.data.shopId == shopId;
+        allow delete: if true;
+      }
+
+      // Suppliers subcollection
+      match /suppliers/{supplierId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.createdBy.userId != null
+          && request.resource.data.createdAt != null;
+        allow update: if request.resource.data.shopId == shopId;
+        allow delete: if true;
+      }
+
+      // Categories subcollection (Level 1)
+      match /categories/{categoryId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.createdBy.userId != null
+          && request.resource.data.createdAt != null;
+        allow update: if request.resource.data.shopId == shopId;
+        allow delete: if true;
+      }
+
+      // Subcategories subcollection (Level 2)
+      match /subcategories/{subcategoryId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.categoryId != null
+          && request.resource.data.createdBy.userId != null
+          && request.resource.data.createdAt != null;
+        allow update: if request.resource.data.shopId == shopId;
+        allow delete: if true;
+      }
+
+      // Products subcollection (Level 3)
+      match /products/{productId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.subcategoryId != null
+          && request.resource.data.createdBy.userId != null
+          && request.resource.data.createdAt != null;
+        allow update: if request.resource.data.shopId == shopId;
+        allow delete: if true;
+      }
+
+      // Product Images metadata
+      match /product_images/{imageId} {
+        allow read: if true;
+        allow create, update: if request.resource.data.shopId == shopId;
+        allow delete: if true;
+      }
+
+      // Barcode print traceability logs
+      match /barcode_logs/{logId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.printedBy.userId != null
+          && request.resource.data.createdAt != null;
+        allow update, delete: if false; // Immutable audit trail
+      }
+
+      // Stock transactions immutable audit trail
+      match /stock_transactions/{txId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.performedBy.userId != null
+          && request.resource.data.createdAt != null;
+        allow update, delete: if false; // Immutable audit trail
+      }
+
+      // Sales subcollection (Mirror)
+      match /sales/{saleId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.saleId != null
+          && request.resource.data.items != null;
+        allow update, delete: if false; // Immutable invoice records
+      }
+    }
+
+    // Root Sales collection (Multi-tenant isolated by shopId)
+    match /sales/{saleId} {
+      allow read: if true;
+      allow create: if request.resource.data.shopId != null
+        && request.resource.data.saleId != null
+        && request.resource.data.items != null;
+      allow update, delete: if false; // Immutable invoice audit records
+    }
+
+    // Default fallback
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

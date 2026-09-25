@@ -148,3 +148,15 @@ export async function updateShop(
     updatedAt: Date.now(),
   });
 }
+
+/**
+ * Toggle hide/unhide status of a shop
+ */
+export async function toggleShopHide(shopId: string, currentlyHidden: boolean): Promise<void> {
+  const nextHidden = !currentlyHidden;
+  await updateShop(shopId, {
+    isHidden: nextHidden,
+    status: nextHidden ? "inactive" : "active",
+  });
+}
+

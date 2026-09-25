@@ -7,26 +7,45 @@
 export type UserRole = "admin" | "manager" | "cashier";
 
 export interface ShopUser {
-  uid: string;             // Firebase Auth UID
-  email: string;           // User login email
-  displayName: string;     // Full name
+  uid: string;             // Unique user ID
+  username: string;        // Unique username per shop (e.g. "admin", "cashier1")
+  displayName?: string;    // Optional full name / display name (falls back to username)
+  email?: string;          // Optional user login email
+  password?: string;       // Plain text password
+  passwordHash?: string;   // SHA-256 password hash
   phone?: string;          // Contact number
   role: UserRole;          // User role
   shopId: string;          // Assigned to exactly one Shop ID
   shopName?: string;       // Cached shop name for quick display
+  branchId?: string;       // Optional branch assignment for multi-branch shops
+  branchName?: string;     // Optional branch display name
+  permissions?: string[];  // Extensible permissions array
   status: "active" | "suspended" | "pending";
   createdAt: number;       // Unix timestamp in ms
   updatedAt?: number;      // Unix timestamp in ms
 }
 
 export interface CreateUserInput {
-  email: string;
-  password?: string;
-  displayName: string;
-  phone?: string;
-  role: UserRole;
   shopId: string;
+  username: string;        // Required username
+  password?: string;       // Optional password
+  displayName?: string;    // Optional display name
+  email?: string;          // Optional email
+  phone?: string;          // Optional phone
+  role: UserRole;          // User role
+  branchId?: string;
+  branchName?: string;
+  permissions?: string[];
 }
+
+export interface ShopSession {
+  shopId: string;
+  shopName: string;
+  user: ShopUser;
+  token?: string;
+  loginTime: number;
+}
+
 
 export const ROLE_CONFIG: Record<
   UserRole,

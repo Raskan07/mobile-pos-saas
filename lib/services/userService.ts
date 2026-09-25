@@ -26,37 +26,38 @@ import { createUserWithEmailAndPassword } from "firebase/auth";
 import { db, getSecondaryAuth } from "../firebase";
 import { ShopUser, CreateUserInput } from "../types/user";
 
+import { hashPassword } from "./shopAuthService";
+
 const USERS_COLLECTION = "users";
 const SHOPS_COLLECTION = "shops";
 
 /**
- * Create a staff user with Firebase Auth & assign strictly to one shop
+ * Create a staff user with password & assign strictly to one shop
  */
 export async function createUserAndAssignToShop(
   input: CreateUserInput,
   password?: string
 ): Promise<ShopUser> {
   const normalizedShopId = input.shopId.trim().toUpperCase();
-  const normalizedEmail = input.email.trim().toLowerCase();
+  const username = input.username?.trim().toLowerCase() || "user";
+  const normalizedEmail = input.email?.trim().toLowerCase() || `${username}@${normalizedShopId.toLowerCase().replace(/[^a-z0-9]/g, "")}.pos`;
+  const rawPassword = (password || input.password || "shop123456").trim();
+  const pwdHash = await hashPassword(rawPassword);
 
   let authUid = "";
 
-  // 1. Create Firebase Auth account if password provided
-  if (password) {
+  // 1. Try Firebase Auth (if enabled), else use stable ID
+  if (rawPassword) {
     try {
       const secondaryAuth = getSecondaryAuth();
       const userCredential = await createUserWithEmailAndPassword(
         secondaryAuth,
         normalizedEmail,
-        password
+        rawPassword
       );
       authUid = userCredential.user.uid;
     } catch (authError: any) {
-      console.warn("Secondary Auth notice:", authError);
-      if (authError.code === "auth/email-already-in-use") {
-        throw new Error("This email is already registered in Firebase Authentication.");
-      }
-      // If client auth creation restricted by Firebase config or network, generate stable doc ID
+      // Ignored if auth/operation-not-allowed or email already in use
       authUid = `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     }
   } else {
@@ -75,22 +76,37 @@ export async function createUserAndAssignToShop(
   }
 
   const now = Date.now();
+  const displayName = input.displayName?.trim() || username;
   const userData: ShopUser = {
     uid: authUid,
+    username,
+    displayName,
     email: normalizedEmail,
-    displayName: input.displayName.trim(),
+    password: rawPassword,
+    passwordHash: pwdHash,
     phone: input.phone?.trim() || "",
     role: input.role,
     shopId: normalizedShopId,
     shopName,
+    branchId: input.branchId || "main",
+    branchName: input.branchName || "Main Branch",
+    permissions: input.permissions || [input.role],
     status: "active",
     createdAt: now,
     updatedAt: now,
   };
 
-  // 3. Save to Firestore `users` collection
+  // 3a. Save to Firestore `users` collection (for global / superadmin lookup)
   const userDocRef = doc(db, USERS_COLLECTION, authUid);
   await setDoc(userDocRef, userData);
+
+  // 3b. Save nested under `shops/{shopId}/users/{authUid}` (for shop-scoped multi-tenancy)
+  try {
+    const nestedUserDocRef = doc(db, SHOPS_COLLECTION, normalizedShopId, "users", authUid);
+    await setDoc(nestedUserDocRef, userData);
+  } catch (err) {
+    console.warn("Could not write to nested shop users collection:", err);
+  }
 
   // 4. Increment staff count on the shop
   try {

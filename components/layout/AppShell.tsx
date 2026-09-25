@@ -67,7 +67,9 @@ export function AppShell({ children, defaultSectionId }: AppShellProps) {
         <SecondarySidebar section={activeSection} isOpen={isSecondaryOpen} />
 
         {/* Main content */}
-        <main className="flex-1 flex flex-col overflow-hidden min-w-0 relative">
+        <main
+          className="flex-1 flex flex-col overflow-hidden min-w-0 relative w-full h-full transition-[width,padding,margin] duration-250 ease-[cubic-bezier(0.16,1,0.3,1)]"
+        >
           {children}
         </main>
       </div>

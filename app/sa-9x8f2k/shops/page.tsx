@@ -22,9 +22,12 @@ import { AddShopModal } from "@/components/shops/AddShopModal";
 import { AssignUserModal } from "@/components/shops/AssignUserModal";
 import { ShopStaffDrawer } from "@/components/shops/ShopStaffDrawer";
 
+import { useLoading } from "@/lib/context/LoadingContext";
+
 export default function ShopsPage() {
   const [shops, setShops] = useState<Shop[]>([]);
   const [activeTab, setActiveTab] = useState<"Default" | "Advanced">("Advanced");
+  const { showLoading, hideLoading } = useLoading();
 
   // Modals state
   const [isAddShopOpen, setIsAddShopOpen] = useState(false);
@@ -36,14 +39,25 @@ export default function ShopsPage() {
 
   // Subscribe to shops in real-time from Firestore
   useEffect(() => {
-    const unsubscribe = subscribeToShops((fetchedShops) => {
-      setShops(fetchedShops);
-      if (fetchedShops.length > 0 && !selectedShop) {
-        setSelectedShop(fetchedShops[0]);
+    showLoading();
+    const unsubscribe = subscribeToShops(
+      (fetchedShops) => {
+        setShops(fetchedShops);
+        if (fetchedShops.length > 0 && !selectedShop) {
+          setSelectedShop(fetchedShops[0]);
+        }
+        hideLoading();
+      },
+      (err) => {
+        console.error("Failed to load shops:", err);
+        hideLoading();
       }
-    });
+    );
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      hideLoading();
+    };
   }, []);
 
   // Listen to sidebar custom event "open-add-shop-modal"
@@ -251,6 +265,15 @@ export default function ShopsPage() {
                 <Plus className="w-3.5 h-3.5" />
               </div>
             </button>
+
+            {/* View All Shops Button */}
+            <a
+              href="/sa-9x8f2k/shops/list"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.09] border border-white/[0.08] text-zinc-300 hover:text-zinc-100 text-xs font-medium transition-all"
+            >
+              <Store className="w-3.5 h-3.5 text-orange-400" />
+              <span>All Shops</span>
+            </a>
 
             {/* Quick Staff Assignment Action (if shops exist) */}
             {shops.length > 0 && (

@@ -40,3 +40,14 @@ body {
   0%, 100% { opacity: 0.4; transform: scale(1) translate(0, 0); }
   50%       { opacity: 0.8; transform: scale(1.15) translate(6px, -8px); }
 }
+
+/* ── iOS-style Spinner Keyframes ── */
+@keyframes iosSpinnerBlade {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.15;
+  }
+}
+

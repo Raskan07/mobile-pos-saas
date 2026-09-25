@@ -51,6 +51,7 @@ export const NAV_CONFIG: NavSection[] = [
     icon: Store,
     subItems: [
       { label: "Overview", href: "/sa-9x8f2k/shops", icon: LayoutDashboard },
+      { label: "Shops", href: "/sa-9x8f2k/shops/list", icon: Store },
       { label: "Shop Map", href: "/sa-9x8f2k/map", icon: MapPin },
       { label: "Add Shop", href: "/sa-9x8f2k/shops?action=add-shop", icon: Plus, actionId: "add-shop" },
       { label: "Staff", href: "/sa-9x8f2k/staff", icon: Users },

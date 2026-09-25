@@ -14,6 +14,7 @@ import { usePathname, useRouter } from "next/navigation";
 import gsap from "gsap";
 import { NavSection, NavSubItem } from "./nav-config";
 import { ChevronRight } from "lucide-react";
+import { showGlobalLoading } from "@/lib/context/LoadingContext";
 
 interface SecondarySidebarProps {
   section: NavSection | null;
@@ -26,48 +27,24 @@ export function SecondarySidebar({ section, isOpen }: SecondarySidebarProps) {
   const pathname = usePathname();
   const router = useRouter();
 
-  // Slide panel in/out
+  // Stagger items when opened
   useEffect(() => {
-    const panel = panelRef.current;
-    if (!panel) return;
-
     if (isOpen && section) {
-      // Slide in
-      gsap.fromTo(
-        panel,
-        { x: -30, opacity: 0 },
-        {
-          x: 0,
-          opacity: 1,
-          duration: 0.32,
-          ease: "power3.out",
-          clearProps: "transform",
-        }
-      );
-
-      // Stagger sub-items in
       const items = itemsRef.current?.querySelectorAll("[data-nav-item]");
       if (items && items.length > 0) {
         gsap.fromTo(
           items,
-          { x: -14, opacity: 0 },
+          { x: -12, opacity: 0 },
           {
             x: 0,
             opacity: 1,
-            duration: 0.28,
+            duration: 0.24,
             ease: "power2.out",
-            stagger: 0.045,
-            delay: 0.06,
+            stagger: 0.035,
+            delay: 0.05,
           }
         );
       }
-    } else if (!isOpen) {
-      gsap.to(panel, {
-        x: -20,
-        opacity: 0,
-        duration: 0.2,
-        ease: "power2.in",
-      });
     }
   }, [isOpen, section]);
 
@@ -76,42 +53,58 @@ export function SecondarySidebar({ section, isOpen }: SecondarySidebarProps) {
       e.preventDefault();
       window.dispatchEvent(new CustomEvent("open-add-shop-modal"));
       if (!pathname.includes("/sa-9x8f2k/shops")) {
+        showGlobalLoading();
         router.push("/sa-9x8f2k/shops");
       }
+      return;
+    }
+
+    if (pathname !== item.href) {
+      showGlobalLoading();
     }
   };
+
+  const isVisible = Boolean(isOpen && section);
 
   return (
     <div
       ref={panelRef}
-      className="flex-shrink-0 w-[220px] h-full flex flex-col relative z-10 overflow-hidden"
+      className="flex-shrink-0 h-full flex flex-col relative z-10 overflow-hidden"
       style={{
-        opacity: isOpen ? undefined : 0,
-        pointerEvents: isOpen ? "auto" : "none",
+        width: isVisible ? "220px" : "0px",
+        opacity: isVisible ? 1 : 0,
+        pointerEvents: isVisible ? "auto" : "none",
+        borderRight: isVisible
+          ? "1px solid rgba(255,255,255,0.08)"
+          : "1px solid transparent",
         background: "rgba(10, 9, 18, 0.45)",
         backdropFilter: "blur(32px) saturate(200%) brightness(1.05)",
         WebkitBackdropFilter: "blur(32px) saturate(200%) brightness(1.05)",
-        borderRight: "1px solid rgba(255,255,255,0.08)",
-        boxShadow:
-          "inset -1px 0 0 rgba(255,255,255,0.04), 6px 0 40px rgba(0,0,0,0.5), inset 1px 0 0 rgba(255,255,255,0.02)",
+        boxShadow: isVisible
+          ? "inset -1px 0 0 rgba(255,255,255,0.04), 6px 0 40px rgba(0,0,0,0.5), inset 1px 0 0 rgba(255,255,255,0.02)"
+          : "none",
+        transition:
+          "width 250ms cubic-bezier(0.16, 1, 0.3, 1), opacity 200ms ease, border-color 200ms ease",
       }}
     >
-      {/* Ambient glows */}
-      <div
-        aria-hidden="true"
-        style={{
-          position: "absolute",
-          top: "-60px",
-          right: "-40px",
-          width: "180px",
-          height: "180px",
-          borderRadius: "50%",
-          background:
-            "radial-gradient(circle, rgba(249,115,22,0.15) 0%, rgba(217,119,6,0.08) 40%, transparent 70%)",
-          filter: "blur(24px)",
-          pointerEvents: "none",
-        }}
-      />
+      {/* Inner fixed-width container prevents text reflow during width collapse */}
+      <div className="w-[220px] h-full flex flex-col relative overflow-hidden flex-shrink-0">
+        {/* Ambient glows */}
+        <div
+          aria-hidden="true"
+          style={{
+            position: "absolute",
+            top: "-60px",
+            right: "-40px",
+            width: "180px",
+            height: "180px",
+            borderRadius: "50%",
+            background:
+              "radial-gradient(circle, rgba(249,115,22,0.15) 0%, rgba(217,119,6,0.08) 40%, transparent 70%)",
+            filter: "blur(24px)",
+            pointerEvents: "none",
+          }}
+        />
 
       {/* Section Header */}
       <div
@@ -152,7 +145,7 @@ export function SecondarySidebar({ section, isOpen }: SecondarySidebarProps) {
             (item.href !== "/sa-9x8f2k/shops" && pathname.startsWith(item.href));
 
           return (
-            <div key={item.href} data-nav-item className="relative">
+            <div key={`${item.label}-${item.href}`} data-nav-item className="relative">
               {isActive && (
                 <div
                   className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-r-full bg-orange-500"
@@ -198,5 +191,6 @@ export function SecondarySidebar({ section, isOpen }: SecondarySidebarProps) {
         })}
       </div>
     </div>
+  </div>
   );
 }

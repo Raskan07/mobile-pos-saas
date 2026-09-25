@@ -55,8 +55,9 @@ export default function StaffDirectoryPage() {
   const filteredUsers = users.filter((u) => {
     const q = searchQuery.toLowerCase();
     const matchesSearch =
-      u.displayName.toLowerCase().includes(q) ||
-      u.email.toLowerCase().includes(q) ||
+      (u.username && u.username.toLowerCase().includes(q)) ||
+      (u.displayName && u.displayName.toLowerCase().includes(q)) ||
+      (u.email && u.email.toLowerCase().includes(q)) ||
       u.shopId.toLowerCase().includes(q);
 
     const matchesShop =
@@ -231,8 +232,13 @@ export default function StaffDirectoryPage() {
                       className="hover:bg-white/[0.03] transition-colors group"
                     >
                       <td className="py-3.5 px-5">
-                        <div className="font-semibold text-zinc-200 group-hover:text-orange-200 transition-colors">
-                          {user.displayName}
+                        <div className="font-semibold text-zinc-200 group-hover:text-orange-200 transition-colors flex items-center gap-1.5">
+                          <span>{user.displayName || user.username}</span>
+                          {user.username && (
+                            <span className="text-[11px] font-mono text-orange-400/90 font-normal">
+                              @{user.username}
+                            </span>
+                          )}
                         </div>
                         <div className="text-[11px] text-zinc-400 flex items-center gap-1.5 mt-0.5">
                           <Mail className="w-3 h-3 text-zinc-500" />

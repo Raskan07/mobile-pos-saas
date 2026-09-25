@@ -15,6 +15,7 @@ export interface Shop {
   latitude?: number;       // Geolocation latitude
   longitude?: number;      // Geolocation longitude
   status: "active" | "inactive" | "pending";
+  isHidden?: boolean;      // Visibility status toggle (hidden vs visible)
   createdAt: number;       // Unix timestamp in ms
   updatedAt: number;       // Unix timestamp in ms
   staffCount?: number;     // Aggregated staff count

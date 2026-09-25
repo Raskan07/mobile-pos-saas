@@ -44,6 +44,7 @@ export function AssignUserModal({
   onUserAssigned,
 }: AssignUserModalProps) {
   const [selectedShopId, setSelectedShopId] = useState("");
+  const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -67,6 +68,7 @@ export function AssignUserModal({
       } else if (allShops.length > 0) {
         setSelectedShopId(allShops[0].shopId);
       }
+      setUsername("");
       setDisplayName("");
       setEmail("");
       setPassword("");
@@ -143,12 +145,12 @@ export function AssignUserModal({
       setErrorMessage("Please select a target shop to assign this user.");
       return;
     }
-    if (!displayName.trim() || !email.trim()) {
-      setErrorMessage("Please enter the user's full name and email.");
+    if (!username.trim()) {
+      setErrorMessage("Please enter a username for this staff member.");
       return;
     }
-    if (password && password.length < 6) {
-      setErrorMessage("Password should be at least 6 characters for Firebase Auth.");
+    if (!password || password.trim().length < 4) {
+      setErrorMessage("Please enter a password with at least 4 characters.");
       return;
     }
 
@@ -156,13 +158,15 @@ export function AssignUserModal({
     try {
       const user = await createUserAndAssignToShop(
         {
-          displayName,
-          email,
-          phone,
+          username: username.trim().toLowerCase(),
+          displayName: displayName.trim() || username.trim(),
+          email: email.trim(),
+          phone: phone.trim(),
           role,
           shopId: selectedShopId,
+          password: password.trim(),
         },
-        password || "shop123456" // Default temporary pass if none provided
+        password.trim()
       );
 
       setCreatedUser(user);
@@ -381,27 +385,77 @@ export function AssignUserModal({
               </p>
             </div>
 
-            {/* Name & Phone */}
+            {/* Username & Password */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-zinc-300 flex items-center gap-1">
                   <User className="w-3 h-3 text-zinc-400" />
-                  Full Name <span className="text-orange-400">*</span>
+                  Username <span className="text-orange-400">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="e.g. admin or cashier1"
+                  disabled={isSubmitting}
+                  required
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-black/40 border border-white/[0.08] focus:border-orange-500/60 text-zinc-100 text-xs font-mono placeholder:text-zinc-600"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-zinc-300 flex items-center gap-1">
+                  <Lock className="w-3 h-3 text-zinc-400" />
+                  Password <span className="text-orange-400">*</span>
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? "text" : "password"}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Min 4 chars"
+                    disabled={isSubmitting}
+                    required
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-black/40 border border-white/[0.08] focus:border-orange-500/60 text-zinc-100 text-xs placeholder:text-zinc-600 pr-9"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+                  >
+                    {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Display Name (Optional) & Phone */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-zinc-300 flex items-center justify-between">
+                  <span className="flex items-center gap-1">
+                    <User className="w-3 h-3 text-zinc-400" />
+                    Display Name
+                  </span>
+                  <span className="text-[10px] text-zinc-500 font-normal">Optional</span>
                 </label>
                 <input
                   type="text"
                   value={displayName}
                   onChange={(e) => setDisplayName(e.target.value)}
-                  placeholder="e.g. Sarah Connor"
+                  placeholder="e.g. Sarah Connor (defaults to username)"
                   disabled={isSubmitting}
                   className="w-full px-3.5 py-2.5 rounded-xl bg-black/40 border border-white/[0.08] focus:border-orange-500/60 text-zinc-100 text-xs placeholder:text-zinc-600"
                 />
               </div>
 
               <div className="space-y-1.5">
-                <label className="text-xs font-medium text-zinc-300 flex items-center gap-1">
-                  <Phone className="w-3 h-3 text-zinc-400" />
-                  Phone (Optional)
+                <label className="text-xs font-medium text-zinc-300 flex items-center justify-between">
+                  <span className="flex items-center gap-1">
+                    <Phone className="w-3 h-3 text-zinc-400" />
+                    Phone
+                  </span>
+                  <span className="text-[10px] text-zinc-500 font-normal">Optional</span>
                 </label>
                 <input
                   type="tel"
@@ -414,46 +468,23 @@ export function AssignUserModal({
               </div>
             </div>
 
-            {/* Email & Password for Firebase Auth */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-zinc-300 flex items-center gap-1">
+            {/* Email (Optional) */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-zinc-300 flex items-center justify-between">
+                <span className="flex items-center gap-1">
                   <Mail className="w-3 h-3 text-zinc-400" />
-                  Login Email <span className="text-orange-400">*</span>
-                </label>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="staff@store.com"
-                  disabled={isSubmitting}
-                  className="w-full px-3.5 py-2.5 rounded-xl bg-black/40 border border-white/[0.08] focus:border-orange-500/60 text-zinc-100 text-xs placeholder:text-zinc-600"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium text-zinc-300 flex items-center gap-1">
-                  <Lock className="w-3 h-3 text-zinc-400" />
-                  Password
-                </label>
-                <div className="relative">
-                  <input
-                    type={showPassword ? "text" : "password"}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Min 6 chars"
-                    disabled={isSubmitting}
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-black/40 border border-white/[0.08] focus:border-orange-500/60 text-zinc-100 text-xs placeholder:text-zinc-600 pr-9"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
-                  >
-                    {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                  </button>
-                </div>
-              </div>
+                  Email Address
+                </span>
+                <span className="text-[10px] text-zinc-500 font-normal">Optional</span>
+              </label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="staff@store.com (auto-generated if empty)"
+                disabled={isSubmitting}
+                className="w-full px-3.5 py-2.5 rounded-xl bg-black/40 border border-white/[0.08] focus:border-orange-500/60 text-zinc-100 text-xs placeholder:text-zinc-600"
+              />
             </div>
 
             {/* Actions */}
