@@ -102,6 +102,29 @@ service cloud.firestore {
           && request.resource.data.items != null;
         allow update, delete: if false; // Immutable invoice records
       }
+
+      // Customers subcollection (Multi-tenant scoped)
+      match /customers/{customerId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId
+          && request.resource.data.name != null
+          && request.resource.data.phone != null
+          && request.resource.data.createdBy.userId != null
+          && request.resource.data.createdAt != null;
+        allow update: if request.resource.data.shopId == shopId
+          || resource.data.shopId == shopId;
+        allow delete: if false; // Soft-delete via isActive flag only
+
+        // Loyalty transaction log (append-only audit trail per customer)
+        match /loyalty_transactions/{txId} {
+          allow read: if true;
+          allow create: if request.resource.data.shopId == shopId
+            && request.resource.data.customerId == customerId
+            && request.resource.data.performedBy.userId != null
+            && request.resource.data.createdAt != null;
+          allow update, delete: if false; // Immutable loyalty ledger
+        }
+      }
     }
 
     // Root Sales collection (Multi-tenant isolated by shopId)

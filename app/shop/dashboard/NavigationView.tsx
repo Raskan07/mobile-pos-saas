@@ -58,12 +58,16 @@ export default function NavigationView({ onClose }: NavigationViewProps) {
       router.push("/shop/products");
     } else if (id === "barcode") {
       router.push("/shop/barcode");
+    } else if (id === "purchases") {
+      router.push("/shop/purchases");
     } else if (id === "ledger") {
       router.push("/shop/ledger");
     } else if (id === "stock") {
       router.push("/shop/stock");
     } else if (id === "stock_analysis") {
       router.push("/shop/stock/analysis");
+    } else if (id === "customers") {
+      router.push("/shop/customers");
     }
   };
 

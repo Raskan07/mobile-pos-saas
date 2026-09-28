@@ -31,6 +31,8 @@ import {
   Store,
   LogOut,
   BookOpen,
+  UserPlus,
+  User,
 } from "lucide-react";
 import { useShopAuth } from "@/lib/context/ShopAuthContext";
 import {
@@ -47,6 +49,7 @@ import PaymentModal from "./PaymentModal";
 import ReceiptModal from "./ReceiptModal";
 import BarcodeScannerModal from "./BarcodeScannerModal";
 import NavigationView from "./NavigationView";
+import CustomerPickerModal, { SelectedCustomerSummary } from "../customers/CustomerPickerModal";
 
 export default function ShopDashboardPOS() {
   const router = useRouter();
@@ -101,6 +104,8 @@ export default function ShopDashboardPOS() {
   const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
   const [isBarcodeModalOpen, setIsBarcodeModalOpen] = useState(false);
   const [isReceiptOpen, setIsReceiptOpen] = useState(false);
+  const [isCustomerPickerOpen, setIsCustomerPickerOpen] = useState(false);
+  const [selectedCustomer, setSelectedCustomer] = useState<SelectedCustomerSummary | null>(null);
   const [persistedSale, setPersistedSale] = useState<SaleRecord | null>(null);
   const [isSavingSale, setIsSavingSale] = useState(false);
   const [receiptData, setReceiptData] = useState<{
@@ -345,6 +350,17 @@ export default function ShopDashboardPOS() {
         paymentMethod: method,
         cashReceived: tendered,
         change,
+        // Attach registered customer if selected (walk-in = undefined)
+        ...(selectedCustomer
+          ? {
+              customer: {
+                customerId: selectedCustomer.customerId,
+                name: selectedCustomer.name,
+                phone: selectedCustomer.phone,
+                ...(selectedCustomer.email ? { email: selectedCustomer.email } : {}),
+              },
+            }
+          : {}),
       });
 
       setPersistedSale(savedSale);
@@ -363,6 +379,7 @@ export default function ShopDashboardPOS() {
     setCart([]);
     setDiscountSetting({ type: "fixed", value: 0 });
     setDiscountInputValue("0");
+    setSelectedCustomer(null);
     setPersistedSale(null);
     setIsReceiptOpen(false);
   };
@@ -948,6 +965,38 @@ export default function ShopDashboardPOS() {
                 </div>
               </div>
 
+              {/* Customer Attach Button */}
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => setIsCustomerPickerOpen(true)}
+                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
+                    selectedCustomer
+                      ? "bg-zinc-800/60 border-zinc-700 text-zinc-200"
+                      : "bg-white/[0.02] border-white/[0.08] text-zinc-500 hover:border-white/[0.15] hover:text-zinc-300"
+                  }`}
+                >
+                  {selectedCustomer ? (
+                    <User className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" />
+                  ) : (
+                    <UserPlus className="w-3.5 h-3.5 flex-shrink-0" />
+                  )}
+                  <span className="flex-1 text-left truncate">
+                    {selectedCustomer ? selectedCustomer.name : "Walk-in Guest — Attach Customer"}
+                  </span>
+                  {selectedCustomer && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); setSelectedCustomer(null); }}
+                      className="w-4 h-4 flex items-center justify-center text-zinc-500 hover:text-zinc-200 flex-shrink-0"
+                      title="Remove customer"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </button>
+              </div>
+
               {/* Quick Payment Method Selector */}
               <div className="pt-1">
                 <div className="grid grid-cols-4 gap-1.5">
@@ -1063,6 +1112,16 @@ export default function ShopDashboardPOS() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* 5. Customer Picker Modal */}
+      {isCustomerPickerOpen && shop?.shopId && (
+        <CustomerPickerModal
+          shopId={shop.shopId}
+          selectedCustomerId={selectedCustomer?.customerId ?? null}
+          onSelect={(customer) => setSelectedCustomer(customer)}
+          onClose={() => setIsCustomerPickerOpen(false)}
+        />
       )}
     </div>
   );

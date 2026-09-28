@@ -74,6 +74,7 @@ export interface SaleRecord {
   // Status & metadata
   status: SaleStatus;
   customer?: {
+    customerId?: string;       // Registered customer ID (undefined = walk-in guest)
     name?: string;
     phone?: string;
     email?: string;
@@ -111,6 +112,7 @@ export interface CreateSaleInput {
   cashReceived?: number;
   change?: number;
   customer?: {
+    customerId?: string;
     name?: string;
     phone?: string;
     email?: string;

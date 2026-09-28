@@ -4,18 +4,12 @@
  * app/shop/stock/analysis/page.tsx
  *
  * Dedicated Stock Analysis & Activity Ledger.
- * Features:
- * - Real-time Firebase stock transactions listener scoped strictly by shopId
- * - Dynamic 28–31 day activity dot matrix with luminous emerald green activity indicators
- * - Hover popovers showing exact staff member, product, stock delta, and reason
- * - Click interaction on any day dot to inspect that day's audit records
- * - Dynamic month navigation (Previous, Next, Current Month quick jump)
- * - Interactive daily movement bar graph across the 28–31 days
- * - Enterprise valuation KPIs (Cost Basis, Retail Potential, Projected Gross Margin, Stock Health)
- * - Filtered day audit ledger with CSV export
+ * Data visualization UI/UX with date range filtering (Last 2 Months, Last 3 Months, etc.),
+ * multi-color stock change event indicators (increment = emerald, reduce = amber, damage = rose),
+ * sleek gray secondary styling, and interactive timeline & dot matrix components.
  */
 
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
@@ -40,6 +34,12 @@ import {
   Sliders,
   Filter,
   Info,
+  ArrowUpRight,
+  ArrowDownRight,
+  Search,
+  X,
+  ChevronDown,
+  CalendarDays,
 } from "lucide-react";
 
 import { useShopAuth } from "@/lib/context/ShopAuthContext";
@@ -56,18 +56,101 @@ const MONTH_NAMES = [
   "July", "August", "September", "October", "November", "December",
 ];
 
+type DateRangePreset =
+  | "today"
+  | "last_7_days"
+  | "last_30_days"
+  | "this_month"
+  | "last_2_months"
+  | "last_3_months"
+  | "last_6_months"
+  | "custom";
+
+type EventTypeFilter = "ALL" | "INCREMENT" | "REDUCE" | "DAMAGE";
+
+function getDateRangeBounds(
+  preset: DateRangePreset,
+  customStart?: string,
+  customEnd?: string
+): { start: Date; end: Date; label: string } {
+  const now = new Date();
+  const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+  switch (preset) {
+    case "today": {
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+      return { start, end: endOfToday, label: "Today" };
+    }
+    case "last_7_days": {
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6, 0, 0, 0, 0);
+      return { start, end: endOfToday, label: "Last 7 Days" };
+    }
+    case "last_30_days": {
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29, 0, 0, 0, 0);
+      return { start, end: endOfToday, label: "Last 30 Days" };
+    }
+    case "this_month": {
+      const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      return { start, end: endOfToday, label: "This Month" };
+    }
+    case "last_2_months": {
+      // 2 calendar months including current
+      const start = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+      return { start, end: endOfToday, label: "Last 2 Months" };
+    }
+    case "last_3_months": {
+      // 3 calendar months including current
+      const start = new Date(now.getFullYear(), now.getMonth() - 2, 1, 0, 0, 0, 0);
+      return { start, end: endOfToday, label: "Last 3 Months" };
+    }
+    case "last_6_months": {
+      const start = new Date(now.getFullYear(), now.getMonth() - 5, 1, 0, 0, 0, 0);
+      return { start, end: endOfToday, label: "Last 6 Months" };
+    }
+    case "custom": {
+      const start = customStart
+        ? new Date(`${customStart}T00:00:00`)
+        : new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      const end = customEnd
+        ? new Date(`${customEnd}T23:59:59`)
+        : endOfToday;
+      return { start, end, label: "Custom Range" };
+    }
+  }
+}
+
 export default function DedicatedStockAnalysisPage() {
-  const { shop, user, isAuthenticated, isLoading: authLoading } = useShopAuth();
+  const { shop, user, isAuthenticated } = useShopAuth();
   const router = useRouter();
 
-  // ── Date navigation state ──
+  // ── Date Range State ──
+  const [datePreset, setDatePreset] = useState<DateRangePreset>("last_2_months");
+  const [customStartDate, setCustomStartDate] = useState<string>(() => {
+    const d = new Date();
+    d.setMonth(d.getMonth() - 1);
+    d.setDate(1);
+    return d.toISOString().slice(0, 10);
+  });
+  const [customEndDate, setCustomEndDate] = useState<string>(() => {
+    return new Date().toISOString().slice(0, 10);
+  });
+  const [showRangeDropdown, setShowRangeDropdown] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // ── Month matrix selection state ──
   const now = new Date();
-  const [selectedYear, setSelectedYear] = useState<number>(now.getFullYear());
-  const [selectedMonth, setSelectedMonth] = useState<number>(now.getMonth()); // 0-indexed
-  const [selectedDay, setSelectedDay] = useState<number | null>(null); // 1-indexed
+  const [matrixYear, setMatrixYear] = useState<number>(now.getFullYear());
+  const [matrixMonth, setMatrixMonth] = useState<number>(now.getMonth());
+
+  // ── Selected day filter (YYYY-MM-DD string or null) ──
+  const [selectedDateKey, setSelectedDateKey] = useState<string | null>(null);
+
+  // ── Event type filter (All, Increment, Reduce, Damage) & Search ──
+  const [typeFilter, setTypeFilter] = useState<EventTypeFilter>("ALL");
+  const [searchQuery, setSearchQuery] = useState("");
 
   // ── Hover popover state ──
-  const [hoveredDay, setHoveredDay] = useState<number | null>(null);
+  const [hoveredDateKey, setHoveredDateKey] = useState<string | null>(null);
   const [popoverPos, setPopoverPos] = useState<{ x: number; y: number } | null>(null);
 
   // ── Data state ──
@@ -75,6 +158,17 @@ export default function DedicatedStockAnalysisPage() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [transactions, setTransactions] = useState<StockTransaction[]>([]);
   const [loadingData, setLoadingData] = useState(true);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setShowRangeDropdown(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   // ---------------------------------------------------------------------------
   // 1. Fetch products, categories & real-time transaction stream
@@ -100,7 +194,6 @@ export default function DedicatedStockAnalysisPage() {
         setLoadingData(false);
       });
 
-    // Real-time listener for stock transactions scoped to active shop
     unsubTx = subscribeToStockTransactions(
       shop.shopId,
       (records) => {
@@ -117,105 +210,225 @@ export default function DedicatedStockAnalysisPage() {
   }, [isAuthenticated, shop?.shopId]);
 
   // ---------------------------------------------------------------------------
-  // 2. Dynamic Month Days Calculation (28, 29, 30, or 31 days)
+  // 2. Active Date Range Bounds & Filtered Transactions
   // ---------------------------------------------------------------------------
-  const daysInSelectedMonth = useMemo(() => {
-    // Passing 0 as day returns the last day of previous month; month + 1 with 0 gives total days
-    return new Date(selectedYear, selectedMonth + 1, 0).getDate();
-  }, [selectedYear, selectedMonth]);
+  const rangeBounds = useMemo(() => {
+    return getDateRangeBounds(datePreset, customStartDate, customEndDate);
+  }, [datePreset, customStartDate, customEndDate]);
 
-  // Navigate month
-  const handlePrevMonth = () => {
-    setSelectedDay(null);
-    if (selectedMonth === 0) {
-      setSelectedMonth(11);
-      setSelectedYear((y) => y - 1);
-    } else {
-      setSelectedMonth((m) => m - 1);
+  // Transactions within selected date range
+  const rangeTransactions = useMemo(() => {
+    const startMs = rangeBounds.start.getTime();
+    const endMs = rangeBounds.end.getTime();
+    return transactions.filter(
+      (tx) => tx.createdAt >= startMs && tx.createdAt <= endMs
+    );
+  }, [transactions, rangeBounds]);
+
+  // Months contained within the selected date range (for dot matrix tabs)
+  const rangeMonths = useMemo(() => {
+    const months: { year: number; month: number; label: string }[] = [];
+    const cur = new Date(rangeBounds.start.getFullYear(), rangeBounds.start.getMonth(), 1);
+    const end = new Date(rangeBounds.end.getFullYear(), rangeBounds.end.getMonth(), 1);
+
+    while (cur <= end) {
+      months.push({
+        year: cur.getFullYear(),
+        month: cur.getMonth(),
+        label: `${MONTH_NAMES[cur.getMonth()]} ${cur.getFullYear()}`,
+      });
+      cur.setMonth(cur.getMonth() + 1);
     }
-  };
+    return months;
+  }, [rangeBounds]);
 
-  const handleNextMonth = () => {
-    setSelectedDay(null);
-    if (selectedMonth === 11) {
-      setSelectedMonth(0);
-      setSelectedYear((y) => y + 1);
-    } else {
-      setSelectedMonth((m) => m + 1);
-    }
-  };
-
-  const handleCurrentMonth = () => {
-    const cur = new Date();
-    setSelectedYear(cur.getFullYear());
-    setSelectedMonth(cur.getMonth());
-    setSelectedDay(null);
-  };
-
-  // ---------------------------------------------------------------------------
-  // 3. Transactions filtered by Month & Year
-  // ---------------------------------------------------------------------------
-  const monthTransactions = useMemo(() => {
-    return transactions.filter((tx) => {
-      const d = new Date(tx.createdAt);
-      return (
-        d.getFullYear() === selectedYear &&
-        d.getMonth() === selectedMonth
+  // Sync matrix month if current selection is outside range
+  useEffect(() => {
+    if (rangeMonths.length > 0) {
+      const exists = rangeMonths.some(
+        (m) => m.year === matrixYear && m.month === matrixMonth
       );
-    });
-  }, [transactions, selectedYear, selectedMonth]);
-
-  // Group transactions by day (1 to daysInSelectedMonth)
-  const dailyTransactionsMap = useMemo(() => {
-    const map = new Map<number, StockTransaction[]>();
-    for (let day = 1; day <= daysInSelectedMonth; day++) {
-      map.set(day, []);
+      if (!exists) {
+        // default to latest month in range
+        const latest = rangeMonths[rangeMonths.length - 1];
+        setMatrixYear(latest.year);
+        setMatrixMonth(latest.month);
+      }
     }
-    monthTransactions.forEach((tx) => {
-      const dayNum = new Date(tx.createdAt).getDate();
-      if (dayNum >= 1 && dayNum <= daysInSelectedMonth) {
-        const arr = map.get(dayNum) || [];
-        arr.push(tx);
-        map.set(dayNum, arr);
+  }, [rangeMonths, matrixYear, matrixMonth]);
+
+  // Helper to categorize stock changes
+  const getChangeMeta = useCallback((tx: StockTransaction) => {
+    if (tx.type === "DAMAGED") {
+      return {
+        category: "damage" as const,
+        label: "Damage",
+        icon: AlertTriangle,
+        colorText: "text-rose-400",
+        colorBg: "bg-rose-500/10",
+        colorBorder: "border-rose-500/25",
+        colorDot: "bg-rose-400 shadow-[0_0_8px_#f43f5e]",
+        colorBar: "bg-rose-500",
+      };
+    }
+    if (tx.type === "STOCK_IN" || tx.quantityDelta > 0) {
+      return {
+        category: "increment" as const,
+        label: tx.type === "STOCK_IN" ? "Restock In" : "Increment",
+        icon: ArrowUpRight,
+        colorText: "text-emerald-400",
+        colorBg: "bg-emerald-500/10",
+        colorBorder: "border-emerald-500/25",
+        colorDot: "bg-emerald-400 shadow-[0_0_8px_#10b981]",
+        colorBar: "bg-emerald-500",
+      };
+    }
+    // Reduce: STOCK_OUT, SALE, or negative adjustment
+    return {
+      category: "reduce" as const,
+      label: tx.type === "SALE" ? "POS Sale" : tx.type === "STOCK_OUT" ? "Stock Out" : "Reduction",
+      icon: tx.type === "SALE" ? ShoppingCart : ArrowDownRight,
+      colorText: "text-amber-400",
+      colorBg: "bg-amber-500/10",
+      colorBorder: "border-amber-500/25",
+      colorDot: "bg-amber-400 shadow-[0_0_8px_#f59e0b]",
+      colorBar: "bg-amber-500",
+    };
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // 3. Daily Movement Map across Selected Range
+  // ---------------------------------------------------------------------------
+  interface DayEntry {
+    dateKey: string; // YYYY-MM-DD
+    dateObj: Date;
+    dayNum: number;
+    monthNum: number;
+    yearNum: number;
+    transactions: StockTransaction[];
+    inUnits: number;
+    outUnits: number;
+    damagedUnits: number;
+    totalVolume: number;
+    hasIncrement: boolean;
+    hasReduce: boolean;
+    hasDamage: boolean;
+  }
+
+  const dailyMap = useMemo(() => {
+    const map = new Map<string, DayEntry>();
+    const cur = new Date(rangeBounds.start);
+    cur.setHours(0, 0, 0, 0);
+
+    const end = new Date(rangeBounds.end);
+    end.setHours(23, 59, 59, 999);
+
+    while (cur <= end) {
+      const year = cur.getFullYear();
+      const month = String(cur.getMonth() + 1).padStart(2, "0");
+      const day = String(cur.getDate()).padStart(2, "0");
+      const key = `${year}-${month}-${day}`;
+
+      map.set(key, {
+        dateKey: key,
+        dateObj: new Date(cur),
+        dayNum: cur.getDate(),
+        monthNum: cur.getMonth(),
+        yearNum: cur.getFullYear(),
+        transactions: [],
+        inUnits: 0,
+        outUnits: 0,
+        damagedUnits: 0,
+        totalVolume: 0,
+        hasIncrement: false,
+        hasReduce: false,
+        hasDamage: false,
+      });
+
+      cur.setDate(cur.getDate() + 1);
+    }
+
+    rangeTransactions.forEach((tx) => {
+      const txDate = new Date(tx.createdAt);
+      const key = `${txDate.getFullYear()}-${String(txDate.getMonth() + 1).padStart(2, "0")}-${String(txDate.getDate()).padStart(2, "0")}`;
+      const entry = map.get(key);
+      if (entry) {
+        entry.transactions.push(tx);
+        const qty = Math.abs(tx.quantityDelta);
+        entry.totalVolume += qty;
+
+        if (tx.type === "DAMAGED") {
+          entry.damagedUnits += qty;
+          entry.hasDamage = true;
+        } else if (tx.type === "STOCK_IN" || tx.quantityDelta > 0) {
+          entry.inUnits += qty;
+          entry.hasIncrement = true;
+        } else {
+          entry.outUnits += qty;
+          entry.hasReduce = true;
+        }
       }
     });
-    return map;
-  }, [monthTransactions, daysInSelectedMonth]);
 
-  // Net monthly metrics
-  const monthSummary = useMemo(() => {
+    return map;
+  }, [rangeBounds, rangeTransactions]);
+
+  const daysArray = useMemo(() => Array.from(dailyMap.values()), [dailyMap]);
+
+  // Max daily volume for responsive bar chart scaling
+  const maxDayVolume = useMemo(() => {
+    let max = 1;
+    daysArray.forEach((d) => {
+      if (d.totalVolume > max) max = d.totalVolume;
+    });
+    return max;
+  }, [daysArray]);
+
+  // ---------------------------------------------------------------------------
+  // 4. Range Aggregates & KPIs
+  // ---------------------------------------------------------------------------
+  const rangeSummary = useMemo(() => {
     let totalIn = 0;
     let totalOut = 0;
-    let totalSales = 0;
     let totalDamaged = 0;
-    let activeDaysCount = 0;
+    let incrementCount = 0;
+    let reduceCount = 0;
+    let damageCount = 0;
 
-    dailyTransactionsMap.forEach((txs) => {
-      if (txs.length > 0) activeDaysCount++;
-      txs.forEach((tx) => {
-        const qty = Math.abs(tx.quantityDelta);
-        if (tx.type === "STOCK_IN") totalIn += qty;
-        else if (tx.type === "STOCK_OUT") totalOut += qty;
-        else if (tx.type === "SALE") totalSales += qty;
-        else if (tx.type === "DAMAGED") totalDamaged += qty;
-      });
+    rangeTransactions.forEach((tx) => {
+      const qty = Math.abs(tx.quantityDelta);
+      if (tx.type === "DAMAGED") {
+        totalDamaged += qty;
+        damageCount++;
+      } else if (tx.type === "STOCK_IN" || tx.quantityDelta > 0) {
+        totalIn += qty;
+        incrementCount++;
+      } else {
+        totalOut += qty;
+        reduceCount++;
+      }
     });
 
-    const totalMovements = monthTransactions.length;
-    const totalVolume = totalIn + totalOut + totalSales + totalDamaged;
+    const netUnits = totalIn - totalOut - totalDamaged;
+    const totalVolume = totalIn + totalOut + totalDamaged;
+    const activeDays = daysArray.filter((d) => d.transactions.length > 0).length;
 
     return {
-      totalMovements,
+      totalMovements: rangeTransactions.length,
       totalVolume,
-      activeDaysCount,
       totalIn,
       totalOut,
-      totalSales,
       totalDamaged,
+      netUnits,
+      activeDays,
+      totalDays: daysArray.length,
+      incrementCount,
+      reduceCount,
+      damageCount,
     };
-  }, [dailyTransactionsMap, monthTransactions]);
+  }, [rangeTransactions, daysArray]);
 
-  // Valuation summary
+  // Overall Catalog Valuation
   const valuation: StockValuationSummary = useMemo(() => {
     return calculateStockValuation(products, transactions);
   }, [products, transactions]);
@@ -226,13 +439,42 @@ export default function DedicatedStockAnalysisPage() {
       ? ((potentialProfit / valuation.totalRetailValue) * 100).toFixed(1)
       : "0";
 
-  // Filtered transactions for the day inspector
+  // ---------------------------------------------------------------------------
+  // 5. Filtered Transactions for Detailed Ledger
+  // ---------------------------------------------------------------------------
   const displayedTransactions = useMemo(() => {
-    if (selectedDay === null) {
-      return monthTransactions;
+    let list = rangeTransactions;
+
+    // Filter by selected day if active
+    if (selectedDateKey) {
+      list = dailyMap.get(selectedDateKey)?.transactions || [];
     }
-    return dailyTransactionsMap.get(selectedDay) || [];
-  }, [selectedDay, monthTransactions, dailyTransactionsMap]);
+
+    // Filter by event type
+    if (typeFilter !== "ALL") {
+      list = list.filter((tx) => {
+        if (typeFilter === "DAMAGE") return tx.type === "DAMAGED";
+        if (typeFilter === "INCREMENT") return tx.type === "STOCK_IN" || tx.quantityDelta > 0;
+        if (typeFilter === "REDUCE") return tx.type !== "DAMAGED" && (tx.type === "STOCK_OUT" || tx.type === "SALE" || tx.quantityDelta < 0);
+        return true;
+      });
+    }
+
+    // Filter by text search
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      list = list.filter((tx) =>
+        (tx.productName || "").toLowerCase().includes(q) ||
+        (tx.sku || "").toLowerCase().includes(q) ||
+        (tx.reason || "").toLowerCase().includes(q) ||
+        (tx.referenceNumber || "").toLowerCase().includes(q) ||
+        (tx.performedBy?.displayName || "").toLowerCase().includes(q) ||
+        (tx.performedBy?.username || "").toLowerCase().includes(q)
+      );
+    }
+
+    return list;
+  }, [rangeTransactions, selectedDateKey, dailyMap, typeFilter, searchQuery]);
 
   // Format currency
   const formatCurrency = (val: number) =>
@@ -242,37 +484,35 @@ export default function DedicatedStockAnalysisPage() {
     })}`;
 
   // ---------------------------------------------------------------------------
-  // CSV Export for the Month
+  // 6. CSV Export for Active Date Range
   // ---------------------------------------------------------------------------
   const handleExportCsv = () => {
     const shopDisplayName = shop?.shopName || "POS Store";
+    const dateRangeStr = `${rangeBounds.start.toISOString().slice(0, 10)} to ${rangeBounds.end.toISOString().slice(0, 10)}`;
+
     const lines: string[] = [
-      `"STOCK ANALYSIS & ACTIVITY AUDIT - ${shopDisplayName}"`,
-      `"Month","${MONTH_NAMES[selectedMonth]} ${selectedYear}"`,
+      `"STOCK ACTIVITY AUDIT LEDGER - ${shopDisplayName}"`,
+      `"Date Range","${dateRangeStr}"`,
       `"Generated At","${new Date().toLocaleString()}"`,
       "",
-      `"MONTH SUMMARY"`,
-      `"Total Movements",${monthSummary.totalMovements}`,
-      `"Active Activity Days","${monthSummary.activeDaysCount} of ${daysInSelectedMonth}"`,
-      `"Total Stock In",${monthSummary.totalIn}`,
-      `"Total Stock Out",${monthSummary.totalOut}`,
-      `"Total Sales Deductions",${monthSummary.totalSales}`,
-      `"Total Damaged Write-offs",${monthSummary.totalDamaged}`,
+      `"SUMMARY METRICS"`,
+      `"Total Movements",${rangeSummary.totalMovements}`,
+      `"Total Units Volume",${rangeSummary.totalVolume}`,
+      `"Total Increments (+)",${rangeSummary.totalIn}`,
+      `"Total Reductions (-)",${rangeSummary.totalOut}`,
+      `"Total Damaged (-)",${rangeSummary.totalDamaged}`,
+      `"Net Stock Movement",${rangeSummary.netUnits}`,
+      `"Active Activity Days","${rangeSummary.activeDays} of ${rangeSummary.totalDays}"`,
       "",
-      `"VALUATION SNAPSHOT"`,
-      `"Asset Value (Cost)",${valuation.totalCostValue.toFixed(2)}`,
-      `"Retail Potential",${valuation.totalRetailValue.toFixed(2)}`,
-      `"Projected Gross Margin",${potentialProfit.toFixed(2)}`,
-      `"Total Units",${valuation.totalUnits}`,
-      "",
-      `"ACTIVITY AUDIT LEDGER"`,
-      `"Date","Time","Product","SKU","Type","Quantity Delta","Previous Stock","New Stock","Reason","Reference","Performed By","Role"`,
+      `"TRANSACTION AUDIT RECORDS"`,
+      `"Date","Time","Product","SKU","Type","Category","Quantity Delta","Previous Stock","New Stock","Reason","Reference","Staff","Role"`,
     ];
 
-    monthTransactions.forEach((tx) => {
+    displayedTransactions.forEach((tx) => {
       const d = new Date(tx.createdAt);
+      const meta = getChangeMeta(tx);
       lines.push(
-        `"${d.toISOString().slice(0, 10)}","${d.toLocaleTimeString()}","${tx.productName.replace(/"/g, '""')}","${tx.sku}","${tx.type}",${tx.quantityDelta},${tx.previousStock},${tx.newStock},"${(tx.reason || "").replace(/"/g, '""')}","${tx.referenceNumber || ""}","${tx.performedBy?.displayName || tx.performedBy?.username || ""}","${tx.performedBy?.role || ""}"`
+        `"${d.toISOString().slice(0, 10)}","${d.toLocaleTimeString()}","${(tx.productName || "").replace(/"/g, '""')}","${tx.sku}","${tx.type}","${meta.label}",${tx.quantityDelta},${tx.previousStock},${tx.newStock},"${(tx.reason || "").replace(/"/g, '""')}","${tx.referenceNumber || ""}","${tx.performedBy?.displayName || tx.performedBy?.username || ""}","${tx.performedBy?.role || ""}"`
       );
     });
 
@@ -280,490 +520,329 @@ export default function DedicatedStockAnalysisPage() {
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
     link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `stock_analysis_${selectedYear}_${selectedMonth + 1}.csv`);
+    link.setAttribute("download", `stock_activity_${rangeBounds.start.toISOString().slice(0, 10)}_${rangeBounds.end.toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
-  // Max volume day for bar chart scaling
-  const maxDayVolume = useMemo(() => {
-    let max = 1;
-    dailyTransactionsMap.forEach((txs) => {
-      const vol = txs.reduce((sum, t) => sum + Math.abs(t.quantityDelta), 0);
-      if (vol > max) max = vol;
-    });
-    return max;
-  }, [dailyTransactionsMap]);
+  // Matrix days calculation for the active matrix tab
+  const daysInMatrixMonth = useMemo(() => {
+    return new Date(matrixYear, matrixMonth + 1, 0).getDate();
+  }, [matrixYear, matrixMonth]);
 
   return (
-    <div className="min-h-screen bg-[#07080d] text-white flex flex-col font-sans selection:bg-emerald-500/30">
-      {/* ── Top Bar ── */}
-      <header className="sticky top-0 z-40 bg-[#07080d]/95 backdrop-blur border-b border-white/[0.08] px-4 py-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-3 min-w-0">
+    <div className="min-h-screen bg-[#090a0f] text-zinc-100 flex flex-col font-sans selection:bg-zinc-800">
+      {/* ── Top Bar (Clean, no heading & description, secondary color is gray) ── */}
+      <header className="sticky top-0 z-40 bg-[#090a0f]/95 backdrop-blur border-b border-zinc-800/80 px-4 py-2.5 flex items-center justify-between gap-3">
+        {/* Left: Back button & sleek breadcrumbs */}
+        <div className="flex items-center gap-2.5 min-w-0">
           <button
             onClick={() => router.push("/shop/stock")}
-            className="w-9 h-9 rounded-xl bg-white/[0.05] hover:bg-white/[0.09] border border-white/[0.08] flex items-center justify-center text-zinc-400 hover:text-white transition-all cursor-pointer flex-shrink-0"
-            title="Return to Stock Management"
+            className="w-8 h-8 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-400 hover:text-zinc-100 flex items-center justify-center transition-all cursor-pointer flex-shrink-0"
+            title="Return to Stock"
           >
             <ArrowLeft className="w-4 h-4" />
           </button>
 
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-emerald-500/20 to-teal-500/20 border border-emerald-500/30 flex items-center justify-center flex-shrink-0 shadow-lg shadow-emerald-500/10">
-              <BarChart3 className="w-4 h-4 text-emerald-400" />
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <h1 className="text-sm font-bold text-white leading-none truncate">
-                  Stock Analysis & Activity
-                </h1>
-                <span className="hidden sm:inline-flex px-2 py-0.5 rounded-full text-[9px] font-bold bg-emerald-500/15 border border-emerald-500/25 text-emerald-300">
-                  Audit Ledger
-                </span>
-              </div>
-              <p className="text-[10px] text-zinc-400 mt-0.5 truncate flex items-center gap-1.5 font-mono">
-                <span>{shop?.shopName || "POS Store"}</span>
-                <span>•</span>
-                <span>{valuation.totalProducts} Catalog Items</span>
-                <span>•</span>
-                <span>{valuation.totalUnits.toLocaleString()} Units</span>
-              </p>
-            </div>
+          <div className="flex items-center gap-1.5 text-xs font-mono text-zinc-400">
+            <span className="text-zinc-500">{shop?.shopName || "POS"}</span>
+            <span className="text-zinc-600">/</span>
+            <span className="text-zinc-300 font-semibold flex items-center gap-1">
+              <BarChart3 className="w-3.5 h-3.5 text-zinc-400" />
+              Stock Analytics
+            </span>
           </div>
         </div>
 
-        {/* Right Header: Month Navigator & Export */}
+        {/* Right: Date Range Selector & Export Button */}
         <div className="flex items-center gap-2 flex-shrink-0">
-          {/* Month Navigation Pills */}
-          <div className="flex items-center p-0.5 rounded-xl bg-white/[0.04] border border-white/[0.07]">
+          {/* Date Range Picker Dropdown */}
+          <div className="relative" ref={dropdownRef}>
             <button
-              onClick={handlePrevMonth}
-              className="w-7 h-7 rounded-lg hover:bg-white/[0.08] text-zinc-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer"
-              title="Previous Month"
+              onClick={() => setShowRangeDropdown(!showRangeDropdown)}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 transition-colors cursor-pointer"
             >
-              <ChevronLeft className="w-4 h-4" />
+              <CalendarDays className="w-3.5 h-3.5 text-zinc-400" />
+              <span>{rangeBounds.label}</span>
+              <ChevronDown className="w-3 h-3 text-zinc-500" />
             </button>
 
-            <div className="px-2.5 py-1 text-xs font-bold text-zinc-100 flex items-center gap-1.5 min-w-[130px] justify-center">
-              <Calendar className="w-3.5 h-3.5 text-emerald-400" />
-              <span>{MONTH_NAMES[selectedMonth]} {selectedYear}</span>
-            </div>
+            {showRangeDropdown && (
+              <div className="absolute right-0 mt-1.5 w-64 rounded-xl bg-zinc-900 border border-zinc-800 shadow-2xl p-2 z-50 text-xs animate-in fade-in zoom-in-95">
+                <div className="px-2 py-1 text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">
+                  Select Date Range
+                </div>
+                <div className="space-y-0.5 mt-1">
+                  {[
+                    { id: "today", label: "Today" },
+                    { id: "last_7_days", label: "Last 7 Days" },
+                    { id: "last_30_days", label: "Last 30 Days" },
+                    { id: "this_month", label: "This Month" },
+                    { id: "last_2_months", label: "Last 2 Months" },
+                    { id: "last_3_months", label: "Last 3 Months" },
+                    { id: "last_6_months", label: "Last 6 Months" },
+                    { id: "custom", label: "Custom Range" },
+                  ].map((item) => (
+                    <button
+                      key={item.id}
+                      onClick={() => {
+                        setDatePreset(item.id as DateRangePreset);
+                        if (item.id !== "custom") {
+                          setShowRangeDropdown(false);
+                          setSelectedDateKey(null);
+                        }
+                      }}
+                      className={`w-full text-left px-2.5 py-1.5 rounded-lg transition-colors flex items-center justify-between cursor-pointer ${
+                        datePreset === item.id
+                          ? "bg-zinc-800 text-white font-medium"
+                          : "text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-200"
+                      }`}
+                    >
+                      <span>{item.label}</span>
+                      {datePreset === item.id && (
+                        <CheckCircle2 className="w-3.5 h-3.5 text-zinc-400" />
+                      )}
+                    </button>
+                  ))}
+                </div>
 
-            <button
-              onClick={handleNextMonth}
-              className="w-7 h-7 rounded-lg hover:bg-white/[0.08] text-zinc-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer"
-              title="Next Month"
-            >
-              <ChevronRight className="w-4 h-4" />
-            </button>
+                {datePreset === "custom" && (
+                  <div className="pt-2.5 mt-1.5 border-t border-zinc-800 space-y-2 px-1">
+                    <div>
+                      <span className="text-[10px] text-zinc-400 block mb-1">From</span>
+                      <input
+                        type="date"
+                        value={customStartDate}
+                        onChange={(e) => setCustomStartDate(e.target.value)}
+                        className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-700"
+                      />
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-zinc-400 block mb-1">To</span>
+                      <input
+                        type="date"
+                        value={customEndDate}
+                        onChange={(e) => setCustomEndDate(e.target.value)}
+                        className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-700"
+                      />
+                    </div>
+                    <button
+                      onClick={() => setShowRangeDropdown(false)}
+                      className="w-full py-1.5 mt-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium cursor-pointer"
+                    >
+                      Apply Range
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <button
-            onClick={handleCurrentMonth}
-            className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-[11px] font-semibold text-zinc-300 hover:text-white transition-all cursor-pointer"
-            title="Jump to Current Month"
-          >
-            <Clock className="w-3 h-3 text-emerald-400" />
-            <span>Today</span>
-          </button>
-
-          <button
             onClick={handleExportCsv}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-lg shadow-emerald-600/20 transition-all cursor-pointer"
-            title="Export Monthly Analysis to CSV"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs font-medium text-zinc-200 transition-colors cursor-pointer"
+            title="Export CSV"
           >
-            <FileSpreadsheet className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Export CSV</span>
+            <FileSpreadsheet className="w-3.5 h-3.5 text-zinc-400" />
+            <span className="hidden sm:inline">Export</span>
           </button>
         </div>
       </header>
 
-      {/* ── Main Content Body ── */}
-      <main className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6 max-w-7xl w-full mx-auto">
+      {/* ── Main Data Visualization Content ── */}
+      <main className="flex-1 overflow-y-auto p-4 md:p-6 space-y-5 max-w-7xl w-full mx-auto">
         {/* ══════════════════════════════════════════════════ */}
-        {/* TOP SECTION: VALUATION & ASSET KPIS */}
+        {/* 1. DATA VISUALIZATION SUMMARY METRICS (GRAY SECONDARY) */}
         {/* ══════════════════════════════════════════════════ */}
-        <section>
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[10px] uppercase font-bold tracking-wider text-zinc-400 flex items-center gap-1.5">
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-              Inventory Valuation & Asset Metrics
-            </span>
-            <span className="text-[10px] text-zinc-500 font-mono">
-              Live valuation based on cost & selling prices
-            </span>
+        <section className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+          {/* Card 1: Total Movements */}
+          <div className="p-3.5 rounded-xl bg-zinc-900/60 border border-zinc-800/80 flex flex-col justify-between gap-1">
+            <span className="text-[11px] font-medium text-zinc-400">Total Movements</span>
+            <div className="text-xl font-bold font-mono text-zinc-100">
+              {rangeSummary.totalMovements.toLocaleString()}
+            </div>
+            <div className="text-[10px] text-zinc-500 font-mono">
+              Across {rangeSummary.activeDays} of {rangeSummary.totalDays} days
+            </div>
           </div>
 
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            {/* 1. Asset Cost Basis */}
-            <div className="p-4 rounded-2xl bg-gradient-to-b from-white/[0.04] to-white/[0.01] border border-white/[0.08] shadow-lg flex flex-col justify-between gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-semibold text-zinc-400">Total Cost Basis</span>
-                <span className="w-2 h-2 rounded-full bg-indigo-500" />
-              </div>
-              <div className="text-xl md:text-2xl font-black font-mono text-zinc-100 tracking-tight">
-                {formatCurrency(valuation.totalCostValue)}
-              </div>
-              <div className="flex items-center justify-between text-[10px] text-zinc-500 font-mono">
-                <span>Inventory Asset Value</span>
-                <span>{valuation.totalUnits.toLocaleString()} units</span>
-              </div>
+          {/* Card 2: Increments (Emerald Color Added) */}
+          <div className="p-3.5 rounded-xl bg-zinc-900/60 border border-zinc-800/80 flex flex-col justify-between gap-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-medium text-zinc-400">Increment</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_#10b981]" />
             </div>
-
-            {/* 2. Retail Potential */}
-            <div className="p-4 rounded-2xl bg-gradient-to-b from-white/[0.04] to-white/[0.01] border border-white/[0.08] shadow-lg flex flex-col justify-between gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-semibold text-zinc-400">Retail Potential</span>
-                <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              </div>
-              <div className="text-xl md:text-2xl font-black font-mono text-emerald-400 tracking-tight">
-                {formatCurrency(valuation.totalRetailValue)}
-              </div>
-              <div className="flex items-center justify-between text-[10px] text-zinc-500 font-mono">
-                <span>Gross Selling Value</span>
-                <span>{valuation.totalProducts} items</span>
-              </div>
+            <div className="text-xl font-bold font-mono text-emerald-400">
+              +{rangeSummary.totalIn.toLocaleString()}
             </div>
-
-            {/* 3. Projected Gross Margin */}
-            <div className="p-4 rounded-2xl bg-gradient-to-b from-white/[0.04] to-white/[0.01] border border-white/[0.08] shadow-lg flex flex-col justify-between gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-semibold text-zinc-400">Projected Margin</span>
-                <span className="text-[10px] font-bold text-emerald-400 font-mono">
-                  +{potentialMarginPct}%
-                </span>
-              </div>
-              <div className="text-xl md:text-2xl font-black font-mono text-zinc-100 tracking-tight">
-                {formatCurrency(potentialProfit)}
-              </div>
-              <div className="flex items-center justify-between text-[10px] text-zinc-500 font-mono">
-                <span>Expected Profit</span>
-                <span>Markup spread</span>
-              </div>
+            <div className="text-[10px] text-zinc-500 font-mono">
+              {rangeSummary.incrementCount} restock / entries
             </div>
+          </div>
 
-            {/* 4. Stock Health Meter */}
-            <div className="p-4 rounded-2xl bg-gradient-to-b from-white/[0.04] to-white/[0.01] border border-white/[0.08] shadow-lg flex flex-col justify-between gap-2">
-              <div className="flex items-center justify-between text-[11px] font-semibold text-zinc-400">
-                <span>Stock Health</span>
-                <span className="font-mono text-zinc-300">{valuation.totalProducts} SKUs</span>
-              </div>
+          {/* Card 3: Reductions (Amber Color Added) */}
+          <div className="p-3.5 rounded-xl bg-zinc-900/60 border border-zinc-800/80 flex flex-col justify-between gap-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-medium text-zinc-400">Reduce</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_#f59e0b]" />
+            </div>
+            <div className="text-xl font-bold font-mono text-amber-400">
+              -{rangeSummary.totalOut.toLocaleString()}
+            </div>
+            <div className="text-[10px] text-zinc-500 font-mono">
+              {rangeSummary.reduceCount} sales / deductions
+            </div>
+          </div>
 
-              {/* Multi-segment bar */}
-              <div className="w-full h-2.5 rounded-full bg-zinc-800 overflow-hidden flex my-auto">
-                {valuation.totalProducts > 0 && (
-                  <>
-                    <div
-                      style={{ width: `${(valuation.healthyCount / valuation.totalProducts) * 100}%` }}
-                      className="bg-emerald-500 h-full transition-all"
-                      title={`Healthy: ${valuation.healthyCount}`}
-                    />
-                    <div
-                      style={{ width: `${(valuation.lowStockCount / valuation.totalProducts) * 100}%` }}
-                      className="bg-amber-500 h-full transition-all"
-                      title={`Low Stock: ${valuation.lowStockCount}`}
-                    />
-                    <div
-                      style={{ width: `${(valuation.outOfStockCount / valuation.totalProducts) * 100}%` }}
-                      className="bg-rose-500 h-full transition-all"
-                      title={`Out of Stock: ${valuation.outOfStockCount}`}
-                    />
-                  </>
-                )}
-              </div>
+          {/* Card 4: Damaged (Rose Color Added) */}
+          <div className="p-3.5 rounded-xl bg-zinc-900/60 border border-zinc-800/80 flex flex-col justify-between gap-1">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-medium text-zinc-400">Damage</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-rose-400 shadow-[0_0_6px_#f43f5e]" />
+            </div>
+            <div className="text-xl font-bold font-mono text-rose-400">
+              -{rangeSummary.totalDamaged.toLocaleString()}
+            </div>
+            <div className="text-[10px] text-zinc-500 font-mono">
+              {rangeSummary.damageCount} write-offs
+            </div>
+          </div>
 
-              <div className="grid grid-cols-3 text-[10px] text-zinc-400 pt-0.5">
-                <span className="text-emerald-400 font-bold font-mono">
-                  {valuation.healthyCount} <span className="text-zinc-500 font-normal">ok</span>
-                </span>
-                <span className="text-amber-400 font-bold font-mono text-center">
-                  {valuation.lowStockCount} <span className="text-zinc-500 font-normal">low</span>
-                </span>
-                <span className="text-rose-400 font-bold font-mono text-right">
-                  {valuation.outOfStockCount} <span className="text-zinc-500 font-normal">out</span>
-                </span>
-              </div>
+          {/* Card 5: Net Units Delta */}
+          <div className="p-3.5 rounded-xl bg-zinc-900/60 border border-zinc-800/80 flex flex-col justify-between gap-1 col-span-2 lg:col-span-1">
+            <span className="text-[11px] font-medium text-zinc-400">Net Delta</span>
+            <div className={`text-xl font-bold font-mono ${
+              rangeSummary.netUnits > 0
+                ? "text-emerald-400"
+                : rangeSummary.netUnits < 0
+                ? "text-rose-400"
+                : "text-zinc-300"
+            }`}>
+              {rangeSummary.netUnits > 0 ? `+${rangeSummary.netUnits}` : rangeSummary.netUnits}
+            </div>
+            <div className="text-[10px] text-zinc-500 font-mono">
+              {valuation.totalUnits.toLocaleString()} units current stock
             </div>
           </div>
         </section>
 
         {/* ══════════════════════════════════════════════════ */}
-        {/* CORE SECTION: DYNAMIC 28–31 DAY ACTIVITY DOT MATRIX */}
-        {/* Inspired by reference design with glowing neon dots */}
+        {/* 2. INTERACTIVE TIMELINE / DISTRIBUTION GRAPH        */}
         {/* ══════════════════════════════════════════════════ */}
-        <section className="p-5 md:p-6 rounded-3xl bg-gradient-to-b from-[#0e1017] to-[#0a0b10] border border-white/[0.09] shadow-2xl relative overflow-hidden">
-          {/* Subtle background glow */}
-          <div className="absolute top-0 right-1/4 w-80 h-40 bg-emerald-500/10 blur-3xl pointer-events-none rounded-full" />
-
-          <div className="relative z-10 flex flex-col gap-5">
-            {/* Card Header with Month Title & Adjusted Volume */}
-            <div className="flex items-center justify-between flex-wrap gap-3 pb-2 border-b border-white/[0.06]">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-2xl bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center text-emerald-400 shadow-[0_0_16px_rgba(16,185,129,0.2)]">
-                  <Sparkles className="w-5 h-5" />
-                </div>
-                <div>
-                  <div className="flex items-center gap-2.5">
-                    <h2 className="text-lg font-black text-white tracking-tight">
-                      {MONTH_NAMES[selectedMonth]} {selectedYear}
-                    </h2>
-                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-white/[0.06] text-zinc-300 font-mono">
-                      {daysInSelectedMonth} Days
-                    </span>
-                  </div>
-                  <p className="text-xs text-zinc-400 mt-0.5 flex items-center gap-2 font-mono">
-                    <span className="text-emerald-400 font-semibold">{monthSummary.activeDaysCount} active days</span>
-                    <span>•</span>
-                    <span>{monthSummary.totalMovements} audit events</span>
-                    <span>•</span>
-                    <span>{monthSummary.totalVolume} units moved</span>
-                  </p>
-                </div>
-              </div>
-
-              {/* Legend & Filter reset */}
-              <div className="flex items-center gap-3 text-xs">
-                <div className="flex items-center gap-4 bg-black/40 px-3 py-1.5 rounded-xl border border-white/[0.06]">
-                  <div className="flex items-center gap-1.5 text-[11px] text-zinc-400">
-                    <span className="w-2.5 h-2.5 rounded-full bg-zinc-800 border border-zinc-700/80" />
-                    <span>Inactive</span>
-                  </div>
-                  <div className="flex items-center gap-1.5 text-[11px] text-zinc-300 font-medium">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399] border border-emerald-300" />
-                    <span>Active Stock Changes</span>
-                  </div>
-                </div>
-
-                {selectedDay !== null && (
-                  <button
-                    onClick={() => setSelectedDay(null)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/30 text-indigo-300 text-xs font-semibold transition-all cursor-pointer"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Show Entire Month</span>
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {/* ── THE LUMINOUS DOT MATRIX GRID (28 to 31 Days) ── */}
-            <div className="py-2">
-              <div className="grid grid-cols-7 sm:grid-cols-10 md:grid-cols-16 gap-2.5 sm:gap-3 items-center justify-items-center">
-                {Array.from({ length: daysInSelectedMonth }, (_, i) => i + 1).map((day) => {
-                  const dayTxs = dailyTransactionsMap.get(day) || [];
-                  const isActive = dayTxs.length > 0;
-                  const isSelected = selectedDay === day;
-                  const isToday =
-                    now.getFullYear() === selectedYear &&
-                    now.getMonth() === selectedMonth &&
-                    now.getDate() === day;
-
-                  // Total delta magnitude on this day
-                  const dayTotalUnits = dayTxs.reduce(
-                    (sum, tx) => sum + Math.abs(tx.quantityDelta),
-                    0
-                  );
-
-                  return (
-                    <div
-                      key={day}
-                      className="relative flex flex-col items-center group cursor-pointer"
-                      onClick={() => setSelectedDay(selectedDay === day ? null : day)}
-                      onMouseEnter={(e) => {
-                        setHoveredDay(day);
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        setPopoverPos({
-                          x: rect.left + rect.width / 2,
-                          y: rect.top,
-                        });
-                      }}
-                      onMouseLeave={() => setHoveredDay(null)}
-                    >
-                      {/* Day dot button */}
-                      <button
-                        type="button"
-                        className={`relative w-8 h-8 sm:w-9 sm:h-9 rounded-2xl flex items-center justify-center transition-all duration-200 cursor-pointer ${
-                          isSelected
-                            ? "ring-2 ring-emerald-400 ring-offset-2 ring-offset-[#0e1017] scale-110"
-                            : ""
-                        } ${
-                          isActive
-                            ? "bg-gradient-to-tr from-emerald-500 to-teal-400 text-black font-black shadow-[0_0_14px_rgba(52,211,153,0.55)] border border-emerald-300 hover:scale-115 hover:shadow-[0_0_20px_rgba(52,211,153,0.8)]"
-                            : "bg-zinc-900/90 text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 border border-white/[0.06] hover:border-white/[0.15]"
-                        }`}
-                      >
-                        <span className="text-[11px] font-mono select-none">
-                          {day}
-                        </span>
-
-                        {/* Today pulsing ring */}
-                        {isToday && (
-                          <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-indigo-400 border border-[#07080d] ring-1 ring-indigo-300 animate-pulse" />
-                        )}
-
-                        {/* Micro indicator badge if high activity */}
-                        {isActive && dayTxs.length > 2 && (
-                          <span className="absolute -bottom-1 -right-1 w-3.5 h-3.5 rounded-full bg-black/90 text-[8px] font-bold text-emerald-300 flex items-center justify-center border border-emerald-500/40 font-mono">
-                            {dayTxs.length}
-                          </span>
-                        )}
-                      </button>
-
-                      {/* Day subtitle label */}
-                      <span
-                        className={`text-[9px] font-mono mt-1 ${
-                          isSelected
-                            ? "text-emerald-300 font-bold"
-                            : isActive
-                            ? "text-emerald-400/80 font-medium"
-                            : "text-zinc-600"
-                        }`}
-                      >
-                        {isActive ? `+${dayTotalUnits}` : "—"}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Matrix summary bar */}
-            <div className="pt-2 border-t border-white/[0.05] flex items-center justify-between text-xs text-zinc-400 flex-wrap gap-2">
-              <span className="flex items-center gap-1.5 text-[11px]">
-                <Info className="w-3.5 h-3.5 text-zinc-500" />
-                <span>
-                  Click any active dot to filter that day&rsquo;s detailed audit records below.
-                </span>
+        <section className="p-4 md:p-5 rounded-2xl bg-zinc-900/50 border border-zinc-800/80 shadow-lg">
+          <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-zinc-300 font-mono">
+                {rangeBounds.start.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                {" — "}
+                {rangeBounds.end.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
               </span>
-              {selectedDay !== null && (
-                <div className="px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/25 text-emerald-300 text-xs font-semibold font-mono">
-                  Filtering Day {selectedDay} ({dailyTransactionsMap.get(selectedDay)?.length || 0} events)
-                </div>
+              {selectedDateKey && (
+                <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-zinc-800 text-zinc-300 border border-zinc-700">
+                  Filtered: {selectedDateKey}
+                </span>
+              )}
+            </div>
+
+            {/* Change Type Color Keys */}
+            <div className="flex items-center gap-3 text-[11px] font-mono">
+              <span className="flex items-center gap-1.5 text-zinc-400">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_5px_#10b981]" />
+                <span className="text-emerald-400 font-medium">Increment</span>
+              </span>
+              <span className="flex items-center gap-1.5 text-zinc-400">
+                <span className="w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_5px_#f59e0b]" />
+                <span className="text-amber-400 font-medium">Reduce</span>
+              </span>
+              <span className="flex items-center gap-1.5 text-zinc-400">
+                <span className="w-2 h-2 rounded-full bg-rose-400 shadow-[0_0_5px_#f43f5e]" />
+                <span className="text-rose-400 font-medium">Damage</span>
+              </span>
+              {selectedDateKey && (
+                <button
+                  onClick={() => setSelectedDateKey(null)}
+                  className="text-[10px] text-zinc-400 hover:text-white underline cursor-pointer ml-1"
+                >
+                  Clear filter
+                </button>
               )}
             </div>
           </div>
-        </section>
 
-        {/* ══════════════════════════════════════════════════ */}
-        {/* INTERACTIVE DAILY MOVEMENT BAR GRAPH (28–31 Days)  */}
-        {/* ══════════════════════════════════════════════════ */}
-        <section className="p-5 md:p-6 rounded-3xl bg-gradient-to-b from-[#0c0e15] to-[#08090e] border border-white/[0.08] shadow-xl">
-          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-            <div>
-              <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                <BarChart3 className="w-4 h-4 text-emerald-400" />
-                Daily Stock Movement Volume ({MONTH_NAMES[selectedMonth]} {selectedYear})
-              </h3>
-              <p className="text-[11px] text-zinc-400 mt-0.5">
-                Magnitude of units adjusted across each day of the month
-              </p>
-            </div>
-
-            {/* Movement type color keys */}
-            <div className="flex items-center gap-3 text-[11px] font-medium flex-wrap">
-              <span className="flex items-center gap-1.5 text-emerald-400">
-                <span className="w-2 h-2 rounded bg-emerald-500" /> Stock In
-              </span>
-              <span className="flex items-center gap-1.5 text-amber-400">
-                <span className="w-2 h-2 rounded bg-amber-500" /> Stock Out
-              </span>
-              <span className="flex items-center gap-1.5 text-blue-400">
-                <span className="w-2 h-2 rounded bg-blue-500" /> POS Sales
-              </span>
-              <span className="flex items-center gap-1.5 text-rose-400">
-                <span className="w-2 h-2 rounded bg-rose-500" /> Damaged
-              </span>
-            </div>
-          </div>
-
-          {/* Bar Chart Container */}
-          <div className="pt-6 pb-2">
-            <div className="h-44 w-full flex items-end gap-1 sm:gap-2 px-1 border-b border-white/[0.08]">
-              {Array.from({ length: daysInSelectedMonth }, (_, i) => i + 1).map((day) => {
-                const dayTxs = dailyTransactionsMap.get(day) || [];
-                const dayTotalUnits = dayTxs.reduce(
-                  (sum, tx) => sum + Math.abs(tx.quantityDelta),
-                  0
-                );
-                const heightPct = maxDayVolume > 0 ? (dayTotalUnits / maxDayVolume) * 100 : 0;
-                const isSelected = selectedDay === day;
-                const hasActivity = dayTxs.length > 0;
-
-                // Segments breakdown
-                let inUnits = 0;
-                let outUnits = 0;
-                let salesUnits = 0;
-                let damagedUnits = 0;
-
-                dayTxs.forEach((tx) => {
-                  const qty = Math.abs(tx.quantityDelta);
-                  if (tx.type === "STOCK_IN") inUnits += qty;
-                  else if (tx.type === "STOCK_OUT") outUnits += qty;
-                  else if (tx.type === "SALE") salesUnits += qty;
-                  else if (tx.type === "DAMAGED") damagedUnits += qty;
-                });
+          {/* Time Series Bar Chart */}
+          <div className="pt-4 pb-1 overflow-x-auto">
+            <div className="h-40 min-w-[500px] flex items-end gap-1 px-1 border-b border-zinc-800">
+              {daysArray.map((day) => {
+                const heightPct = maxDayVolume > 0 ? (day.totalVolume / maxDayVolume) * 100 : 0;
+                const isSelected = selectedDateKey === day.dateKey;
+                const hasActivity = day.totalVolume > 0;
 
                 return (
                   <div
-                    key={day}
-                    className="flex-1 flex flex-col items-center h-full justify-end group relative cursor-pointer"
-                    onClick={() => setSelectedDay(selectedDay === day ? null : day)}
+                    key={day.dateKey}
+                    className="flex-1 min-w-[12px] flex flex-col items-center h-full justify-end group relative cursor-pointer"
+                    onClick={() =>
+                      setSelectedDateKey(selectedDateKey === day.dateKey ? null : day.dateKey)
+                    }
+                    onMouseEnter={(e) => {
+                      setHoveredDateKey(day.dateKey);
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      setPopoverPos({
+                        x: rect.left + rect.width / 2,
+                        y: rect.top,
+                      });
+                    }}
+                    onMouseLeave={() => setHoveredDateKey(null)}
                   >
-                    {/* Bar stack */}
+                    {/* Bar Stack */}
                     <div
                       style={{ height: `${Math.max(4, heightPct)}%` }}
-                      className={`w-full max-w-[20px] rounded-t-md transition-all duration-200 overflow-hidden flex flex-col justify-end ${
+                      className={`w-full max-w-[18px] rounded-t-sm transition-all duration-150 overflow-hidden flex flex-col justify-end ${
                         isSelected
-                          ? "ring-2 ring-emerald-400 shadow-[0_0_12px_#10b981]"
+                          ? "ring-2 ring-zinc-300 shadow-[0_0_10px_rgba(255,255,255,0.2)]"
                           : hasActivity
-                          ? "group-hover:scale-y-105"
-                          : "opacity-40"
+                          ? "group-hover:opacity-90"
+                          : "opacity-25"
                       }`}
                     >
                       {hasActivity ? (
                         <div className="w-full h-full flex flex-col justify-end">
-                          {damagedUnits > 0 && (
+                          {day.damagedUnits > 0 && (
                             <div
-                              style={{ height: `${(damagedUnits / dayTotalUnits) * 100}%` }}
+                              style={{ height: `${(day.damagedUnits / day.totalVolume) * 100}%` }}
                               className="bg-rose-500 w-full"
                             />
                           )}
-                          {salesUnits > 0 && (
+                          {day.outUnits > 0 && (
                             <div
-                              style={{ height: `${(salesUnits / dayTotalUnits) * 100}%` }}
-                              className="bg-blue-500 w-full"
-                            />
-                          )}
-                          {outUnits > 0 && (
-                            <div
-                              style={{ height: `${(outUnits / dayTotalUnits) * 100}%` }}
+                              style={{ height: `${(day.outUnits / day.totalVolume) * 100}%` }}
                               className="bg-amber-500 w-full"
                             />
                           )}
-                          {inUnits > 0 && (
+                          {day.inUnits > 0 && (
                             <div
-                              style={{ height: `${(inUnits / dayTotalUnits) * 100}%` }}
+                              style={{ height: `${(day.inUnits / day.totalVolume) * 100}%` }}
                               className="bg-emerald-500 w-full"
                             />
                           )}
                         </div>
                       ) : (
-                        <div className="w-full h-full bg-zinc-800/60" />
+                        <div className="w-full h-full bg-zinc-800/80" />
                       )}
                     </div>
 
-                    {/* Day label */}
+                    {/* Date label */}
                     <span
-                      className={`text-[9px] font-mono mt-2 transition-colors ${
+                      className={`text-[8.5px] font-mono mt-1.5 transition-colors select-none ${
                         isSelected
-                          ? "text-emerald-400 font-bold"
+                          ? "text-zinc-100 font-bold"
                           : hasActivity
-                          ? "text-zinc-300 font-medium"
+                          ? "text-zinc-400 group-hover:text-zinc-200"
                           : "text-zinc-600"
                       }`}
                     >
-                      {day}
+                      {day.dayNum === 1 || daysArray.length <= 14 ? `${day.monthNum + 1}/${day.dayNum}` : day.dayNum}
                     </span>
                   </div>
                 );
@@ -773,140 +852,287 @@ export default function DedicatedStockAnalysisPage() {
         </section>
 
         {/* ══════════════════════════════════════════════════ */}
-        {/* DAY TRANSACTION INSPECTOR & DETAILED AUDIT LEDGER  */}
+        {/* 3. DATE MATRIX WITH CHANGE COLOR INDICATORS        */}
         {/* ══════════════════════════════════════════════════ */}
-        <section className="p-5 md:p-6 rounded-3xl bg-gradient-to-b from-[#0c0e15] to-[#08090e] border border-white/[0.08] shadow-xl">
-          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-            <div>
-              <div className="flex items-center gap-2">
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <Clock className="w-4 h-4 text-emerald-400" />
-                  {selectedDay !== null
-                    ? `Audit Ledger: ${MONTH_NAMES[selectedMonth]} ${selectedDay}, ${selectedYear}`
-                    : `Audit Ledger: All Records for ${MONTH_NAMES[selectedMonth]} ${selectedYear}`}
-                </h3>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-white/[0.05] text-zinc-300 font-mono">
-                  {displayedTransactions.length} Record{displayedTransactions.length !== 1 ? "s" : ""}
+        <section className="p-4 md:p-5 rounded-2xl bg-zinc-900/50 border border-zinc-800/80 shadow-lg">
+          {/* Header controls: month tabs if multi-month, else active month */}
+          <div className="flex items-center justify-between flex-wrap gap-2 pb-3 border-b border-zinc-800/80">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {rangeMonths.map((m) => (
+                <button
+                  key={`${m.year}-${m.month}`}
+                  onClick={() => {
+                    setMatrixYear(m.year);
+                    setMatrixMonth(m.month);
+                  }}
+                  className={`px-3 py-1 rounded-lg text-xs font-mono transition-all cursor-pointer ${
+                    matrixYear === m.year && matrixMonth === m.month
+                      ? "bg-zinc-800 text-white font-semibold border border-zinc-700"
+                      : "bg-zinc-900/60 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40 border border-transparent"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-3 text-xs">
+              {/* Legend with change colors */}
+              <div className="flex items-center gap-3 bg-zinc-950 px-2.5 py-1 rounded-lg border border-zinc-800/80 font-mono text-[10.5px]">
+                <span className="flex items-center gap-1 text-zinc-400">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                  +In
+                </span>
+                <span className="flex items-center gap-1 text-zinc-400">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                  -Out
+                </span>
+                <span className="flex items-center gap-1 text-zinc-400">
+                  <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
+                  Damage
                 </span>
               </div>
-              <p className="text-[11px] text-zinc-400 mt-0.5">
-                Every stock addition, reduction, sale, and write-off with who changed what
-              </p>
-            </div>
 
-            {selectedDay !== null && (
-              <button
-                onClick={() => setSelectedDay(null)}
-                className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold cursor-pointer underline"
-              >
-                Clear Day Filter
-              </button>
-            )}
+              {selectedDateKey && (
+                <button
+                  onClick={() => setSelectedDateKey(null)}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-mono transition-all cursor-pointer"
+                >
+                  <RotateCcw className="w-3 h-3 text-zinc-400" />
+                  <span>Show All</span>
+                </button>
+              )}
+            </div>
           </div>
 
-          {/* Audit Ledger List */}
+          {/* Matrix Grid of Days for Active Month */}
+          <div className="py-3">
+            <div className="grid grid-cols-7 sm:grid-cols-10 md:grid-cols-16 gap-2 sm:gap-2.5 items-center justify-items-center">
+              {Array.from({ length: daysInMatrixMonth }, (_, i) => i + 1).map((day) => {
+                const dateKey = `${matrixYear}-${String(matrixMonth + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+                const dayEntry = dailyMap.get(dateKey);
+                const hasActivity = dayEntry && dayEntry.transactions.length > 0;
+                const isSelected = selectedDateKey === dateKey;
+                const isToday =
+                  now.getFullYear() === matrixYear &&
+                  now.getMonth() === matrixMonth &&
+                  now.getDate() === day;
+
+                return (
+                  <div
+                    key={dateKey}
+                    className="relative flex flex-col items-center group cursor-pointer"
+                    onClick={() =>
+                      setSelectedDateKey(selectedDateKey === dateKey ? null : dateKey)
+                    }
+                    onMouseEnter={(e) => {
+                      setHoveredDateKey(dateKey);
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      setPopoverPos({
+                        x: rect.left + rect.width / 2,
+                        y: rect.top,
+                      });
+                    }}
+                    onMouseLeave={() => setHoveredDateKey(null)}
+                  >
+                    {/* Day button - Sleek gray base with specific change color dots */}
+                    <button
+                      type="button"
+                      className={`relative w-8 h-8 sm:w-9 sm:h-9 rounded-xl flex flex-col items-center justify-center transition-all duration-150 cursor-pointer ${
+                        isSelected
+                          ? "ring-2 ring-zinc-300 bg-zinc-800 scale-105"
+                          : hasActivity
+                          ? "bg-zinc-800/90 text-zinc-200 border border-zinc-700 hover:bg-zinc-700/80 hover:scale-105"
+                          : "bg-zinc-950/70 text-zinc-500 border border-zinc-800/80 hover:text-zinc-300 hover:bg-zinc-900"
+                      }`}
+                    >
+                      <span className="text-[11px] font-mono leading-none select-none">
+                        {day}
+                      </span>
+
+                      {/* Multi-color change dots on the day button */}
+                      {hasActivity && (
+                        <div className="flex items-center gap-0.5 mt-1">
+                          {dayEntry.hasIncrement && (
+                            <span className="w-1 h-1 rounded-full bg-emerald-400" />
+                          )}
+                          {dayEntry.hasReduce && (
+                            <span className="w-1 h-1 rounded-full bg-amber-400" />
+                          )}
+                          {dayEntry.hasDamage && (
+                            <span className="w-1 h-1 rounded-full bg-rose-400" />
+                          )}
+                        </div>
+                      )}
+
+                      {/* Today pulse dot */}
+                      {isToday && (
+                        <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-zinc-300 border border-zinc-950" />
+                      )}
+                    </button>
+
+                    {/* Delta label below button */}
+                    <span
+                      className={`text-[8.5px] font-mono mt-1 ${
+                        isSelected
+                          ? "text-zinc-200 font-bold"
+                          : hasActivity
+                          ? dayEntry.hasDamage
+                            ? "text-rose-400 font-medium"
+                            : dayEntry.hasIncrement
+                            ? "text-emerald-400 font-medium"
+                            : "text-amber-400 font-medium"
+                          : "text-zinc-600"
+                      }`}
+                    >
+                      {hasActivity ? `${dayEntry.totalVolume}` : "·"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        {/* ══════════════════════════════════════════════════ */}
+        {/* 4. STOCK CHANGES EVENT LEDGER (NEW STYLE & ICONS) */}
+        {/* ══════════════════════════════════════════════════ */}
+        <section className="p-4 md:p-5 rounded-2xl bg-zinc-900/50 border border-zinc-800/80 shadow-lg">
+          {/* Controls toolbar */}
+          <div className="flex items-center justify-between flex-wrap gap-2.5 pb-3 border-b border-zinc-800/80">
+            {/* Filter chips */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {[
+                { id: "ALL", label: `All (${displayedTransactions.length})` },
+                { id: "INCREMENT", label: "Increments (+)", dot: "bg-emerald-400" },
+                { id: "REDUCE", label: "Reductions (-)", dot: "bg-amber-400" },
+                { id: "DAMAGE", label: "Damaged", dot: "bg-rose-400" },
+              ].map((chip) => (
+                <button
+                  key={chip.id}
+                  onClick={() => setTypeFilter(chip.id as EventTypeFilter)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-mono transition-colors flex items-center gap-1.5 cursor-pointer ${
+                    typeFilter === chip.id
+                      ? "bg-zinc-800 text-white font-medium border border-zinc-700"
+                      : "bg-zinc-950 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900 border border-zinc-800/80"
+                  }`}
+                >
+                  {chip.dot && <span className={`w-1.5 h-1.5 rounded-full ${chip.dot}`} />}
+                  <span>{chip.label}</span>
+                </button>
+              ))}
+            </div>
+
+            {/* Search Input */}
+            <div className="relative w-full sm:w-64">
+              <Search className="w-3.5 h-3.5 text-zinc-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                placeholder="Search product, SKU, staff, reason..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-7 py-1 text-xs text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-zinc-700 font-mono"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Event Items List */}
           {displayedTransactions.length === 0 ? (
-            <div className="py-12 flex flex-col items-center justify-center gap-2 text-zinc-500 rounded-2xl bg-white/[0.01] border border-dashed border-white/[0.06]">
-              <Package className="w-8 h-8 text-zinc-600" />
-              <p className="text-xs">
-                {selectedDay !== null
-                  ? `No stock activity recorded on Day ${selectedDay}.`
-                  : `No stock transactions logged in ${MONTH_NAMES[selectedMonth]} ${selectedYear}.`}
-              </p>
+            <div className="py-10 flex flex-col items-center justify-center gap-2 text-zinc-500 rounded-xl bg-zinc-950/40 border border-dashed border-zinc-800/80">
+              <Package className="w-7 h-7 text-zinc-600" />
+              <p className="text-xs font-mono">No stock changes match the selected criteria.</p>
             </div>
           ) : (
-            <div className="space-y-2 overflow-x-auto">
+            <div className="space-y-2 mt-3">
               {displayedTransactions.map((tx) => {
                 const txDate = new Date(tx.createdAt);
+                const meta = getChangeMeta(tx);
+                const IconComponent = meta.icon;
                 const isPositive = tx.quantityDelta > 0;
-                const isSale = tx.type === "SALE";
-                const isDamaged = tx.type === "DAMAGED";
-                const isStockIn = tx.type === "STOCK_IN";
 
                 return (
                   <div
                     key={tx.id}
-                    className="p-3.5 rounded-2xl bg-white/[0.02] hover:bg-white/[0.04] border border-white/[0.06] transition-all flex items-center justify-between gap-3 text-xs"
+                    className="p-3 rounded-xl bg-zinc-950/60 hover:bg-zinc-900/80 border border-zinc-800/80 transition-all flex items-center justify-between gap-3 text-xs"
                   >
-                    {/* Left: Type Icon & Product info */}
+                    {/* Left: Event Icon (Only change color added) + Product details */}
                     <div className="flex items-center gap-3 min-w-0">
+                      {/* Icon container with change color */}
                       <div
-                        className={`w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 ${
-                          isStockIn
-                            ? "bg-emerald-500/15 border border-emerald-500/25 text-emerald-400"
-                            : isDamaged
-                            ? "bg-rose-500/15 border border-rose-500/25 text-rose-400"
-                            : isSale
-                            ? "bg-blue-500/15 border border-blue-500/25 text-blue-400"
-                            : "bg-amber-500/15 border border-amber-500/25 text-amber-400"
-                        }`}
+                        className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${meta.colorBg} border ${meta.colorBorder} ${meta.colorText}`}
+                        title={meta.label}
                       >
-                        {isStockIn ? (
-                          <TrendingUp className="w-4 h-4" />
-                        ) : isDamaged ? (
-                          <AlertOctagon className="w-4 h-4" />
-                        ) : isSale ? (
-                          <ShoppingCart className="w-4 h-4" />
-                        ) : (
-                          <TrendingDown className="w-4 h-4" />
-                        )}
+                        <IconComponent className="w-4 h-4" />
                       </div>
 
                       <div className="min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-bold text-zinc-100 truncate">
+                          <span className="font-semibold text-zinc-100 truncate">
                             {tx.productName}
                           </span>
                           {tx.variantName && (
-                            <span className="text-[10px] text-zinc-400 px-1.5 py-0.2 rounded bg-white/[0.05]">
+                            <span className="text-[10px] text-zinc-400 px-1.5 py-0.2 rounded bg-zinc-800/80 font-mono">
                               {tx.variantName}
                             </span>
                           )}
                           <span className="text-[10px] text-zinc-500 font-mono">
                             #{tx.sku}
                           </span>
+                          {/* Change Type Badge (Only change color added) */}
+                          <span
+                            className={`text-[9px] font-mono px-1.5 py-0.2 rounded border ${meta.colorBg} ${meta.colorBorder} ${meta.colorText}`}
+                          >
+                            {meta.label}
+                          </span>
                         </div>
 
                         <div className="text-[11px] text-zinc-400 mt-0.5 flex items-center gap-2 flex-wrap">
-                          <span className="text-zinc-300 font-medium">{tx.reason || tx.type}</span>
+                          <span className="text-zinc-400">{tx.reason || tx.type}</span>
                           {tx.referenceNumber && (
                             <>
-                              <span>•</span>
-                              <span className="font-mono text-zinc-400">Ref: {tx.referenceNumber}</span>
+                              <span className="text-zinc-600">•</span>
+                              <span className="font-mono text-zinc-500">Ref: {tx.referenceNumber}</span>
                             </>
                           )}
                         </div>
                       </div>
                     </div>
 
-                    {/* Middle: Staff / Performed By */}
-                    <div className="hidden lg:flex items-center gap-1.5 px-3 py-1 rounded-xl bg-white/[0.03] border border-white/[0.05] flex-shrink-0">
-                      <User className="w-3.5 h-3.5 text-indigo-400" />
-                      <div className="text-[11px]">
-                        <span className="text-zinc-200 font-semibold">
+                    {/* Middle: Staff Member (Sleek gray style) */}
+                    <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-zinc-900 border border-zinc-800 flex-shrink-0">
+                      <User className="w-3.5 h-3.5 text-zinc-500" />
+                      <div className="text-[11px] font-mono">
+                        <span className="text-zinc-300">
                           {tx.performedBy?.displayName || tx.performedBy?.username || "Staff"}
                         </span>
                         {tx.performedBy?.role && (
-                          <span className="text-zinc-500 text-[10px] ml-1 uppercase">
+                          <span className="text-zinc-500 text-[9.5px] ml-1 uppercase">
                             ({tx.performedBy.role})
                           </span>
                         )}
                       </div>
                     </div>
 
-                    {/* Right: Quantity Delta & Stock Transition */}
+                    {/* Right: Quantity Delta (Only change color added) & Transition */}
                     <div className="text-right flex-shrink-0">
-                      <div
-                        className={`text-sm font-black font-mono ${
-                          isPositive ? "text-emerald-400" : "text-rose-400"
-                        }`}
-                      >
+                      <div className={`text-sm font-bold font-mono ${meta.colorText}`}>
                         {isPositive ? `+${tx.quantityDelta}` : tx.quantityDelta} units
                       </div>
-                      <div className="text-[10.5px] text-zinc-500 font-mono mt-0.5 flex items-center justify-end gap-1.5">
-                        <span>{tx.previousStock} → {tx.newStock} stock</span>
-                        <span>•</span>
-                        <span>{txDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                      <div className="text-[10px] text-zinc-500 font-mono mt-0.5 flex items-center justify-end gap-1.5">
+                        <span>{tx.previousStock} → {tx.newStock}</span>
+                        <span className="text-zinc-600">•</span>
+                        <span>
+                          {txDate.toLocaleDateString("en-US", { month: "short", day: "numeric" })}{" "}
+                          {txDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -918,99 +1144,92 @@ export default function DedicatedStockAnalysisPage() {
       </main>
 
       {/* ══════════════════════════════════════════════════ */}
-      {/* FLOATING HOVER POPOVER (WHO CHANGED WHAT)           */}
+      {/* FLOATING HOVER POPOVER (SLEEK GRAY WITH CHANGE COLORS) */}
       {/* ══════════════════════════════════════════════════ */}
-      {hoveredDay !== null && popoverPos !== null && (
+      {hoveredDateKey !== null && popoverPos !== null && (
         (() => {
-          const dayTxs = dailyTransactionsMap.get(hoveredDay) || [];
+          const dayEntry = dailyMap.get(hoveredDateKey);
+          const dayTxs = dayEntry?.transactions || [];
           const hasTxs = dayTxs.length > 0;
-          const dayDate = new Date(selectedYear, selectedMonth, hoveredDay);
-          const dayName = dayDate.toLocaleDateString("en-US", { weekday: "short" });
-          const totalUnits = dayTxs.reduce((sum, tx) => sum + Math.abs(tx.quantityDelta), 0);
+          const dayDate = dayEntry?.dateObj || new Date();
+          const dayLabel = dayDate.toLocaleDateString("en-US", {
+            weekday: "short",
+            month: "short",
+            day: "numeric",
+            year: "numeric",
+          });
 
           return (
             <div
-              className="fixed z-50 pointer-events-none -translate-x-1/2 -translate-y-full mb-3 w-80 rounded-2xl bg-[#0e111a] border border-white/[0.14] shadow-2xl p-3.5 text-xs text-white animate-in fade-in zoom-in-95 duration-150"
+              className="fixed z-50 pointer-events-none -translate-x-1/2 -translate-y-full mb-2.5 w-76 rounded-xl bg-zinc-900 border border-zinc-700 shadow-2xl p-3 text-xs text-zinc-200 animate-in fade-in zoom-in-95 duration-100"
               style={{
                 left: `${popoverPos.x}px`,
-                top: `${popoverPos.y - 12}px`,
+                top: `${popoverPos.y - 8}px`,
               }}
             >
               {/* Popover Header */}
-              <div className="flex items-center justify-between pb-2 border-b border-white/[0.08]">
-                <div className="flex items-center gap-1.5 font-bold text-zinc-200">
-                  <Calendar className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>
-                    {dayName}, {MONTH_NAMES[selectedMonth]} {hoveredDay}
-                  </span>
+              <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
+                <div className="font-semibold text-zinc-100 font-mono text-[11px]">
+                  {dayLabel}
                 </div>
-                <span
-                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold font-mono ${
-                    hasTxs
-                      ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
-                      : "bg-zinc-800 text-zinc-500"
-                  }`}
-                >
-                  {hasTxs ? `${dayTxs.length} event${dayTxs.length !== 1 ? "s" : ""}` : "No Activity"}
+                <span className="text-[10px] font-mono text-zinc-400">
+                  {hasTxs ? `${dayTxs.length} event${dayTxs.length !== 1 ? "s" : ""}` : "No events"}
                 </span>
               </div>
 
               {/* Popover Content */}
               {hasTxs ? (
-                <div className="pt-2.5 space-y-2">
-                  <div className="text-[11px] text-zinc-400 flex items-center justify-between font-mono">
-                    <span>Total Volume:</span>
-                    <span className="font-bold text-emerald-400">+{totalUnits} units</span>
+                <div className="pt-2 space-y-2">
+                  {/* Breakdown pill */}
+                  <div className="flex items-center justify-between text-[10.5px] font-mono text-zinc-400 bg-zinc-950 px-2 py-1 rounded-lg border border-zinc-800/80">
+                    <span className="text-emerald-400">+{dayEntry?.inUnits || 0}</span>
+                    <span className="text-amber-400">-{dayEntry?.outUnits || 0}</span>
+                    <span className="text-rose-400">-{dayEntry?.damagedUnits || 0}</span>
+                    <span className="text-zinc-500 font-medium">Vol: {dayEntry?.totalVolume || 0}</span>
                   </div>
 
-                  {/* Most recent 3 transactions */}
-                  <div className="space-y-1.5 max-h-48 overflow-hidden">
-                    {dayTxs.slice(0, 3).map((tx) => (
-                      <div
-                        key={tx.id}
-                        className="p-2 rounded-xl bg-white/[0.03] border border-white/[0.05] text-[11px]"
-                      >
-                        <div className="flex items-center justify-between font-semibold">
-                          <span className="text-zinc-200 truncate max-w-[170px]">
-                            {tx.productName}
-                          </span>
-                          <span
-                            className={`font-mono font-bold ${
-                              tx.quantityDelta > 0 ? "text-emerald-400" : "text-rose-400"
-                            }`}
-                          >
-                            {tx.quantityDelta > 0 ? `+${tx.quantityDelta}` : tx.quantityDelta}
-                          </span>
+                  {/* Top 3 transactions */}
+                  <div className="space-y-1.5 max-h-44 overflow-hidden">
+                    {dayTxs.slice(0, 3).map((tx) => {
+                      const meta = getChangeMeta(tx);
+                      return (
+                        <div
+                          key={tx.id}
+                          className="p-1.5 rounded-lg bg-zinc-950/70 border border-zinc-800/80 text-[10.5px]"
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-zinc-200 truncate font-medium max-w-[170px]">
+                              {tx.productName}
+                            </span>
+                            <span className={`font-mono font-bold ${meta.colorText}`}>
+                              {tx.quantityDelta > 0 ? `+${tx.quantityDelta}` : tx.quantityDelta}
+                            </span>
+                          </div>
+                          <div className="text-[9.5px] text-zinc-400 mt-0.5 truncate flex items-center justify-between">
+                            <span>{tx.reason || tx.type}</span>
+                            <span className="font-mono text-zinc-500">
+                              {new Date(tx.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                            </span>
+                          </div>
                         </div>
-
-                        <div className="text-[10px] text-zinc-400 mt-0.5 truncate">
-                          Reason: {tx.reason || tx.type}
-                        </div>
-
-                        <div className="text-[9.5px] text-zinc-500 font-mono mt-0.5 flex items-center justify-between">
-                          <span>
-                            By: {tx.performedBy?.displayName || tx.performedBy?.username || "Staff"}
-                          </span>
-                          <span>{new Date(tx.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
 
                   {dayTxs.length > 3 && (
-                    <div className="text-[10px] text-zinc-500 text-center font-mono pt-1">
-                      + {dayTxs.length - 3} more (click to view all)
+                    <div className="text-[9.5px] text-zinc-500 text-center font-mono">
+                      + {dayTxs.length - 3} more (click day to view)
                     </div>
                   )}
                 </div>
               ) : (
-                <div className="py-3 text-center text-zinc-500 text-[11px]">
-                  No stock adjustments or transactions on this date.
+                <div className="py-2 text-center text-zinc-500 text-[11px] font-mono">
+                  No stock adjustments on this date.
                 </div>
               )}
 
-              {/* Triangle pointer */}
-              <div className="absolute left-1/2 -bottom-2 -translate-x-1/2 w-0 h-0 border-x-8 border-x-transparent border-t-8 border-t-[#0e111a]" />
+              {/* Triangle indicator */}
+              <div className="absolute left-1/2 -bottom-1.5 -translate-x-1/2 w-0 h-0 border-x-6 border-x-transparent border-t-6 border-t-zinc-900" />
             </div>
           );
         })()

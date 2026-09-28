@@ -185,6 +185,7 @@ export async function createSaleRecord(
     ...(input.customer && Object.values(input.customer).some(Boolean)
       ? {
           customer: {
+            ...(input.customer.customerId ? { customerId: input.customer.customerId } : {}),
             ...(input.customer.name ? { name: input.customer.name } : {}),
             ...(input.customer.phone ? { phone: input.customer.phone } : {}),
             ...(input.customer.email ? { email: input.customer.email } : {}),
@@ -263,6 +264,27 @@ export async function createSaleRecord(
         // Log but don't fail the completed invoice if product was unlinked
         console.warn(`[SalesService] Notice: Could not decrement stock for ${item.productId}:`, stockErr);
       }
+    }
+  }
+
+  // 6. Non-blocking loyalty points award for registered customers
+  if (input.customer?.customerId) {
+    try {
+      const { awardLoyaltyPoints } = await import("./customerService");
+      await awardLoyaltyPoints(
+        normShopId,
+        input.customer.customerId,
+        grandTotal,
+        saleId,
+        {
+          userId: input.cashier?.userId || "cashier",
+          username: input.cashier?.username || "Cashier",
+          role: input.cashier?.role || "cashier",
+          displayName: input.cashier?.displayName || input.cashier?.username || "Cashier",
+        }
+      );
+    } catch (loyaltyErr) {
+      console.warn("[SalesService] Non-blocking loyalty points notice:", loyaltyErr);
     }
   }
 
