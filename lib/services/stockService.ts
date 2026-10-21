@@ -173,6 +173,12 @@ export async function recordStockMovement(
 
   await updateDoc(productRef, updatePayload);
 
+  // Also update root collection "products" if present
+  try {
+    const rootProductRef = doc(db, "products", input.productId);
+    await updateDoc(rootProductRef, updatePayload);
+  } catch (_) {}
+
   return { transaction, newStock };
 }
 
@@ -210,6 +216,20 @@ export async function updateProductMinStockLevel(
       displayName: user.displayName || user.username,
     },
   });
+
+  // Mirror to root products collection
+  try {
+    await updateDoc(doc(db, "products", productId), {
+      minStockLevel: cleanMin,
+      updatedAt: now,
+      updatedBy: {
+        userId: user.userId,
+        username: user.username,
+        role: user.role,
+        displayName: user.displayName || user.username,
+      },
+    });
+  } catch (_) {}
 
   // Log audit trail for threshold adjustment
   const txId = `stk_${now}_${Math.random().toString(36).substring(2, 7)}`;

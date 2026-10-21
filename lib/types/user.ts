@@ -4,7 +4,71 @@
  * Types for User management, Roles and Shop Assignment
  */
 
-export type UserRole = "admin" | "manager" | "cashier";
+export type UserRole = "admin" | "manager" | "cashier" | "partner" | "custom" | string;
+
+export type AppModule =
+  | "products"
+  | "barcode"
+  | "purchases"
+  | "sales"
+  | "stock"
+  | "customers"
+  | "returns"
+  | "roles"
+  | "expenditures"
+  | "repairs";
+
+export type PermissionKey =
+  // Products Module
+  | "products:view"
+  | "products:manage"
+  // Barcode Module
+  | "barcode:view"
+  | "barcode:print"
+  // Purchases Module
+  | "purchases:view"
+  | "purchases:manage"
+  // Sales Module
+  | "sales:view"
+  | "sales:create"
+  | "sales:discount"
+  | "sales:void"
+  // Stock Module
+  | "stock:view"
+  | "stock:adjust"
+  | "stock:analysis"
+  // Customer Module
+  | "customers:view"
+  | "customers:manage"
+  // Returns Module
+  | "returns:view"
+  | "returns:process"
+  // Expenditures Module
+  | "expenditures:view"
+  | "expenditures:create"
+  | "expenditures:edit"
+  | "expenditures:delete"
+  | "expenditures:approve"
+  | "expenditures:categories"
+  // Repairs Module
+  | "repairs:view"
+  | "repairs:create"
+  | "repairs:technician"
+  | "repairs:approve"
+  | "repairs:qc"
+  | "repairs:billing"
+  | "repairs:manage"
+  // Role Access & User Management
+  | "roles:manage";
+
+export interface PermissionDefinition {
+  key: PermissionKey;
+  module: AppModule;
+  label: string;
+  description: string;
+  category: string;
+  riskLevel: "low" | "medium" | "high";
+}
 
 export interface ShopUser {
   uid: string;             // Unique user ID
@@ -19,7 +83,8 @@ export interface ShopUser {
   shopName?: string;       // Cached shop name for quick display
   branchId?: string;       // Optional branch assignment for multi-branch shops
   branchName?: string;     // Optional branch display name
-  permissions?: string[];  // Extensible permissions array
+  permissions?: string[];  // Extensible permissions array containing PermissionKey values
+  customPermissions?: string[]; // Granular fine-tuned permissions if tailored
   status: "active" | "suspended" | "pending";
   createdAt: number;       // Unix timestamp in ms
   updatedAt?: number;      // Unix timestamp in ms
@@ -46,30 +111,58 @@ export interface ShopSession {
   loginTime: number;
 }
 
-
 export const ROLE_CONFIG: Record<
-  UserRole,
+  string,
   { label: string; description: string; color: string; bg: string; border: string }
 > = {
   admin: {
     label: "Admin",
     description: "Full store control: manage inventory, staff, sales & financial reports",
-    color: "text-orange-400",
-    bg: "bg-orange-500/10",
-    border: "border-orange-500/20",
+    color: "text-zinc-200",
+    bg: "bg-zinc-800",
+    border: "border-zinc-700",
   },
   manager: {
     label: "Manager",
-    description: "Store operations: repairs, stock updates, inventory & day-to-day sales",
-    color: "text-amber-400",
-    bg: "bg-amber-500/10",
-    border: "border-amber-500/20",
+    description: "Store operations: purchases, catalog, stock & day-to-day sales",
+    color: "text-zinc-200",
+    bg: "bg-zinc-800",
+    border: "border-zinc-700",
   },
   cashier: {
     label: "Cashier",
     description: "POS terminal checkout, customer invoicing, receipts & cash desk",
-    color: "text-emerald-400",
-    bg: "bg-emerald-500/10",
-    border: "border-emerald-500/20",
+    color: "text-zinc-300",
+    bg: "bg-zinc-800/80",
+    border: "border-zinc-700/80",
+  },
+  partner: {
+    label: "Partner",
+    description: "Store business partner with executive operational visibility",
+    color: "text-zinc-200",
+    bg: "bg-zinc-800",
+    border: "border-zinc-700",
+  },
+  custom: {
+    label: "Custom",
+    description: "Tailored permission profile fine-tuned per module by shop administrator",
+    color: "text-zinc-300",
+    bg: "bg-zinc-800/80",
+    border: "border-zinc-700/80",
   },
 };
+
+export function getRoleBadge(role: string): { label: string; color: string; bg: string; border: string } {
+  const normalized = (role || "cashier").toLowerCase();
+  if (ROLE_CONFIG[normalized]) {
+    return ROLE_CONFIG[normalized];
+  }
+  const formatted = role.charAt(0).toUpperCase() + role.slice(1);
+  return {
+    label: formatted,
+    color: "text-zinc-300",
+    bg: "bg-zinc-800/80",
+    border: "border-zinc-700/80",
+  };
+}
+

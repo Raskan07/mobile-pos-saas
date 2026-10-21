@@ -33,6 +33,7 @@ import {
   BookOpen,
   UserPlus,
   User,
+  Star,
 } from "lucide-react";
 import { useShopAuth } from "@/lib/context/ShopAuthContext";
 import {
@@ -50,10 +51,15 @@ import ReceiptModal from "./ReceiptModal";
 import BarcodeScannerModal from "./BarcodeScannerModal";
 import NavigationView from "./NavigationView";
 import CustomerPickerModal, { SelectedCustomerSummary } from "../customers/CustomerPickerModal";
+import { useRBAC } from "@/lib/rbac/useRBAC";
 
 export default function ShopDashboardPOS() {
   const router = useRouter();
   const shopAuth = useShopAuth();
+  const { hasPermission } = useRBAC();
+
+  const canCreateSales = hasPermission("sales:create");
+  const canDiscount = hasPermission("sales:discount");
 
   // Shop & Cashier data
   const shop = shopAuth?.shop || {
@@ -105,7 +111,37 @@ export default function ShopDashboardPOS() {
   const [isBarcodeModalOpen, setIsBarcodeModalOpen] = useState(false);
   const [isReceiptOpen, setIsReceiptOpen] = useState(false);
   const [isCustomerPickerOpen, setIsCustomerPickerOpen] = useState(false);
+  const [customerModalInitialMode, setCustomerModalInitialMode] = useState<"search" | "add">("search");
   const [selectedCustomer, setSelectedCustomer] = useState<SelectedCustomerSummary | null>(null);
+
+  // Global POS Billing Keyboard Shortcuts:
+  // - Alt + C or F2: Quick Add Customer directly
+  // - Alt + A: Open Customer Search / Attach
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't intercept if full-screen modals are open
+      if (isPaymentModalOpen || isReceiptOpen || isBarcodeModalOpen) return;
+
+      // Shortcut: Alt + C or F2 -> Quick Add Customer
+      if ((e.altKey && (e.key === "c" || e.key === "C")) || e.key === "F2") {
+        e.preventDefault();
+        setCustomerModalInitialMode("add");
+        setIsCustomerPickerOpen(true);
+        return;
+      }
+
+      // Shortcut: Alt + A -> Search/Attach Customer
+      if (e.altKey && (e.key === "a" || e.key === "A")) {
+        e.preventDefault();
+        setCustomerModalInitialMode("search");
+        setIsCustomerPickerOpen(true);
+        return;
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isPaymentModalOpen, isReceiptOpen, isBarcodeModalOpen]);
   const [persistedSale, setPersistedSale] = useState<SaleRecord | null>(null);
   const [isSavingSale, setIsSavingSale] = useState(false);
   const [receiptData, setReceiptData] = useState<{
@@ -339,6 +375,7 @@ export default function ShopDashboardPOS() {
           username: user.username,
           displayName: user.displayName || user.username,
           role: user.role,
+          permissions: ("permissions" in user ? (user.permissions as string[]) : []) || [],
         },
         items: snapshotItems,
         subtotal,
@@ -965,36 +1002,71 @@ export default function ShopDashboardPOS() {
                 </div>
               </div>
 
-              {/* Customer Attach Button */}
+              {/* Customer Attach Section */}
               <div className="pt-1">
-                <button
-                  type="button"
-                  onClick={() => setIsCustomerPickerOpen(true)}
-                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
-                    selectedCustomer
-                      ? "bg-zinc-800/60 border-zinc-700 text-zinc-200"
-                      : "bg-white/[0.02] border-white/[0.08] text-zinc-500 hover:border-white/[0.15] hover:text-zinc-300"
-                  }`}
-                >
-                  {selectedCustomer ? (
-                    <User className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" />
-                  ) : (
-                    <UserPlus className="w-3.5 h-3.5 flex-shrink-0" />
-                  )}
-                  <span className="flex-1 text-left truncate">
-                    {selectedCustomer ? selectedCustomer.name : "Walk-in Guest — Attach Customer"}
-                  </span>
-                  {selectedCustomer && (
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); setSelectedCustomer(null); }}
-                      className="w-4 h-4 flex items-center justify-center text-zinc-500 hover:text-zinc-200 flex-shrink-0"
-                      title="Remove customer"
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
-                  )}
-                </button>
+                {selectedCustomer ? (
+                  <div className="flex items-center justify-between p-2.5 rounded-xl bg-zinc-900/60 border border-zinc-800 text-xs font-mono transition-all">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-7 h-7 rounded-lg bg-zinc-800 border border-zinc-700 flex items-center justify-center font-bold text-zinc-200 text-xs flex-shrink-0">
+                        {selectedCustomer.name.charAt(0).toUpperCase()}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <p className="font-semibold text-zinc-100 truncate">{selectedCustomer.name}</p>
+                          {selectedCustomer.pointsBalance > 0 && (
+                            <span className="flex items-center gap-0.5 text-[9px] font-bold text-amber-300 bg-amber-950/60 px-1 py-0.2 rounded border border-amber-600/30">
+                              <Star className="w-2.5 h-2.5 fill-amber-400" />
+                              {selectedCustomer.pointsBalance}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[10px] text-zinc-400 truncate">{selectedCustomer.phone}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 flex-shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCustomerModalInitialMode("search");
+                          setIsCustomerPickerOpen(true);
+                        }}
+                        className="px-2 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-[10px] font-medium transition-colors cursor-pointer"
+                        title="Change Customer (Alt+A)"
+                      >
+                        Change
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedCustomer(null);
+                        }}
+                        className="w-6 h-6 flex items-center justify-center rounded-lg hover:bg-red-950/50 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
+                        title="Remove customer from bill"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCustomerModalInitialMode("search");
+                      setIsCustomerPickerOpen(true);
+                    }}
+                    className="w-full flex items-center justify-between px-3 py-2 rounded-xl bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.08] hover:border-white/[0.15] text-xs font-mono text-zinc-400 hover:text-zinc-200 transition-all cursor-pointer group"
+                    title="Attach customer to bill (Shortcut: Alt+A or Alt+C)"
+                  >
+                    <div className="flex items-center gap-2 truncate">
+                      <User className="w-3.5 h-3.5 text-zinc-500 group-hover:text-zinc-300 flex-shrink-0" />
+                      <span className="truncate">Walk-in Guest — Attach Customer</span>
+                    </div>
+                    <kbd className="px-1.5 py-0.5 text-[9px] font-mono text-zinc-500 bg-white/[0.04] border border-white/[0.08] rounded group-hover:text-zinc-300">
+                      Alt+A
+                    </kbd>
+                  </button>
+                )}
               </div>
 
               {/* Quick Payment Method Selector */}
@@ -1034,15 +1106,18 @@ export default function ShopDashboardPOS() {
               <div className="pt-1">
                 <button
                   type="button"
-                  disabled={cart.length === 0}
+                  disabled={cart.length === 0 || !canCreateSales}
                   onClick={() => setIsPaymentModalOpen(true)}
                   className={`w-full py-3.5 px-4 rounded-xl active:scale-[0.99] disabled:pointer-events-none text-white font-bold flex items-center justify-between transition-all cursor-pointer group ${
-                    cart.length === 0
+                    cart.length === 0 || !canCreateSales
                       ? "bg-gradient-to-r from-zinc-700 via-zinc-600 to-zinc-600 shadow-lg shadow-zinc-900/20 opacity-35"
                       : "bg-gradient-to-r from-[#ea4815] via-[#f95721] to-[#ff6229] hover:from-[#f95721] hover:via-[#ff6229] hover:to-[#ff7340] shadow-lg shadow-orange-600/30 hover:shadow-orange-500/50"
                   }`}
+                  title={!canCreateSales ? "Your account does not have permission to process sales" : "Proceed to Payment"}
                 >
-                  <span className="text-sm tracking-wide">Pay Now</span>
+                  <span className="text-sm tracking-wide">
+                    {!canCreateSales ? "Checkout Restricted" : "Pay Now"}
+                  </span>
                   <div className="flex items-center gap-2">
                     <span className="text-base font-mono font-black">
                       LKR {grandTotal.toFixed(2)}
@@ -1119,6 +1194,13 @@ export default function ShopDashboardPOS() {
         <CustomerPickerModal
           shopId={shop.shopId}
           selectedCustomerId={selectedCustomer?.customerId ?? null}
+          initialMode={customerModalInitialMode}
+          currentUser={{
+            userId: shopAuth?.user?.uid || "cashier",
+            username: shopAuth?.user?.username || "Cashier",
+            role: shopAuth?.user?.role || "cashier",
+            displayName: shopAuth?.user?.displayName,
+          }}
           onSelect={(customer) => setSelectedCustomer(customer)}
           onClose={() => setIsCustomerPickerOpen(false)}
         />

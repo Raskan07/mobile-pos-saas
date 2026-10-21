@@ -52,6 +52,7 @@ function canManageCustomers(role?: string, permissions?: string[]): boolean {
   if (r === "admin" || r === "manager") return true;
   if (permissions && Array.isArray(permissions)) {
     return (
+      permissions.includes("customers:manage") ||
       permissions.includes("customers") ||
       permissions.includes("manage_customers") ||
       permissions.includes("admin")

@@ -19,6 +19,8 @@ import {
   Bell,
   Settings,
   CreditCard,
+  ShieldCheck,
+  Wrench,
 } from "lucide-react";
 
 interface NavigationViewProps {
@@ -31,16 +33,24 @@ interface NavigationViewProps {
   cartCount?: number;
 }
 
-const NAV_ITEMS = [
+interface NavItem {
+  id: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  isNew?: boolean;
+}
+
+const NAV_ITEMS: NavItem[] = [
   { id: "products",       label: "Products",           icon: Package },
   { id: "barcode",        label: "Barcode",            icon: ScanLine },
   { id: "purchases",      label: "Purchase History",   icon: ClipboardList },
+  { id: "repair",         label: "Repair",             icon: Wrench },
   { id: "stock",          label: "Stock Management",   icon: Warehouse },
   { id: "stock_analysis", label: "Stock Analysis",     icon: BarChart3 },
-  { id: "supply",         label: "Supply Chain",       icon: Truck },
+  { id: "role_access",    label: "Role Access",        icon: ShieldCheck },
   { id: "ledger",         label: "Sales Ledger",       icon: BookOpen },
   { id: "analytics",      label: "Sales Analytics",    icon: BarChart2 },
-  { id: "financial",      label: "Financial Reports",  icon: FileText },
+  { id: "financial",      label: "Reports & SST",      icon: FileText },
   { id: "expenditures",   label: "Expenditures",       icon: Receipt },
   { id: "operational",    label: "Operational Summary",icon: LayoutDashboard },
   { id: "customers",      label: "Customers",          icon: Users },
@@ -60,14 +70,24 @@ export default function NavigationView({ onClose }: NavigationViewProps) {
       router.push("/shop/barcode");
     } else if (id === "purchases") {
       router.push("/shop/purchases");
+    } else if (id === "repair") {
+      router.push("/shop/repair");
     } else if (id === "ledger") {
       router.push("/shop/ledger");
+    } else if (id === "analytics") {
+      router.push("/shop/analytics");
     } else if (id === "stock") {
       router.push("/shop/stock");
     } else if (id === "stock_analysis") {
       router.push("/shop/stock/analysis");
     } else if (id === "customers") {
       router.push("/shop/customers");
+    } else if (id === "role_access") {
+      router.push("/shop/role-access");
+    } else if (id === "financial") {
+      router.push("/shop/reports");
+    } else if (id === "expenditures") {
+      router.push("/shop/expenditure");
     }
   };
 

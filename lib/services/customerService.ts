@@ -77,6 +77,46 @@ function customersRef(shopId: string) {
   return collection(db, "shops", shopId, CUSTOMERS_COLLECTION);
 }
 
+/**
+ * Finds an existing customer by phone number within the authenticated shop.
+ */
+export async function findCustomerByPhone(
+  shopId: string,
+  phone: string
+): Promise<CustomerRecord | null> {
+  const normShopId = assertValidShop(shopId);
+  const cleanPhone = phone.trim();
+  if (!cleanPhone) return null;
+
+  const existingQ = query(
+    customersRef(normShopId),
+    where("phone", "==", cleanPhone)
+  );
+  const existingSnap = await getDocs(existingQ);
+  if (existingSnap.empty) return null;
+
+  const docMatch = existingSnap.docs.find((d) => {
+    const data = d.data() as CustomerRecord;
+    return !data.shopId || normalizeShopId(data.shopId) === normShopId;
+  });
+
+  return docMatch ? (docMatch.data() as CustomerRecord) : null;
+}
+
+/**
+ * Ensures customer collection accessibility for the shop.
+ */
+export async function ensureCustomerCollectionExists(shopId: string): Promise<boolean> {
+  try {
+    const normShopId = assertValidShop(shopId);
+    await getDocs(query(customersRef(normShopId)));
+    return true;
+  } catch (err) {
+    console.warn("[CustomerService] Collection check warning:", err);
+    return true; // Still allow offline/local fallback
+  }
+}
+
 // ── 1. Create Customer ────────────────────────────────────────────────────────
 
 /**
@@ -86,7 +126,7 @@ function customersRef(shopId: string) {
 export async function createCustomer(
   shopId: string,
   input: CreateCustomerInput,
-  createdBy: AuditUser
+  createdBy?: AuditUser
 ): Promise<CustomerRecord> {
   const normShopId = assertValidShop(shopId);
   const now = Date.now();
@@ -97,16 +137,20 @@ export async function createCustomer(
   if (!name) throw new Error("Customer name is required.");
   if (!phone) throw new Error("Customer phone number is required.");
 
-  // Enforce phone uniqueness within this shop
-  const existingQ = query(
-    customersRef(normShopId),
-    where("phone", "==", phone),
-    where("shopId", "==", normShopId)
-  );
-  const existingSnap = await getDocs(existingQ);
-  if (!existingSnap.empty) {
-    throw new Error(`A customer with phone number "${phone}" already exists in this shop.`);
+  // Enforce phone uniqueness within this shop without requiring composite indexes
+  const existingCustomer = await findCustomerByPhone(normShopId, phone);
+  if (existingCustomer) {
+    throw new Error(
+      `Customer with phone number "${phone}" already exists (${existingCustomer.name}).`
+    );
   }
+
+  const safeCreatedBy: AuditUser = {
+    userId: createdBy?.userId || "pos_cashier",
+    username: createdBy?.username || "Cashier",
+    role: createdBy?.role || "cashier",
+    ...(createdBy?.displayName ? { displayName: createdBy.displayName } : {}),
+  };
 
   const id = generateCustomerId(now);
 
@@ -122,7 +166,7 @@ export async function createCustomer(
     isActive: true,
     createdAt: now,
     updatedAt: now,
-    createdBy,
+    createdBy: safeCreatedBy,
     ...(input.email?.trim() ? { email: input.email.trim() } : {}),
     ...(input.dateOfBirth ? { dateOfBirth: input.dateOfBirth } : {}),
     ...(input.notes?.trim() ? { notes: input.notes.trim() } : {}),
@@ -155,13 +199,8 @@ export async function updateCustomer(
   // If phone is changing, enforce uniqueness
   if (input.phone && input.phone.trim() !== existing.phone) {
     const phone = input.phone.trim();
-    const dupQ = query(
-      customersRef(normShopId),
-      where("phone", "==", phone),
-      where("shopId", "==", normShopId)
-    );
-    const dupSnap = await getDocs(dupQ);
-    if (!dupSnap.empty) {
+    const existingWithPhone = await findCustomerByPhone(normShopId, phone);
+    if (existingWithPhone && existingWithPhone.id !== customerId) {
       throw new Error(`A customer with phone number "${phone}" already exists in this shop.`);
     }
   }

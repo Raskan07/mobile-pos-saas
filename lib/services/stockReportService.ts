@@ -38,6 +38,7 @@ export function canUserAccessStockReports(
   if (r === "admin" || r === "manager") return true;
   if (permissions && Array.isArray(permissions)) {
     return (
+      permissions.includes("stock:analysis") ||
       permissions.includes("inventory_reports") ||
       permissions.includes("stock_reports") ||
       permissions.includes("admin")

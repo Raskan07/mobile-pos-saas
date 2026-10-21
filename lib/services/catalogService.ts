@@ -422,20 +422,56 @@ export async function getProducts(
   const normShopId = normalizeShopId(shopId);
   if (!normShopId) return [];
 
-  const prodRef = collection(db, "shops", normShopId, PRODUCTS_COLLECTION);
-  let q = query(prodRef, orderBy("createdAt", "desc"));
+  const productMap = new Map<string, ProductItem>();
 
-  if (subcategoryId) {
-    q = query(prodRef, where("subcategoryId", "==", subcategoryId), orderBy("createdAt", "desc"));
-  } else if (categoryId) {
-    q = query(prodRef, where("categoryId", "==", categoryId), orderBy("createdAt", "desc"));
+  // 1. Fetch from shops/{shopId}/products
+  try {
+    const prodRef = collection(db, "shops", normShopId, PRODUCTS_COLLECTION);
+    let q = query(prodRef, orderBy("createdAt", "desc"));
+
+    if (subcategoryId) {
+      q = query(prodRef, where("subcategoryId", "==", subcategoryId), orderBy("createdAt", "desc"));
+    } else if (categoryId) {
+      q = query(prodRef, where("categoryId", "==", categoryId), orderBy("createdAt", "desc"));
+    }
+
+    const snap = await getDocs(q);
+    snap.docs.forEach((docSnap) => {
+      productMap.set(docSnap.id, {
+        id: docSnap.id,
+        ...(docSnap.data() as Omit<ProductItem, "id">),
+      });
+    });
+  } catch (err) {
+    console.warn("[CatalogService] Subcollection products fetch warning:", err);
   }
 
-  const snap = await getDocs(q);
-  return snap.docs.map((docSnap) => ({
-    id: docSnap.id,
-    ...(docSnap.data() as Omit<ProductItem, "id">),
-  }));
+  // 2. Also fetch from root collection "products" where shopId == normShopId
+  try {
+    const rootRef = collection(db, PRODUCTS_COLLECTION);
+    let rootQ = query(rootRef, where("shopId", "==", normShopId));
+    if (subcategoryId) {
+      rootQ = query(rootRef, where("shopId", "==", normShopId), where("subcategoryId", "==", subcategoryId));
+    } else if (categoryId) {
+      rootQ = query(rootRef, where("shopId", "==", normShopId), where("categoryId", "==", categoryId));
+    }
+
+    const rootSnap = await getDocs(rootQ);
+    rootSnap.docs.forEach((docSnap) => {
+      if (!productMap.has(docSnap.id)) {
+        productMap.set(docSnap.id, {
+          id: docSnap.id,
+          ...(docSnap.data() as Omit<ProductItem, "id">),
+        });
+      }
+    });
+  } catch (err) {
+    console.warn("[CatalogService] Root collection products fetch warning:", err);
+  }
+
+  const list = Array.from(productMap.values());
+  list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return list;
 }
 
 export async function getProductById(
@@ -445,11 +481,29 @@ export async function getProductById(
   const normShopId = normalizeShopId(shopId);
   if (!normShopId || !productId) return null;
 
-  const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
-  const snap = await getDoc(docRef);
-  if (!snap.exists()) return null;
+  // Check subcollection
+  try {
+    const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
+    const snap = await getDoc(docRef);
+    if (snap.exists()) {
+      return { id: snap.id, ...(snap.data() as Omit<ProductItem, "id">) };
+    }
+  } catch (err) {
+    console.warn("[CatalogService] Subcollection product get warning:", err);
+  }
 
-  return { id: snap.id, ...(snap.data() as Omit<ProductItem, "id">) };
+  // Check root collection "products"
+  try {
+    const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
+    const rootSnap = await getDoc(rootDocRef);
+    if (rootSnap.exists()) {
+      return { id: rootSnap.id, ...(rootSnap.data() as Omit<ProductItem, "id">) };
+    }
+  } catch (err) {
+    console.warn("[CatalogService] Root product get warning:", err);
+  }
+
+  return null;
 }
 
 export async function createProduct(
@@ -503,8 +557,17 @@ export async function createProduct(
     updatedAt: now,
   };
 
+  // 1. Save to shops/{shopId}/products/{productId}
   const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
   await setDoc(docRef, productData);
+
+  // 2. Save directly to root collection "products" as well so it is stored under the products collection
+  try {
+    const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
+    await setDoc(rootDocRef, productData);
+  } catch (rootErr) {
+    console.warn("[CatalogService] Notice mirroring product to root products collection:", rootErr);
+  }
 
   // Increment products count on category and subcategory
   try {
@@ -559,6 +622,14 @@ export async function updateProduct(
   if (updates.status !== undefined) patch.status = updates.status;
 
   await updateDoc(docRef, patch);
+
+  // Mirror patch to root collection "products"
+  try {
+    const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
+    await setDoc(rootDocRef, patch, { merge: true });
+  } catch (rootErr) {
+    console.warn("[CatalogService] Notice updating root products doc:", rootErr);
+  }
 }
 
 export async function deleteProduct(
@@ -572,6 +643,14 @@ export async function deleteProduct(
 
   const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
   await deleteDoc(docRef);
+
+  // Also remove from root collection "products"
+  try {
+    const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
+    await deleteDoc(rootDocRef);
+  } catch (rootErr) {
+    console.warn("[CatalogService] Notice deleting from root products collection:", rootErr);
+  }
 
   // Decrement counts
   if (categoryId) {

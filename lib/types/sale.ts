@@ -29,8 +29,88 @@ export interface SaleItemSnapshot {
   imageUrl?: string;           // Product image snapshot
 }
 
-export type PaymentMethod = "cash" | "card" | "bank-transfer" | "mobile-qr" | string;
-export type SaleStatus = "completed" | "refunded" | "voided";
+export type PaymentMethod = "cash" | "card" | "bank-transfer" | "bank-deposit" | "mobile-qr" | "split" | string;
+export type SaleStatus = "completed" | "partially_returned" | "refunded" | "exchanged" | "voided";
+
+export interface SplitPaymentEntry {
+  method: "cash" | "card" | "bank-transfer" | "bank-deposit" | "deposit" | "mobile-qr" | string;
+  amount: number;
+  referenceNumber?: string;
+  notes?: string;
+}
+
+export interface SaleReturnItem {
+  productId: string;
+  name: string;
+  sku: string;
+  quantity: number;            // Number of units returned
+  unitPrice: number;           // Original selling unit price
+  refundAmount: number;        // Total refund for this line (qty * unitPrice - discount share)
+  restock: boolean;            // Whether the item is put back into shop inventory
+  condition?: "good" | "damaged" | "defective";
+}
+
+export interface SaleReturnRecord {
+  returnId: string;            // Unique return document ID
+  originalSaleId: string;      // ID of the original sale record
+  invoiceNumber: string;       // Original invoice number
+  shopId: string;              // Tenant shop ID
+  returnDate: number;          // Timestamp epoch (ms)
+  returnDateISO: string;       // ISO 8601 string
+  items: SaleReturnItem[];     // Returned line items
+  totalRefundAmount: number;   // Total sum refunded
+  refundMethod: "cash" | "card" | "store-credit" | "original" | string;
+  reason: string;              // Return explanation/reason
+  processedBy: {
+    userId: string;
+    username: string;
+    displayName?: string;
+    role: string;
+  };
+}
+
+export interface SaleExchangeItem {
+  productId: string;
+  name: string;
+  sku: string;
+  quantity: number;
+  unitPrice: number;
+  subtotal: number;
+  variant?: string;
+  categoryName?: string;
+}
+
+export interface SaleExchangeRecord {
+  exchangeId: string;              // Unique document ID in `sales` or embedded
+  exchangeInvoiceNumber: string;   // e.g. "EXC-20261002-8321"
+  originalSaleId: string;          // Frozen original sale ID
+  originalInvoiceNumber: string;   // Frozen original invoice number
+  shopId: string;
+  exchangeDate: number;
+  exchangeDateISO: string;
+
+  // Items returned by customer
+  returnedItems: SaleReturnItem[];
+  returnedTotal: number;
+
+  // New replacement items selected by customer
+  replacementItems: SaleExchangeItem[];
+  replacementTotal: number;
+
+  // Price differential
+  difference: number;              // replacementTotal - returnedTotal
+  settlementType: "customer_paid" | "store_refunded" | "even_exchange";
+  settlementMethod: "cash" | "card" | "store-credit" | "bank-transfer" | "mobile-qr" | string;
+  amountSettled: number;           // Math.abs(difference)
+
+  reason: string;
+  operator: {
+    userId: string;
+    username: string;
+    displayName?: string;
+    role: string;
+  };
+}
 
 export interface SaleRecord {
   saleId: string;              // Unique document ID in `sales` collection
@@ -40,10 +120,11 @@ export interface SaleRecord {
   branchId: string;            // Store branch identifier (e.g. "main")
   branchName: string;          // Store branch display name
 
-  // Cashier audit trail
+  // Cashier audit trail (Immutable frozen snapshot to preserve historical record even if cashier role changes later)
   cashierId: string;           // Authenticated user ID (e.g. uid)
   cashierName: string;         // Display name or username
-  cashierRole: string;         // Role (e.g. "admin", "manager", "cashier")
+  cashierRole: string;         // Role (e.g. "admin", "manager", "cashier", "custom")
+  cashierPermissionsSnapshot?: string[]; // Immutable snapshot of permissions at time of sale
 
   // Product snapshots
   items: SaleItemSnapshot[];
@@ -63,6 +144,7 @@ export interface SaleRecord {
 
   // Tender details
   paymentMethod: PaymentMethod;
+  splitPayments?: SplitPaymentEntry[];
   cashReceived?: number;       // Cash tendered by customer (if cash)
   change?: number;             // Change returned to customer (if cash)
   paymentDetails?: {
@@ -81,10 +163,79 @@ export interface SaleRecord {
   };
   notes?: string;
 
+  // Returns audit trail (linked returns without deleting or altering original transaction integrity)
+  hasReturns?: boolean;
+  returns?: SaleReturnRecord[];
+  totalRefunded?: number;
+
+  // Exchanges audit trail (linked exchanges without deleting original transaction integrity)
+  hasExchanges?: boolean;
+  exchanges?: SaleExchangeRecord[];
+
   // Timestamps
   createdAt: number;           // Unix millisecond timestamp
   createdAtISO: string;        // ISO 8601 string for human-readable audit
   updatedAt: number;           // Unix millisecond timestamp
+}
+
+export interface ProcessReturnItemInput {
+  productId: string;
+  name: string;
+  sku: string;
+  quantity: number;
+  unitPrice: number;
+  refundAmount: number;
+  restock: boolean;
+  condition?: "good" | "damaged" | "defective";
+}
+
+export interface ProcessReturnInput {
+  saleId: string;
+  items: ProcessReturnItemInput[];
+  refundMethod: "cash" | "card" | "store-credit" | "original" | string;
+  reason: string;
+  operator: {
+    userId: string;
+    username: string;
+    displayName?: string;
+    role: string;
+  };
+}
+
+export interface ProcessExchangeItemInput {
+  productId: string;
+  name: string;
+  sku: string;
+  quantity: number;
+  unitPrice: number;
+  subtotal?: number;
+  variant?: string;
+  categoryName?: string;
+}
+
+export interface ProcessExchangeInput {
+  originalSaleId: string;
+  returnedItems: ProcessReturnItemInput[];
+  replacementItems: ProcessExchangeItemInput[];
+  settlementMethod: "cash" | "card" | "store-credit" | "bank-transfer" | "mobile-qr" | string;
+  reason: string;
+  operator: {
+    userId: string;
+    username: string;
+    displayName?: string;
+    role: string;
+  };
+}
+
+export interface EditSaleInput {
+  customer?: {
+    customerId?: string;
+    name?: string;
+    phone?: string;
+    email?: string;
+  };
+  notes?: string;
+  paymentMethod?: PaymentMethod;
 }
 
 export interface CreateSaleInput {
@@ -97,6 +248,7 @@ export interface CreateSaleInput {
     username: string;
     displayName?: string;
     role: string;
+    permissions?: string[];
   };
   items: SaleItemSnapshot[];
   subtotal: number;
@@ -109,6 +261,7 @@ export interface CreateSaleInput {
   taxAmount: number;
   grandTotal: number;
   paymentMethod: PaymentMethod;
+  splitPayments?: SplitPaymentEntry[];
   cashReceived?: number;
   change?: number;
   customer?: {
