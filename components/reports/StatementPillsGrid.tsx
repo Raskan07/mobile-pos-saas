@@ -27,7 +27,7 @@ export default function StatementPillsGrid({
             Accounting Statements
           </span>
           <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-white/[0.06] text-zinc-400 border border-white/[0.08]">
-            12 Reports Available
+            {STATEMENTS_CONFIG.length} Reports Available
           </span>
         </div>
         <span className="text-xs text-zinc-500 hidden sm:inline">

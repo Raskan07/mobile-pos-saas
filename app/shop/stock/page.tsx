@@ -77,7 +77,8 @@ import StockReportModal from "@/components/stock/StockReportModal";
 
 export default function StockManagementPage() {
   const router = useRouter();
-  const { shop, user, activeBranchName, isAuthenticated, isLoading: isAuthLoading } = useShopAuth();
+  const { shop, user, activeBranchId: ctxBranchId, activeBranchName, isAuthenticated, isLoading: isAuthLoading } = useShopAuth();
+  const activeBranchId = ctxBranchId || user?.primaryBranchId || "main";
 
   // Shop context fallbacks
   const activeShopId = shop?.shopId || "SHOP-7294";
@@ -136,14 +137,14 @@ export default function StockManagementPage() {
     }
   }, [isAuthLoading, isAuthenticated, router]);
 
-  // Load products & categories strictly scoped to shopId
+  // Load products & categories strictly scoped to shopId & activeBranchId
   const loadData = useCallback(async () => {
     if (!activeShopId) return;
     setIsLoading(true);
     try {
       const [fetchedProducts, fetchedCats] = await Promise.all([
-        getProducts(activeShopId),
-        getCategories(activeShopId),
+        getProducts(activeShopId, undefined, undefined, activeBranchId),
+        getCategories(activeShopId, activeBranchId),
       ]);
       setProducts(fetchedProducts);
       setCategories(fetchedCats);
@@ -153,7 +154,7 @@ export default function StockManagementPage() {
     } finally {
       setIsLoading(false);
     }
-  }, [activeShopId]);
+  }, [activeShopId, activeBranchId]);
 
   useEffect(() => {
     loadData();

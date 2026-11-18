@@ -20,12 +20,19 @@ import {
   setDoc,
   updateDoc,
   deleteDoc,
+  onSnapshot,
+  Unsubscribe,
   CollectionReference,
   DocumentData,
 } from "firebase/firestore";
 import { db } from "../firebase";
 import { Shop } from "../types/shop";
 import { ShopUser, CreateUserInput, ShopSession } from "../types/user";
+import {
+  DEFAULT_BRANCH_PERMISSIONS_BY_ROLE,
+  getAuthorizedBranchIdsForUser,
+  isShopAdmin,
+} from "../rbac/permissions";
 
 const SHOPS_COLLECTION = "shops";
 const USERS_SUBCOLLECTION = "users";
@@ -169,7 +176,9 @@ export async function findShopUserByUsernameOrEmail(
 export async function authenticateShopUser(
   shopId: string,
   usernameOrEmail: string,
-  password: string
+  password: string,
+  selectedBranchId?: string,
+  selectedBranchName?: string
 ): Promise<{ user: ShopUser; shop: Shop; session: ShopSession }> {
   const normalizedShopId = normalizeShopId(shopId);
 
@@ -200,15 +209,39 @@ export async function authenticateShopUser(
     throw new Error("Invalid username or password for this shop.");
   }
 
-  // 4. Build secure shop session
+  // 4. Verify Branch Authorization when a branch is selected at login
+  let effectiveUser: ShopUser = { ...shopUser };
+  if (selectedBranchId && selectedBranchId.trim()) {
+    const cleanBranchId = selectedBranchId.trim();
+    const isAdminUser = isShopAdmin(shopUser) || Boolean(shopUser.allBranchesAccess);
+    const authorizedBranchIds = getAuthorizedBranchIdsForUser(shopUser);
+    const isAssignedToBranch =
+      isAdminUser ||
+      authorizedBranchIds.includes(cleanBranchId);
+
+    if (!isAssignedToBranch) {
+      const targetLabel = selectedBranchName || cleanBranchId;
+      throw new Error(
+        `Access denied: @${shopUser.username} (${shopUser.role}) is not assigned to ${targetLabel}.`
+      );
+    }
+
+    effectiveUser = {
+      ...shopUser,
+      branchId: cleanBranchId,
+      branchName: selectedBranchName || shopUser.branchName || "Main Branch",
+    };
+  }
+
+  // 5. Build secure shop session
   const session: ShopSession = {
     shopId: normalizedShopId,
     shopName: shop.shopName,
-    user: shopUser,
+    user: effectiveUser,
     loginTime: Date.now(),
   };
 
-  return { user: shopUser, shop, session };
+  return { user: effectiveUser, shop, session };
 }
 
 /**
@@ -246,6 +279,19 @@ export async function createShopUserNested(
   }
 
   const now = Date.now();
+  const cleanRole = (input.role || "cashier").toLowerCase();
+  const primaryBranchId = (input.primaryBranchId || input.branchId || "main").trim();
+  const assignedBranchIds = Array.from(
+    new Set([primaryBranchId, ...(input.assignedBranchIds || [])])
+  );
+  const allBranchesAccess =
+    input.allBranchesAccess !== undefined
+      ? Boolean(input.allBranchesAccess)
+      : cleanRole === "admin";
+  const defaultBranchPerms =
+    DEFAULT_BRANCH_PERMISSIONS_BY_ROLE[cleanRole] ||
+    DEFAULT_BRANCH_PERMISSIONS_BY_ROLE.cashier;
+
   const userData: ShopUser = {
     uid: authUid,
     username,
@@ -257,8 +303,12 @@ export async function createShopUserNested(
     role: input.role,
     shopId: normalizedShopId,
     shopName,
-    branchId: input.branchId || "main",
+    branchId: primaryBranchId,
     branchName: input.branchName || "Main Branch",
+    primaryBranchId,
+    assignedBranchIds,
+    allBranchesAccess,
+    branchPermissions: input.branchPermissions || defaultBranchPerms,
     permissions: input.permissions || [input.role],
     status: "active",
     createdAt: now,
@@ -290,4 +340,56 @@ export function getShopScopedCollection<T = DocumentData>(
 ): CollectionReference<T> {
   const normalizedShopId = normalizeShopId(shopId);
   return collection(db, SHOPS_COLLECTION, normalizedShopId, subcollectionName) as CollectionReference<T>;
+}
+
+/**
+ * Real-time listener for all user accounts assigned to a specific shop.
+ * Combines both `shops/{shopId}/users` and global `users` (where shopId == currentShop),
+ * deduplicating by UID and username.
+ */
+export function subscribeToAllShopAccounts(
+  shopId: string,
+  callback: (users: ShopUser[]) => void
+): Unsubscribe {
+  const normShop = normalizeShopId(shopId);
+  const nestedRef = collection(db, SHOPS_COLLECTION, normShop, USERS_SUBCOLLECTION);
+  const rootRef = query(collection(db, "users"), where("shopId", "==", normShop));
+
+  let nestedUsers: ShopUser[] = [];
+  let rootUsers: ShopUser[] = [];
+
+  const emit = () => {
+    const map = new Map<string, ShopUser>();
+    [...nestedUsers, ...rootUsers].forEach((u) => {
+      const key = u.uid || u.username;
+      if (key && !map.has(key)) {
+        map.set(key, u);
+      }
+    });
+    const combined = Array.from(map.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    callback(combined);
+  };
+
+  const unsubNested = onSnapshot(
+    nestedRef,
+    (snap) => {
+      nestedUsers = snap.docs.map((d) => d.data() as ShopUser);
+      emit();
+    },
+    (err) => console.warn("[ShopAuth] Nested users listener notice:", err)
+  );
+
+  const unsubRoot = onSnapshot(
+    rootRef,
+    (snap) => {
+      rootUsers = snap.docs.map((d) => d.data() as ShopUser);
+      emit();
+    },
+    (err) => console.warn("[ShopAuth] Root users listener notice:", err)
+  );
+
+  return () => {
+    unsubNested();
+    unsubRoot();
+  };
 }

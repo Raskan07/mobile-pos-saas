@@ -560,7 +560,8 @@ function BarcodeItemRow({
 // ---------------------------------------------------------------------------
 
 export default function BarcodeCenterPage() {
-  const { shop, user, isAuthenticated, isLoading: authLoading } = useShopAuth();
+  const { shop, user, activeBranchId: ctxBranchId, isAuthenticated, isLoading: authLoading } = useShopAuth();
+  const activeBranchId = ctxBranchId || user?.primaryBranchId || "main";
   const router = useRouter();
 
   // ── Data ──
@@ -627,15 +628,15 @@ export default function BarcodeCenterPage() {
     if (!isAuthenticated || !shop?.shopId) return;
     loadProducts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAuthenticated, shop?.shopId]);
+  }, [isAuthenticated, shop?.shopId, activeBranchId]);
 
   const loadProducts = useCallback(async () => {
     if (!shop?.shopId) return;
     setLoadingProducts(true);
     setLoadError(null);
     try {
-      // Scoped strictly by shopId
-      const products = await getProducts(shop.shopId);
+      // Scoped strictly by shopId & activeBranchId
+      const products = await getProducts(shop.shopId, undefined, undefined, activeBranchId);
       const flattened: BarcodeItem[] = [];
       products.forEach((p) => {
         flattened.push(...flattenProductToItems(p));

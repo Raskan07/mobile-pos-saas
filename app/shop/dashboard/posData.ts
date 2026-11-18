@@ -32,9 +32,14 @@ export interface CartItem {
   customPrice?: number;
   variant?: string;
   variantId?: string;
+  /** Per-product discount setting (when billing discount scope is "item") */
+  itemDiscountType?: "percentage" | "fixed";
+  itemDiscountValue?: number;
 }
 
 export interface DiscountSetting {
   type: "percentage" | "fixed";
   value: number;
+  /** "group" = bill-wide group discount, "item" = each product discount */
+  scope?: "group" | "item";
 }

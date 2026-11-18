@@ -35,6 +35,7 @@ import {
   Sparkles,
   Users,
   Compass,
+  Bell,
 } from "lucide-react";
 import { Shop } from "@/lib/types/shop";
 import { ShopUser, ROLE_CONFIG } from "@/lib/types/user";
@@ -48,6 +49,7 @@ interface ShopDetailsModalProps {
   onToggleHide: (shop: Shop) => void;
   onDelete: (shop: Shop) => void;
   onAssignStaff: (shop: Shop) => void;
+  onSendMessage?: (shop: Shop) => void;
 }
 
 export function ShopDetailsModal({
@@ -58,6 +60,7 @@ export function ShopDetailsModal({
   onToggleHide,
   onDelete,
   onAssignStaff,
+  onSendMessage,
 }: ShopDetailsModalProps) {
   const [copied, setCopied] = useState(false);
   const [staffList, setStaffList] = useState<ShopUser[]>([]);
@@ -407,6 +410,20 @@ export function ShopDetailsModal({
           </button>
 
           <div className="flex items-center gap-2">
+            {onSendMessage && (
+              <button
+                type="button"
+                onClick={() => {
+                  handleClose();
+                  onSendMessage(shop);
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/35 text-emerald-300 hover:text-emerald-200 text-xs font-semibold transition-all cursor-pointer"
+              >
+                <Bell className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Send Message / Update</span>
+              </button>
+            )}
+
             <button
               type="button"
               onClick={() => {

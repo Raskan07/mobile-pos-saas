@@ -123,9 +123,11 @@ export async function recordStockMovement(
   }
 
   // Construct audit transaction
+  const targetBranchId = input.branchId && input.branchId !== "ALL" ? input.branchId : "main";
   const transaction: StockTransaction = {
     id: txId,
     shopId: normShopId,
+    branchId: targetBranchId,
     productId: input.productId,
     productName: input.productName || productData.name,
     sku: input.sku || productData.sku,
@@ -173,11 +175,46 @@ export async function recordStockMovement(
 
   await updateDoc(productRef, updatePayload);
 
+  // Also update branch-nested product collection `shops/{shopId}/branches/{branchId}/products/{productId}`
+  try {
+    const prodBranchId = productData.branchId || targetBranchId || "main";
+    const branchProdRef = doc(
+      db,
+      "shops",
+      normShopId,
+      "branches",
+      prodBranchId,
+      "products",
+      input.productId
+    );
+    await updateDoc(branchProdRef, updatePayload);
+  } catch (_) {}
+
   // Also update root collection "products" if present
   try {
     const rootProductRef = doc(db, "products", input.productId);
     await updateDoc(rootProductRef, updatePayload);
   } catch (_) {}
+
+  // 3. Sync branch-specific stock record
+  try {
+    const { adjustBranchStock } = await import("./branchService");
+    await adjustBranchStock(
+      normShopId,
+      targetBranchId,
+      input.productId,
+      quantityDelta,
+      user.userId,
+      {
+        damagedDelta: input.type === "DAMAGED" ? Math.abs(quantityDelta) : 0,
+        variantId: input.variantId,
+        productName: input.productName || productData.name,
+        sku: input.sku || productData.sku,
+      }
+    );
+  } catch (branchErr) {
+    console.warn("[StockService] Non-blocking branchStock sync notice:", branchErr);
+  }
 
   return { transaction, newStock };
 }
@@ -216,6 +253,24 @@ export async function updateProductMinStockLevel(
       displayName: user.displayName || user.username,
     },
   });
+
+  // Mirror to branch-nested products collection
+  try {
+    const prodBranchId = prod.branchId || "main";
+    await updateDoc(
+      doc(db, "shops", normShopId, "branches", prodBranchId, "products", productId),
+      {
+        minStockLevel: cleanMin,
+        updatedAt: now,
+        updatedBy: {
+          userId: user.userId,
+          username: user.username,
+          role: user.role,
+          displayName: user.displayName || user.username,
+        },
+      }
+    );
+  } catch (_) {}
 
   // Mirror to root products collection
   try {

@@ -31,6 +31,10 @@ import { PurchaseRecord } from "../types/purchase";
 import { ProductItem } from "../types/catalog";
 import { CustomerRecord } from "../types/customer";
 import { ExpenseRecord } from "../types/expense";
+import { RepairTicket, RepairEstimate, RepairPartUsage } from "../types/repair";
+import { CustomRepairPart } from "./repairService";
+import { InstallmentPlanRecord } from "../types/installment";
+import { fetchInstallmentPlans } from "./installmentService";
 import {
   DateRangePreset,
   ReportDateFilter,
@@ -40,6 +44,8 @@ import {
   CashFlowData,
   TrialBalanceData,
   SalesStatementData,
+  RepairStatementData,
+  RepairStatementTicketRow,
   InventoryValuationData,
   PurchaseStatementData,
   ARAgingData,
@@ -177,215 +183,269 @@ export function getDateFilter(preset: DateRangePreset, customStart?: string, cus
 }
 
 // ─────────────────────────────────────────────────────────────
-// Raw Data Fetchers
+// Raw Data Fetchers (Optimized Parallel Execution + SWR Memory Cache)
 // ─────────────────────────────────────────────────────────────
 
-export async function fetchRawAccountingData(shopId: string) {
+export interface RawAccountingDataSnapshot {
+  sales: SaleRecord[];
+  purchases: PurchaseRecord[];
+  products: ProductItem[];
+  customers: CustomerRecord[];
+  expenses: ExpenseRecord[];
+  repairs: RepairTicket[];
+  repairParts: CustomRepairPart[];
+  installments: InstallmentPlanRecord[];
+}
+
+const accountingDataMemoryCache = new Map<
+  string,
+  { timestamp: number; data: RawAccountingDataSnapshot }
+>();
+
+export function getCachedRawAccountingData(shopId: string): RawAccountingDataSnapshot | null {
+  const normShop = (shopId || "").trim().toUpperCase();
+  const cached = accountingDataMemoryCache.get(normShop);
+  return cached ? cached.data : null;
+}
+
+export async function fetchRawAccountingData(shopId: string): Promise<RawAccountingDataSnapshot> {
   const normShop = (shopId || "").trim().toUpperCase();
 
-  // 1. Fetch Sales (Live Firestore: root "sales" + shops/{shopId}/sales)
-  let sales: SaleRecord[] = [];
-  try {
-    const saleMap = new Map<string, SaleRecord>();
-    if (normShop && normShop !== "ALL") {
-      // Root collection query
+  // Execute all 8 Firestore collection queries in parallel instead of sequentially
+  const [
+    sales,
+    purchases,
+    products,
+    customers,
+    expenses,
+    repairs,
+    repairParts,
+    installments,
+  ] = await Promise.all([
+    // 1. Sales
+    (async (): Promise<SaleRecord[]> => {
       try {
-        const q = query(collection(db, "sales"), where("shopId", "==", normShop));
-        const snap = await getDocs(q);
-        snap.docs.forEach((d) => {
-          saleMap.set(d.id, { saleId: d.id, ...(d.data() as Omit<SaleRecord, "saleId">) });
-        });
-      } catch (err) {
-        console.warn("[AccountingService] Root sales query notice:", err);
-      }
-
-      // Shop subcollection query
-      try {
-        const subSnap = await getDocs(collection(db, "shops", normShop, "sales"));
-        subSnap.docs.forEach((d) => {
-          if (!saleMap.has(d.id)) {
+        const saleMap = new Map<string, SaleRecord>();
+        if (normShop && normShop !== "ALL") {
+          const [rootSnap, subSnap] = await Promise.all([
+            getDocs(query(collection(db, "sales"), where("shopId", "==", normShop))).catch(() => null),
+            getDocs(collection(db, "shops", normShop, "sales")).catch(() => null),
+          ]);
+          rootSnap?.docs.forEach((d) => {
             saleMap.set(d.id, { saleId: d.id, ...(d.data() as Omit<SaleRecord, "saleId">) });
-          }
-        });
-      } catch (err) {
-        console.warn("[AccountingService] Subcollection sales query notice:", err);
+          });
+          subSnap?.docs.forEach((d) => {
+            if (!saleMap.has(d.id)) {
+              saleMap.set(d.id, { saleId: d.id, ...(d.data() as Omit<SaleRecord, "saleId">) });
+            }
+          });
+        } else {
+          const snap = await getDocs(collection(db, "sales"));
+          snap.docs.forEach((d) => {
+            saleMap.set(d.id, { saleId: d.id, ...(d.data() as Omit<SaleRecord, "saleId">) });
+          });
+        }
+        const list = Array.from(saleMap.values());
+        list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        return list;
+      } catch {
+        return [];
       }
-    } else {
-      const snap = await getDocs(collection(db, "sales"));
-      snap.docs.forEach((d) => {
-        saleMap.set(d.id, { saleId: d.id, ...(d.data() as Omit<SaleRecord, "saleId">) });
-      });
-    }
-    sales = Array.from(saleMap.values());
-    sales.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  } catch (err) {
-    console.warn("[AccountingService] Sales fetch error:", err);
-  }
+    })(),
 
-  // 2. Fetch Purchases (Live Firestore: shops/{shopId}/purchases + root "purchases")
-  let purchases: PurchaseRecord[] = [];
-  try {
-    const purchaseMap = new Map<string, PurchaseRecord>();
-    if (normShop && normShop !== "ALL") {
+    // 2. Purchases
+    (async (): Promise<PurchaseRecord[]> => {
       try {
-        const pRef = collection(db, "shops", normShop, "purchases");
-        const snap = await getDocs(pRef);
-        snap.docs.forEach((d) => {
-          purchaseMap.set(d.id, { id: d.id, ...(d.data() as Omit<PurchaseRecord, "id">) });
-        });
-      } catch (err) {
-        console.warn("[AccountingService] Subcollection purchases query notice:", err);
-      }
-
-      try {
-        const q = query(collection(db, "purchases"), where("shopId", "==", normShop));
-        const rootSnap = await getDocs(q);
-        rootSnap.docs.forEach((d) => {
-          if (!purchaseMap.has(d.id)) {
+        const purchaseMap = new Map<string, PurchaseRecord>();
+        if (normShop && normShop !== "ALL") {
+          const [subSnap, rootSnap] = await Promise.all([
+            getDocs(collection(db, "shops", normShop, "purchases")).catch(() => null),
+            getDocs(query(collection(db, "purchases"), where("shopId", "==", normShop))).catch(() => null),
+          ]);
+          subSnap?.docs.forEach((d) => {
             purchaseMap.set(d.id, { id: d.id, ...(d.data() as Omit<PurchaseRecord, "id">) });
-          }
-        });
-      } catch (err) {
-        console.warn("[AccountingService] Root purchases query notice:", err);
+          });
+          rootSnap?.docs.forEach((d) => {
+            if (!purchaseMap.has(d.id)) {
+              purchaseMap.set(d.id, { id: d.id, ...(d.data() as Omit<PurchaseRecord, "id">) });
+            }
+          });
+        } else {
+          const snap = await getDocs(collection(db, "purchases"));
+          snap.docs.forEach((d) => {
+            purchaseMap.set(d.id, { id: d.id, ...(d.data() as Omit<PurchaseRecord, "id">) });
+          });
+        }
+        return Array.from(purchaseMap.values());
+      } catch {
+        return [];
       }
-    } else {
-      const snap = await getDocs(collection(db, "purchases"));
-      snap.docs.forEach((d) => {
-        purchaseMap.set(d.id, { id: d.id, ...(d.data() as Omit<PurchaseRecord, "id">) });
-      });
-    }
-    purchases = Array.from(purchaseMap.values());
-  } catch (err) {
-    console.warn("[AccountingService] Purchases fetch error:", err);
-  }
+    })(),
 
-  // 3. Fetch Products (Live Firestore: shops/{shopId}/products + root "products" collection)
-  let products: ProductItem[] = [];
-  try {
-    const productMap = new Map<string, ProductItem>();
-    if (normShop && normShop !== "ALL") {
-      // Check subcollection shops/{shopId}/products
+    // 3. Products
+    (async (): Promise<ProductItem[]> => {
       try {
-        const prodRef = collection(db, "shops", normShop, "products");
-        const snap = await getDocs(prodRef);
-        snap.docs.forEach((d) => {
-          productMap.set(d.id, { id: d.id, ...(d.data() as Omit<ProductItem, "id">) });
-        });
-      } catch (err) {
-        console.warn("[AccountingService] Subcollection products query notice:", err);
-      }
-
-      // Check root "products" collection
-      try {
-        const rootQ = query(collection(db, "products"), where("shopId", "==", normShop));
-        const rootSnap = await getDocs(rootQ);
-        rootSnap.docs.forEach((d) => {
-          if (!productMap.has(d.id)) {
+        const productMap = new Map<string, ProductItem>();
+        if (normShop && normShop !== "ALL") {
+          const [subSnap, rootSnap] = await Promise.all([
+            getDocs(collection(db, "shops", normShop, "products")).catch(() => null),
+            getDocs(query(collection(db, "products"), where("shopId", "==", normShop))).catch(() => null),
+          ]);
+          subSnap?.docs.forEach((d) => {
             productMap.set(d.id, { id: d.id, ...(d.data() as Omit<ProductItem, "id">) });
-          }
-        });
-      } catch (err) {
-        console.warn("[AccountingService] Root products query notice:", err);
-      }
-    } else {
-      // All shops: scan shops subcollections and root products
-      const shopsSnap = await getDocs(collection(db, "shops"));
-      for (const sDoc of shopsSnap.docs) {
-        try {
-          const pRef = collection(db, "shops", sDoc.id, "products");
-          const pSnap = await getDocs(pRef);
-          pSnap.docs.forEach((pd) => {
+          });
+          rootSnap?.docs.forEach((d) => {
+            if (!productMap.has(d.id)) {
+              productMap.set(d.id, { id: d.id, ...(d.data() as Omit<ProductItem, "id">) });
+            }
+          });
+        } else {
+          const rootSnap = await getDocs(collection(db, "products")).catch(() => null);
+          rootSnap?.docs.forEach((pd) => {
             productMap.set(pd.id, { id: pd.id, ...(pd.data() as Omit<ProductItem, "id">) });
           });
-        } catch (_) {}
+        }
+        return Array.from(productMap.values());
+      } catch {
+        return [];
       }
-      try {
-        const rootSnap = await getDocs(collection(db, "products"));
-        rootSnap.docs.forEach((pd) => {
-          if (!productMap.has(pd.id)) {
-            productMap.set(pd.id, { id: pd.id, ...(pd.data() as Omit<ProductItem, "id">) });
-          }
-        });
-      } catch (_) {}
-    }
-    products = Array.from(productMap.values());
-  } catch (err) {
-    console.warn("[AccountingService] Products fetch error:", err);
-  }
+    })(),
 
-  // 4. Fetch Customers (Live Firestore: shops/{shopId}/customers with root fallback)
-  let customers: CustomerRecord[] = [];
-  try {
-    const customerMap = new Map<string, CustomerRecord>();
-    if (normShop && normShop !== "ALL") {
+    // 4. Customers
+    (async (): Promise<CustomerRecord[]> => {
       try {
-        const cRef = collection(db, "shops", normShop, "customers");
-        const snap = await getDocs(cRef);
-        snap.docs.forEach((d) => {
-          customerMap.set(d.id, { id: d.id, ...(d.data() as Omit<CustomerRecord, "id">) });
-        });
-      } catch (_) {}
-
-      try {
-        const q = query(collection(db, "customers"), where("shopId", "==", normShop));
-        const rootSnap = await getDocs(q);
-        rootSnap.docs.forEach((d) => {
-          if (!customerMap.has(d.id)) {
+        const customerMap = new Map<string, CustomerRecord>();
+        if (normShop && normShop !== "ALL") {
+          const [subSnap, rootSnap] = await Promise.all([
+            getDocs(collection(db, "shops", normShop, "customers")).catch(() => null),
+            getDocs(query(collection(db, "customers"), where("shopId", "==", normShop))).catch(() => null),
+          ]);
+          subSnap?.docs.forEach((d) => {
             customerMap.set(d.id, { id: d.id, ...(d.data() as Omit<CustomerRecord, "id">) });
-          }
-        });
-      } catch (_) {}
-    } else {
-      const snap = await getDocs(collection(db, "customers"));
-      snap.docs.forEach((d) => {
-        customerMap.set(d.id, { id: d.id, ...(d.data() as Omit<CustomerRecord, "id">) });
-      });
-    }
-    customers = Array.from(customerMap.values());
-  } catch (err) {
-    console.warn("[AccountingService] Customers fetch error:", err);
-  }
-
-  // 5. Fetch Expenses (Live Firestore: root "expenses" + shops/{shopId}/expenses)
-  let expenses: ExpenseRecord[] = [];
-  try {
-    const expenseMap = new Map<string, ExpenseRecord>();
-    if (normShop && normShop !== "ALL") {
-      // 1. Root expenses collection
-      try {
-        const q = query(collection(db, "expenses"), where("shopId", "==", normShop));
-        const rootSnap = await getDocs(q);
-        rootSnap.docs.forEach((d) => {
-          expenseMap.set(d.id, { id: d.id, ...(d.data() as Omit<ExpenseRecord, "id">) });
-        });
-      } catch (err) {
-        console.warn("[AccountingService] Root expenses query notice:", err);
+          });
+          rootSnap?.docs.forEach((d) => {
+            if (!customerMap.has(d.id)) {
+              customerMap.set(d.id, { id: d.id, ...(d.data() as Omit<CustomerRecord, "id">) });
+            }
+          });
+        } else {
+          const snap = await getDocs(collection(db, "customers"));
+          snap.docs.forEach((d) => {
+            customerMap.set(d.id, { id: d.id, ...(d.data() as Omit<CustomerRecord, "id">) });
+          });
+        }
+        return Array.from(customerMap.values());
+      } catch {
+        return [];
       }
+    })(),
 
-      // 2. Subcollection shops/{shopId}/expenses
+    // 5. Expenses (Includes Operating Expenses, Custom/Other Expenses, and Employee Salaries)
+    (async (): Promise<ExpenseRecord[]> => {
       try {
-        const expRef = collection(db, "shops", normShop, "expenses");
-        const snap = await getDocs(expRef);
-        snap.docs.forEach((d) => {
-          if (!expenseMap.has(d.id)) {
+        const expenseMap = new Map<string, ExpenseRecord>();
+        if (normShop && normShop !== "ALL") {
+          const [subSnap, rootSnap] = await Promise.all([
+            getDocs(collection(db, "shops", normShop, "expenses")).catch(() => null),
+            getDocs(query(collection(db, "expenses"), where("shopId", "==", normShop))).catch(() => null),
+          ]);
+          subSnap?.docs.forEach((d) => {
             expenseMap.set(d.id, { id: d.id, ...(d.data() as Omit<ExpenseRecord, "id">) });
-          }
-        });
-      } catch (err) {
-        console.warn("[AccountingService] Subcollection expenses query notice:", err);
+          });
+          rootSnap?.docs.forEach((d) => {
+            if (!expenseMap.has(d.id)) {
+              expenseMap.set(d.id, { id: d.id, ...(d.data() as Omit<ExpenseRecord, "id">) });
+            }
+          });
+        } else {
+          const snap = await getDocs(collection(db, "expenses"));
+          snap.docs.forEach((d) => {
+            expenseMap.set(d.id, { id: d.id, ...(d.data() as Omit<ExpenseRecord, "id">) });
+          });
+        }
+        return Array.from(expenseMap.values());
+      } catch {
+        return [];
       }
-    } else {
-      const snap = await getDocs(collection(db, "expenses"));
-      snap.docs.forEach((d) => {
-        expenseMap.set(d.id, { id: d.id, ...(d.data() as Omit<ExpenseRecord, "id">) });
-      });
-    }
-    expenses = Array.from(expenseMap.values());
-  } catch (err) {
-    console.warn("[AccountingService] Expenses fetch error:", err);
+    })(),
+
+    // 6. Repairs (Single-pass without N+1 per-ticket subcollection waterfall)
+    (async (): Promise<RepairTicket[]> => {
+      try {
+        const repairMap = new Map<string, RepairTicket>();
+        if (normShop && normShop !== "ALL") {
+          const [subSnap, rootSnap] = await Promise.all([
+            getDocs(collection(db, "shops", normShop, "repairs")).catch(() => null),
+            getDocs(query(collection(db, "repairs"), where("shopId", "==", normShop))).catch(() => null),
+          ]);
+          subSnap?.docs.forEach((d) => {
+            repairMap.set(d.id, { id: d.id, ...(d.data() as Omit<RepairTicket, "id">) });
+          });
+          rootSnap?.docs.forEach((d) => {
+            if (!repairMap.has(d.id)) {
+              repairMap.set(d.id, { id: d.id, ...(d.data() as Omit<RepairTicket, "id">) });
+            }
+          });
+        } else {
+          const snap = await getDocs(collection(db, "repairs"));
+          snap.docs.forEach((d) => {
+            repairMap.set(d.id, { id: d.id, ...(d.data() as Omit<RepairTicket, "id">) });
+          });
+        }
+        return Array.from(repairMap.values());
+      } catch {
+        return [];
+      }
+    })(),
+
+    // 7. Repair Parts
+    (async (): Promise<CustomRepairPart[]> => {
+      try {
+        const partMap = new Map<string, CustomRepairPart>();
+        if (normShop && normShop !== "ALL") {
+          const snap = await getDocs(collection(db, "shops", normShop, "repair_catalog_parts")).catch(() => null);
+          snap?.docs.forEach((d) => {
+            partMap.set(d.id, { id: d.id, ...(d.data() as Omit<CustomRepairPart, "id">) });
+          });
+        }
+        return Array.from(partMap.values());
+      } catch {
+        return [];
+      }
+    })(),
+
+    // 8. Installments
+    (async (): Promise<InstallmentPlanRecord[]> => {
+      try {
+        if (normShop && normShop !== "ALL") {
+          return await fetchInstallmentPlans(normShop);
+        }
+        return [];
+      } catch {
+        return [];
+      }
+    })(),
+  ]);
+
+  const snapshot: RawAccountingDataSnapshot = {
+    sales,
+    purchases,
+    products,
+    customers,
+    expenses,
+    repairs,
+    repairParts,
+    installments,
+  };
+
+  if (normShop) {
+    accountingDataMemoryCache.set(normShop, {
+      timestamp: Date.now(),
+      data: snapshot,
+    });
   }
 
-  return { sales, purchases, products, customers, expenses };
+  return snapshot;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -402,6 +462,9 @@ export function generateMasterAccountingReport(
     products: ProductItem[];
     customers: CustomerRecord[];
     expenses?: ExpenseRecord[];
+    repairs?: RepairTicket[];
+    repairParts?: CustomRepairPart[];
+    installments?: InstallmentPlanRecord[];
   }
 ): MasterAccountingReportsData {
   const { startStartTime: startTimeMs, endTimeMs } = {
@@ -413,6 +476,14 @@ export function generateMasterAccountingReport(
   const filteredSales = (data.sales || []).filter((s) => {
     const t = s.createdAt || (s as unknown as { date: number }).date || 0;
     return t >= startTimeMs && t <= endTimeMs;
+  });
+
+  // 1b. Filter Repairs by date range (createdAt or closedAt or updatedAt within period)
+  const allRepairs = data.repairs || [];
+  const filteredRepairs = allRepairs.filter((r) => {
+    const created = r.createdAt || 0;
+    const closed = r.closedAt || 0;
+    return (created >= startTimeMs && created <= endTimeMs) || (closed >= startTimeMs && closed <= endTimeMs);
   });
 
   // 2. Filter Purchases by date range
@@ -439,7 +510,7 @@ export function generateMasterAccountingReport(
   const postedLiabilityPayments: ExpenseRecord[] = validExpenses.filter((e) => e.expenseType === "LIABILITY_PAYMENT");
   const postedOwnerWithdrawals: ExpenseRecord[] = validExpenses.filter((e) => e.expenseType === "OWNER_WITHDRAWAL");
 
-  // Build product lookup map for accurate COGS calculation
+  // Build product lookup map for accurate COGS calculation (including workshop spare parts catalog)
   const productCostMap = new Map<string, number>();
   (data.products || []).forEach((p) => {
     const c = typeof p.costPrice === "number" ? p.costPrice : 0;
@@ -448,24 +519,237 @@ export function generateMasterAccountingReport(
     if (p.barcode) productCostMap.set(p.barcode, c);
   });
 
+  const repairPartCostMap = new Map<string, number>();
+  (data.repairParts || []).forEach((rp) => {
+    const c = typeof rp.costPriceLKR === "number" ? rp.costPriceLKR : 0;
+    if (rp.id) repairPartCostMap.set(rp.id.toLowerCase(), c);
+    if (rp.sku) repairPartCostMap.set(rp.sku.toLowerCase(), c);
+    if (rp.name) repairPartCostMap.set(rp.name.toLowerCase(), c);
+  });
+
   // ─────────────────────────────────────────────────────────
-  // A. PROFIT & LOSS CALCULATIONS (Original Real Data)
+  // A0. WORKSHOP REPAIR STATEMENT & CHANNEL FINANCIALS
   // ─────────────────────────────────────────────────────────
-  let grossSales = 0;
-  let totalDiscounts = 0;
+  const repairLinkedSaleIds = new Set<string>();
+  allRepairs.forEach((r) => {
+    if (r.finalSaleId) repairLinkedSaleIds.add(r.finalSaleId);
+  });
+
+  let totalRepairPartsRevenue = 0;
+  let totalRepairServiceRevenue = 0;
+  let totalRepairDiscounts = 0;
+  let totalGrossRepairRevenue = 0;
+  let totalCollectedRepairRevenue = 0;
+  let totalOutstandingRepairReceivables = 0;
+  let totalRepairPartsCost = 0;
+
+  // Track repair revenue/collections NOT already recorded as a POS SaleRecord in filteredSales
+  let uninvoicedRepairGrossRevenue = 0;
+  let uninvoicedRepairDiscounts = 0;
+  let uninvoicedRepairCollectedCash = 0;
+  let uninvoicedRepairCollectedCost = 0;
+
+  let completedTicketsCount = 0;
+  let activeTicketsCount = 0;
+  let cancelledTicketsCount = 0;
+  const repairStatusMap: Record<string, { count: number; revenue: number; cost: number; profit: number }> = {};
+
+  const filteredSaleIdSet = new Set(filteredSales.map((s) => s.saleId));
+
+  const repairTicketRows: RepairStatementTicketRow[] = filteredRepairs.map((ticket) => {
+    const isCancelledOrDeclined =
+      ticket.status === "cancelled" ||
+      ticket.status === "customer_declined" ||
+      ticket.status === "irreparable";
+    const isCompleted = ticket.status === "collected" || ticket.status === "delivered";
+
+    if (isCancelledOrDeclined) {
+      cancelledTicketsCount++;
+    } else if (isCompleted) {
+      completedTicketsCount++;
+    } else {
+      activeTicketsCount++;
+    }
+
+    const discountAmt = Number(ticket.discountAmount || 0);
+    const addlAmt = Number(ticket.additionalCharges || 0);
+    // estimatedCost in RepairTicket is net of discount in POS intake; ensure payable is accurate
+    const billableRev = isCancelledOrDeclined
+      ? 0
+      : Math.max(0, Number(ticket.estimatedCost || 0) + addlAmt);
+
+    // Determine replacement parts selling revenue vs service/labour revenue
+    let partsRev = 0;
+    let serviceRev = 0;
+    let partsCost = Number(ticket.internalPartsCost || 0);
+
+    if (!isCancelledOrDeclined) {
+      if (ticket.intakeLineItems && ticket.intakeLineItems.length > 0) {
+        ticket.intakeLineItems.forEach((it) => {
+          const lineTotal = Number(it.totalPrice || 0);
+          if (it.type === "part") {
+            partsRev += lineTotal;
+          } else {
+            serviceRev += lineTotal;
+          }
+          if (partsCost <= 0 && it.sku) {
+            const skuKey = it.sku.toLowerCase();
+            if (repairPartCostMap.has(skuKey)) {
+              partsCost += repairPartCostMap.get(skuKey)! * (Number(it.quantity) || 1);
+            } else if (productCostMap.has(skuKey)) {
+              partsCost += productCostMap.get(skuKey)! * (Number(it.quantity) || 1);
+            }
+          }
+        });
+      }
+
+      if (ticket.serviceChargeAmount && ticket.serviceChargeAmount > 0 && serviceRev === 0) {
+        serviceRev += Number(ticket.serviceChargeAmount);
+      }
+
+      // Reconcile partsRev + serviceRev with billableRev
+      const rawSplitSum = partsRev + serviceRev;
+      if (rawSplitSum <= 0 && billableRev > 0) {
+        serviceRev = billableRev;
+      } else if (rawSplitSum > 0 && Math.abs(rawSplitSum - discountAmt - billableRev) > 0.01) {
+        const diff = billableRev - Math.max(0, rawSplitSum - discountAmt);
+        if (diff > 0) serviceRev += diff;
+      }
+    }
+
+    const paidAmt = isCancelledOrDeclined
+      ? 0
+      : isCompleted && (ticket.totalPaid || 0) <= 0
+      ? billableRev
+      : Number(ticket.totalPaid || ticket.depositPaid || 0);
+    const balDue = isCancelledOrDeclined ? 0 : Math.max(0, billableRev - paidAmt);
+    const ticketProfit = isCancelledOrDeclined ? 0 : billableRev - partsCost;
+    const ticketMarginPct = billableRev > 0 ? (ticketProfit / billableRev) * 100 : 0;
+
+    if (!isCancelledOrDeclined) {
+      totalRepairPartsRevenue += partsRev;
+      totalRepairServiceRevenue += Math.max(0, billableRev - partsRev);
+      totalRepairDiscounts += discountAmt;
+      totalGrossRepairRevenue += billableRev;
+      totalCollectedRepairRevenue += paidAmt;
+      totalOutstandingRepairReceivables += balDue;
+      totalRepairPartsCost += partsCost;
+
+      const hasMatchingFilteredSale = Boolean(ticket.finalSaleId && filteredSaleIdSet.has(ticket.finalSaleId));
+      if (!hasMatchingFilteredSale) {
+        // Realized revenue from completed/delivered repairs or collected deposits not yet in POS sales
+        const realizedRev = isCompleted || ticket.status === "ready_for_collection" ? billableRev : paidAmt;
+        if (realizedRev > 0) {
+          uninvoicedRepairGrossRevenue += realizedRev + discountAmt;
+          uninvoicedRepairDiscounts += discountAmt;
+        }
+        if (paidAmt > 0) {
+          uninvoicedRepairCollectedCash += paidAmt;
+        }
+        if (partsCost > 0 && (isCompleted || ticket.status === "ready_for_collection" || paidAmt > 0)) {
+          uninvoicedRepairCollectedCost += partsCost;
+        }
+      }
+    }
+
+    const stKey = (ticket.status || "received").toUpperCase().replace(/_/g, " ");
+    if (!repairStatusMap[stKey]) {
+      repairStatusMap[stKey] = { count: 0, revenue: 0, cost: 0, profit: 0 };
+    }
+    repairStatusMap[stKey].count++;
+    repairStatusMap[stKey].revenue += billableRev;
+    repairStatusMap[stKey].cost += partsCost;
+    repairStatusMap[stKey].profit += ticketProfit;
+
+    const d = new Date(ticket.createdAt || Date.now());
+    const dateFormatted = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+    return {
+      ticketId: ticket.id,
+      ticketNumber: ticket.ticketNumber || `REP-${ticket.id.slice(0, 6).toUpperCase()}`,
+      date: dateFormatted,
+      customerName: ticket.customerName || "Walk-in Customer",
+      customerPhone: ticket.customerPhone || "-",
+      device: `${ticket.brand || ""} ${ticket.model || "Device"}`.trim(),
+      faultsSummary: (ticket.reportedFaults || []).join(", ") || "General Repair",
+      status: stKey,
+      technicianName: ticket.assignedTechnicianName || "Workshop Team",
+      partsRevenue: Math.round(partsRev * 100) / 100,
+      serviceRevenue: Math.round(Math.max(0, billableRev - partsRev) * 100) / 100,
+      discountAmount: Math.round(discountAmt * 100) / 100,
+      totalBillableRevenue: Math.round(billableRev * 100) / 100,
+      partsCost: Math.round(partsCost * 100) / 100,
+      grossProfit: Math.round(ticketProfit * 100) / 100,
+      marginPct: Math.round(ticketMarginPct * 10) / 10,
+      amountPaid: Math.round(paidAmt * 100) / 100,
+      balanceDue: Math.round(balDue * 100) / 100,
+      invoiceNumber: ticket.finalInvoiceNumber || ticket.intakeReceiptNumber,
+    };
+  });
+
+  const netRepairProfit = totalGrossRepairRevenue - totalRepairPartsCost;
+  const repairMarginPct = totalGrossRepairRevenue > 0 ? (netRepairProfit / totalGrossRepairRevenue) * 100 : 0;
+
+  const repairStatement: RepairStatementData = {
+    tickets: repairTicketRows,
+    totalTicketsCount: repairTicketRows.length,
+    completedTicketsCount,
+    activeTicketsCount,
+    cancelledTicketsCount,
+    totalPartsRevenue: Math.round(totalRepairPartsRevenue * 100) / 100,
+    totalServiceRevenue: Math.round(totalRepairServiceRevenue * 100) / 100,
+    totalDiscounts: Math.round(totalRepairDiscounts * 100) / 100,
+    totalGrossRepairRevenue: Math.round(totalGrossRepairRevenue * 100) / 100,
+    totalCollectedRevenue: Math.round(totalCollectedRepairRevenue * 100) / 100,
+    totalOutstandingReceivables: Math.round(totalOutstandingRepairReceivables * 100) / 100,
+    totalPartsCost: Math.round(totalRepairPartsCost * 100) / 100,
+    netRepairProfit: Math.round(netRepairProfit * 100) / 100,
+    repairMarginPct: Math.round(repairMarginPct * 10) / 10,
+    statusBreakdown: Object.entries(repairStatusMap).map(([status, val]) => ({
+      status,
+      count: val.count,
+      revenue: Math.round(val.revenue * 100) / 100,
+      cost: Math.round(val.cost * 100) / 100,
+      profit: Math.round(val.profit * 100) / 100,
+    })),
+  };
+
+  // ─────────────────────────────────────────────────────────
+  // A. PROFIT & LOSS CALCULATIONS (Product + Repair Channels)
+  // ─────────────────────────────────────────────────────────
+  let grossProductSales = 0;
+  let productDiscounts = 0;
+  let productCogs = 0;
+
+  let invoicedRepairSales = 0;
+  let invoicedRepairDiscounts = 0;
+  let invoicedRepairCogs = 0;
+
   let totalReturnsAndRefunds = 0;
   let totalTaxCollected = 0;
-  let totalCogs = 0;
+
+  // Map ticketId -> internalPartsCost so repair sales in `sales` get exact internal part cost even if sale item had costPrice=0
+  const ticketPartsCostBySaleId = new Map<string, number>();
+  allRepairs.forEach((r) => {
+    if (r.finalSaleId && typeof r.internalPartsCost === "number" && r.internalPartsCost > 0) {
+      ticketPartsCostBySaleId.set(r.finalSaleId, r.internalPartsCost);
+    }
+  });
 
   filteredSales.forEach((sale) => {
     if (sale.status === "voided") return;
 
-    const sub = Number(sale.subtotal || 0);
     const disc = Number(sale.discountAmount || 0);
     const tax = Number(sale.taxAmount || 0);
+    const grandTot = Number(sale.grandTotal || sale.total || 0);
+    const sub = Number(sale.subtotal || 0) > 0 ? Number(sale.subtotal) : Math.max(0, grandTot + disc - tax);
 
-    grossSales += sub;
-    totalDiscounts += disc;
+    const isRepairSale =
+      repairLinkedSaleIds.has(sale.saleId) ||
+      Boolean(sale.notes && sale.notes.toLowerCase().includes("repair settlement for job ticket")) ||
+      (Array.isArray(sale.items) &&
+        sale.items.some((it) => String(it.productId || "").startsWith("prod_adhoc_rep_")));
+
     totalTaxCollected += tax;
 
     // Refund calculations
@@ -475,7 +759,7 @@ export function generateMasterAccountingReport(
       totalReturnsAndRefunds += Number((sale as unknown as { returnedAmount: number }).returnedAmount);
     }
 
-    // Cost of goods sold for items from real sale items or product catalog
+    let saleCogs = 0;
     if (Array.isArray(sale.items)) {
       sale.items.forEach((it) => {
         let cost = Number(it.costPrice || 0);
@@ -484,30 +768,88 @@ export function generateMasterAccountingReport(
             cost = productCostMap.get(it.productId)!;
           } else if (it.sku && productCostMap.has(it.sku.toLowerCase())) {
             cost = productCostMap.get(it.sku.toLowerCase())!;
+          } else if (it.sku && repairPartCostMap.has(it.sku.toLowerCase())) {
+            cost = repairPartCostMap.get(it.sku.toLowerCase())!;
           } else if (it.barcode && productCostMap.has(it.barcode)) {
             cost = productCostMap.get(it.barcode)!;
           }
         }
         const qty = Number(it.quantity || 1);
-        totalCogs += cost * qty;
+        saleCogs += cost * qty;
       });
+    }
+
+    if (isRepairSale) {
+      invoicedRepairSales += sub;
+      invoicedRepairDiscounts += disc;
+      if (saleCogs <= 0 && ticketPartsCostBySaleId.has(sale.saleId)) {
+        saleCogs = ticketPartsCostBySaleId.get(sale.saleId)!;
+      }
+      invoicedRepairCogs += saleCogs;
+    } else {
+      grossProductSales += sub;
+      productDiscounts += disc;
+      productCogs += saleCogs;
     }
   });
 
-  const netRevenue = Math.max(0, grossSales - totalDiscounts - totalReturnsAndRefunds);
+  // Include non-cancelled Installment Plans created within the date filter in Product Revenue & COGS
+  const allInstallments = data.installments || [];
+  const periodInstallments = allInstallments.filter((inst) => {
+    const t = inst.createdAt || 0;
+    return inst.status !== "cancelled" && t >= startTimeMs && t <= endTimeMs;
+  });
+
+  let periodInstallmentGross = 0;
+  let periodInstallmentDisc = 0;
+  let periodInstallmentCogs = 0;
+
+  periodInstallments.forEach((inst) => {
+    const agreedGross = Number(inst.totalAgreedPayable || 0) + Number(inst.discountAmount || 0);
+    const instDisc = Number(inst.discountAmount || 0) + Number(inst.earlySettlementDiscount || 0);
+    let instCost = Number(inst.product?.purchaseCostPrice || 0);
+    if (instCost <= 0 && inst.product?.productId && productCostMap.has(inst.product.productId)) {
+      instCost = productCostMap.get(inst.product.productId)!;
+    }
+    periodInstallmentGross += agreedGross;
+    periodInstallmentDisc += instDisc;
+    periodInstallmentCogs += instCost;
+
+    grossProductSales += agreedGross;
+    productDiscounts += instDisc;
+    productCogs += instCost;
+  });
+
+  const productSalesRevenue = grossProductSales - productDiscounts - totalReturnsAndRefunds;
+  const repairServiceRevenue =
+    invoicedRepairSales - invoicedRepairDiscounts + (uninvoicedRepairGrossRevenue - uninvoicedRepairDiscounts);
+  const repairPartsCost = Math.max(totalRepairPartsCost, invoicedRepairCogs + uninvoicedRepairCollectedCost);
+
+  const grossSales = grossProductSales + invoicedRepairSales + uninvoicedRepairGrossRevenue;
+  const totalDiscounts = productDiscounts + invoicedRepairDiscounts + uninvoicedRepairDiscounts;
+  const totalCogs = productCogs + repairPartsCost;
+
+  const netRevenue = productSalesRevenue + repairServiceRevenue;
   const grossProfit = netRevenue - totalCogs;
   const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue) * 100 : 0;
 
-  // Operating Expenses: grouped from live expenses collection with standard category mapping
+  // Operating Expenses: grouped strictly from live Firestore expenses collection (including Employee Salaries)
   const catMap: Record<string, number> = {};
   validOperatingExpenses.forEach((e) => {
     let cat = (e.categoryName || "").trim();
     const code = (e.categoryCode || "").toUpperCase();
     const lowerCat = cat.toLowerCase();
+    const isSalaryItem =
+      code === "SALARY" ||
+      lowerCat.includes("salary") ||
+      lowerCat.includes("salaries") ||
+      lowerCat.includes("wage") ||
+      e.expenseType === "EMPLOYEE_SALARY" ||
+      Boolean(e.salaryDetails);
 
     if (code === "UTILITIES" || code === "INTERNET" || lowerCat.includes("utilit") || lowerCat.includes("power") || lowerCat.includes("electric") || lowerCat.includes("internet") || lowerCat.includes("water") || lowerCat.includes("phone")) {
       cat = "Utilities Expenses";
-    } else if (code === "SALARY" || lowerCat.includes("salary") || lowerCat.includes("salaries") || lowerCat.includes("wage") || e.expenseType === "EMPLOYEE_SALARY") {
+    } else if (isSalaryItem) {
       cat = "Salaries Expenses";
     } else if (code === "RENT" || lowerCat.includes("rent") || lowerCat.includes("lease")) {
       cat = "Rent Expenses";
@@ -517,39 +859,22 @@ export function generateMasterAccountingReport(
       cat = "Other Expenses";
     }
 
-    catMap[cat] = (catMap[cat] || 0) + (Number(e.amount) || 0);
+    const expAmt = Number(e.amount) || Number(e.salaryDetails?.netSalary) || 0;
+    catMap[cat] = (catMap[cat] || 0) + expAmt;
   });
 
-  // Always present the standard operational expense categories (matching screenshot: Utilities, Salaries, Rent, Supplies, Other)
-  const standardCategories = [
-    "Utilities Expenses",
-    "Salaries Expenses",
-    "Rent Expenses",
-    "Supplies Expenses",
-    "Other Expenses",
-  ];
-
-  const operatingExpenses: { category: string; amount: number; pctOfRevenue: number }[] = [];
-
-  standardCategories.forEach((sc) => {
-    const amt = Math.round((catMap[sc] || 0) * 100) / 100;
-    operatingExpenses.push({
-      category: sc,
-      amount: amt,
-      pctOfRevenue: netRevenue > 0 ? Math.round((amt / netRevenue) * 1000) / 10 : 0,
+  // Only include categories that have real Firestore expense entries (no hardcoded 0-value mock rows)
+  const operatingExpenses: { category: string; amount: number; pctOfRevenue: number }[] = Object.entries(catMap)
+    .filter(([, amt]) => amt > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([cat, amt]) => {
+      const rounded = Math.round(amt * 100) / 100;
+      return {
+        category: cat,
+        amount: rounded,
+        pctOfRevenue: netRevenue > 0 ? Math.round((rounded / netRevenue) * 1000) / 10 : 0,
+      };
     });
-    delete catMap[sc];
-  });
-
-  // Any custom additional categories recorded in expenses
-  Object.entries(catMap).forEach(([cat, amt]) => {
-    const rounded = Math.round(amt * 100) / 100;
-    operatingExpenses.push({
-      category: cat,
-      amount: rounded,
-      pctOfRevenue: netRevenue > 0 ? Math.round((rounded / netRevenue) * 1000) / 10 : 0,
-    });
-  });
 
   const totalOperatingExpenses = Math.round(operatingExpenses.reduce((sum, e) => sum + e.amount, 0) * 100) / 100;
   const operatingIncome = grossProfit - totalOperatingExpenses;
@@ -563,6 +888,10 @@ export function generateMasterAccountingReport(
     discounts: Math.round(totalDiscounts * 100) / 100,
     returnsAndRefunds: Math.round(totalReturnsAndRefunds * 100) / 100,
     netRevenue: Math.round(netRevenue * 100) / 100,
+    productSalesRevenue: Math.round(productSalesRevenue * 100) / 100,
+    repairServiceRevenue: Math.round(repairServiceRevenue * 100) / 100,
+    productCogs: Math.round(productCogs * 100) / 100,
+    repairPartsCost: Math.round(repairPartsCost * 100) / 100,
     cogs: Math.round(totalCogs * 100) / 100,
     grossProfit: Math.round(grossProfit * 100) / 100,
     grossMarginPct: Math.round(grossMarginPct * 10) / 10,
@@ -576,7 +905,7 @@ export function generateMasterAccountingReport(
   };
 
   // ─────────────────────────────────────────────────────────
-  // B. INVENTORY VALUATION (Original Real Catalog Data)
+  // B. INVENTORY VALUATION (Retail Catalog + Repair Spare Parts)
   // ─────────────────────────────────────────────────────────
   let totalSkus = 0;
   let totalUnits = 0;
@@ -622,6 +951,46 @@ export function generateMasterAccountingReport(
       marginPct: Math.round(marginPct * 10) / 10,
       stockHealth: health,
     };
+  });
+
+  // Also include stored workshop spare parts in inventory valuation
+  (data.repairParts || []).forEach((rp) => {
+    totalSkus++;
+    const qty = typeof rp.inStockQty === "number" ? rp.inStockQty : 0;
+    const unitCost = typeof rp.costPriceLKR === "number" ? rp.costPriceLKR : 0;
+    const unitPrice = typeof rp.sellingPriceLKR === "number" ? rp.sellingPriceLKR : 0;
+    const costVal = qty * unitCost;
+    const retailVal = qty * unitPrice;
+    const potentialProfit = retailVal - costVal;
+    const marginPct = retailVal > 0 ? (potentialProfit / retailVal) * 100 : 0;
+
+    totalUnits += qty;
+    totalCostValue += costVal;
+    totalRetailValue += retailVal;
+
+    let health: "HEALTHY" | "LOW" | "OUT_OF_STOCK" = "HEALTHY";
+    if (qty <= 0) {
+      health = "OUT_OF_STOCK";
+      outOfStockItemsCount++;
+    } else if (qty <= 5) {
+      health = "LOW";
+      lowStockItemsCount++;
+    }
+
+    inventoryRows.push({
+      productId: rp.id,
+      sku: rp.sku || `PRT-${rp.id.slice(-4).toUpperCase()}`,
+      name: `[Spare Part] ${rp.name || "Repair Component"}`,
+      category: `Workshop Parts (${rp.category || "Hardware"})`,
+      stockQty: qty,
+      unitCost,
+      unitPrice,
+      totalCostValuation: Math.round(costVal * 100) / 100,
+      totalRetailValuation: Math.round(retailVal * 100) / 100,
+      potentialProfit: Math.round(potentialProfit * 100) / 100,
+      marginPct: Math.round(marginPct * 10) / 10,
+      stockHealth: health,
+    });
   });
 
   const potentialTotalProfit = totalRetailValue - totalCostValue;
@@ -752,6 +1121,9 @@ export function generateMasterAccountingReport(
   // ─────────────────────────────────────────────────────────
   const arDebtors: ARAgingData["debtors"] = [];
   let arTotalReceivables = 0;
+  let arCustomerCreditReceivables = 0;
+  let arRepairReceivables = 0;
+  let arInstallmentReceivables = 0;
   let arTotal0to30 = 0;
   let arTotal31to60 = 0;
   let arTotal61to90 = 0;
@@ -764,6 +1136,7 @@ export function generateMasterAccountingReport(
 
     if (outstanding > 0) {
       arTotalReceivables += outstanding;
+      arCustomerCreditReceivables += outstanding;
       const c0 = outstanding;
       const c31 = 0;
       const c61 = 0;
@@ -785,6 +1158,91 @@ export function generateMasterAccountingReport(
         status: "GOOD",
       });
     }
+  });
+
+  // Include unpaid balances on active/ready/completed repair tickets in Accounts Receivable
+  filteredRepairs.forEach((ticket) => {
+    if (
+      ticket.status === "cancelled" ||
+      ticket.status === "customer_declined" ||
+      ticket.status === "irreparable"
+    ) {
+      return;
+    }
+    const billable = Math.max(0, Number(ticket.estimatedCost || 0) + Number(ticket.additionalCharges || 0));
+    const paid =
+      (ticket.status === "collected" || ticket.status === "delivered") && (ticket.totalPaid || 0) <= 0
+        ? billable
+        : Number(ticket.totalPaid || ticket.depositPaid || 0);
+    const bal = Math.max(0, billable - paid);
+    if (bal > 0) {
+      arTotalReceivables += bal;
+      arRepairReceivables += bal;
+      const ageDays = Math.floor((Date.now() - (ticket.createdAt || Date.now())) / 86400000);
+      let c0 = 0, c31 = 0, c61 = 0, c90 = 0;
+      if (ageDays <= 30) {
+        c0 = bal;
+        arTotal0to30 += bal;
+      } else if (ageDays <= 60) {
+        c31 = bal;
+        arTotal31to60 += bal;
+      } else if (ageDays <= 90) {
+        c61 = bal;
+        arTotal61to90 += bal;
+      } else {
+        c90 = bal;
+        arTotalOver90 += bal;
+      }
+
+      const d = new Date(ticket.createdAt || Date.now());
+      const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+      arDebtors.push({
+        customerId: ticket.customerId || ticket.id,
+        name: `${ticket.customerName || "Customer"} (Repair #${ticket.ticketNumber})`,
+        phone: ticket.customerPhone || "-",
+        lifetimeSpend: billable,
+        totalOutstanding: Math.round(bal * 100) / 100,
+        current0to30: Math.round(c0 * 100) / 100,
+        days31to60: Math.round(c31 * 100) / 100,
+        days61to90: Math.round(c61 * 100) / 100,
+        over90Days: Math.round(c90 * 100) / 100,
+        lastPurchaseDate: dateStr,
+        status: ageDays > 30 ? "DUE" : "GOOD",
+      });
+    }
+  });
+
+  // Include active/overdue Installment Agreements with remaining balance in Accounts Receivable
+  allInstallments.forEach((inst) => {
+    if (inst.status === "cancelled" || inst.status === "completed" || inst.status === "early_settled") {
+      return;
+    }
+    const bal = Math.max(0, Number(inst.remainingBalance || 0));
+    if (bal <= 0) return;
+
+    arTotalReceivables += bal;
+    arInstallmentReceivables += bal;
+    const overdueAmt = Math.max(0, Number(inst.overdueAmount || 0));
+    const currentAmt = Math.max(0, bal - overdueAmt);
+    const c0 = currentAmt;
+    const c31 = overdueAmt;
+    arTotal0to30 += c0;
+    arTotal31to60 += c31;
+
+    arDebtors.push({
+      customerId: inst.customer.customerId || inst.id,
+      name: `${inst.customer.fullName} (Installment ${inst.agreementNumber})`,
+      phone: inst.customer.mobileNumber || "-",
+      lifetimeSpend: Number(inst.totalAgreedPayable || 0),
+      totalOutstanding: Math.round(bal * 100) / 100,
+      current0to30: Math.round(c0 * 100) / 100,
+      days31to60: Math.round(c31 * 100) / 100,
+      days61to90: 0,
+      over90Days: 0,
+      lastPurchaseDate: inst.startDate,
+      status: overdueAmt > 0 ? "OVERDUE" : "GOOD",
+    });
   });
 
   const accountsReceivable: ARAgingData = {
@@ -824,6 +1282,41 @@ export function generateMasterAccountingReport(
       grandTotal: gTot,
       status: (s.status || "completed").toUpperCase(),
     };
+  });
+
+  // Include repair deposits/collections for tickets not already represented in filteredSales
+  if (uninvoicedRepairCollectedCash > 0) {
+    if (!tenderCounts["cash"]) tenderCounts["cash"] = { count: 0, total: 0 };
+    tenderCounts["cash"].count += 1;
+    tenderCounts["cash"].total += uninvoicedRepairCollectedCash;
+  }
+
+  // Include actual collected Down Payments & Monthly Installment Payments within the period in Tender Breakdown & Cash Flow
+  let periodInstallmentCashCollected = 0;
+  let periodInstallmentBankCollected = 0;
+  allInstallments.forEach((inst) => {
+    if (inst.status === "cancelled") return;
+    (inst.payments || []).forEach((pay) => {
+      const paidAt = pay.paidAt || 0;
+      if (paidAt >= startTimeMs && paidAt <= endTimeMs) {
+        const rawMethod = (pay.paymentMethod || "cash").toLowerCase();
+        const methodKey =
+          rawMethod === "bank_transfer"
+            ? "bank-transfer"
+            : rawMethod === "mobile_qr"
+            ? "mobile-qr"
+            : rawMethod;
+        const payAmt = Number(pay.amount || 0);
+        if (!tenderCounts[methodKey]) tenderCounts[methodKey] = { count: 0, total: 0 };
+        tenderCounts[methodKey].count += 1;
+        tenderCounts[methodKey].total += payAmt;
+        if (methodKey === "cash") {
+          periodInstallmentCashCollected += payAmt;
+        } else {
+          periodInstallmentBankCollected += payAmt;
+        }
+      }
+    });
   });
 
   const paymentBreakdown = Object.entries(tenderCounts).map(([method, val]) => ({
@@ -1027,68 +1520,414 @@ export function generateMasterAccountingReport(
   };
 
   // ─────────────────────────────────────────────────────────
-  // I. BALANCE SHEET (STATEMENT OF FINANCIAL POSITION - Real Data)
+  // I, J, K. DOUBLE-ENTRY GENERAL LEDGER, BALANCE SHEET,
+  //          CASH FLOW STATEMENT & TRIAL BALANCE ENGINE (CPA Standard)
   // ─────────────────────────────────────────────────────────
-  const totalPostedCapitalAssets = Math.round(postedCapitalAssets.reduce((s, e) => s + (e.amount || 0), 0) * 100) / 100;
-  const totalPostedLiabilityPayments = Math.round(postedLiabilityPayments.reduce((s, e) => s + (e.amount || 0), 0) * 100) / 100;
-  const totalPostedOwnerWithdrawals = Math.round(postedOwnerWithdrawals.reduce((s, e) => s + (e.amount || 0), 0) * 100) / 100;
-  const totalPostedUnpaidExpenses = Math.round(postedOperatingExpenses.reduce((s, e) => s + (e.balanceDue || 0), 0) * 100) / 100;
+  const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
-  const cashInTill = actualCashInTill;
-  const liveBankExpensePayouts = postedExpenses
-    .filter((e) => (e.paymentMethod || "").toLowerCase() !== "cash")
-    .reduce((s, e) => s + (e.amountPaid || e.amount || 0), 0);
+  type GLAccountCategory = "ASSET" | "LIABILITY" | "EQUITY" | "REVENUE" | "EXPENSE";
+  interface GLAccountEntry {
+    code: string;
+    name: string;
+    category: GLAccountCategory;
+    normalBalance: "DEBIT" | "CREDIT";
+    openDr: number;
+    openCr: number;
+    periodDr: number;
+    periodCr: number;
+  }
 
-  // Bank balance derived purely from real collections minus supplier disbursements and bank expenses
-  const bankAccountsBalance = Math.round(
-    Math.max(0, cardSalesTotal + qrSalesTotal + bankTransferSalesTotal - totalAmountPaid - liveBankExpensePayouts) * 100
-  ) / 100;
-
-  const accountsReceivableAsset = Math.round(arTotalReceivables * 100) / 100;
-  const inventoryAsset = Math.round(totalCostValue * 100) / 100;
-
-  const currentAssets = [
-    { accountCode: "1010", name: "Cash on Hand (POS Drawer & Till Float)", amount: cashInTill, notes: "Verified till cash" },
-    { accountCode: "1020", name: "Bank Operating Accounts (Digital Tenders)", amount: bankAccountsBalance, notes: "Card, QR & wire collections" },
-    { accountCode: "1030", name: "Accounts Receivable (Customer Credit)", amount: accountsReceivableAsset, notes: "Real customer credit balances" },
-    { accountCode: "1040", name: "Inventory Asset (Merchandise at Cost)", amount: inventoryAsset, notes: "Active catalog valuation at cost" },
+  const chartOfAccounts: GLAccountEntry[] = [
+    { code: "1010", name: "Cash on Hand (POS Drawer & Till Float)", category: "ASSET", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "1020", name: "Bank Operating Accounts (Card, QR & Wire)", category: "ASSET", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "1030", name: "Accounts Receivable (Trade & Repair Debtors)", category: "ASSET", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "1035", name: "Installment Contracts Receivable", category: "ASSET", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "1040", name: "Merchandise & Spare Parts Inventory (at Cost)", category: "ASSET", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "1050", name: "SST Input Tax Claimable (Tax Credit)", category: "ASSET", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "1510", name: "Store Equipment, Fixtures & Capital Assets", category: "ASSET", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "2010", name: "Accounts Payable (Trade Supplier Creditors)", category: "LIABILITY", normalBalance: "CREDIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "2020", name: "SST / Output Sales Tax Payable", category: "LIABILITY", normalBalance: "CREDIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "2030", name: "Accrued Operating Expenses & Bills Payable", category: "LIABILITY", normalBalance: "CREDIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "3005", name: "Owner's Capital & Seed Inventory Equity", category: "EQUITY", normalBalance: "CREDIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "3010", name: "Retained Earnings (Prior Periods Accumulated)", category: "EQUITY", normalBalance: "CREDIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "3030", name: "Owner's Drawings & Capital Distributions", category: "EQUITY", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "4010", name: "Product & Installment Sales Revenue (Gross)", category: "REVENUE", normalBalance: "CREDIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "4015", name: "Workshop Repair & Service Revenue (Gross)", category: "REVENUE", normalBalance: "CREDIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "4020", name: "Sales Returns & Refunds Allowed", category: "REVENUE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "4030", name: "Sales & Repair Discounts Allowed", category: "REVENUE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "5010", name: "Cost of Goods Sold — Merchandise (COGS)", category: "EXPENSE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "5020", name: "Cost of Workshop Repair Parts & Components", category: "EXPENSE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "6010", name: "Utilities, Electricity & Internet Expenses", category: "EXPENSE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "6020", name: "Employee Salaries & Wages Expenses", category: "EXPENSE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "6030", name: "Store Rent & Leasehold Expenses", category: "EXPENSE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "6040", name: "Store Supplies & Packaging Expenses", category: "EXPENSE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
+    { code: "6050", name: "General & Administrative Operating Expenses", category: "EXPENSE", normalBalance: "DEBIT", openDr: 0, openCr: 0, periodDr: 0, periodCr: 0 },
   ];
-  const totalCurrentAssets = Math.round(currentAssets.reduce((s, it) => s + it.amount, 0) * 100) / 100;
 
-  const nonCurrentAssets = [
-    { accountCode: "1510", name: "Capital Assets & Equipment", amount: totalPostedCapitalAssets, notes: "Recorded capital expenditures" },
-  ];
-  const totalNonCurrentAssets = Math.round(nonCurrentAssets.reduce((s, it) => s + it.amount, 0) * 100) / 100;
-  const totalAssets = Math.round((totalCurrentAssets + totalNonCurrentAssets) * 100) / 100;
+  const glMap = new Map<string, GLAccountEntry>();
+  chartOfAccounts.forEach((acct) => glMap.set(acct.code, acct));
 
-  // Liabilities
-  const accountsPayableLiability = Math.round(totalOutstandingPayable * 100) / 100;
-  const sstPayableLiability = Math.max(0, netSSTPayable);
-  const accruedLiabilities = totalPostedUnpaidExpenses;
+  const postJournal = (stage: "OPEN" | "PERIOD", drCode: string, crCode: string, rawAmount: number) => {
+    const amt = r2(rawAmount);
+    if (amt <= 0) return;
+    const dr = glMap.get(drCode);
+    const cr = glMap.get(crCode);
+    if (!dr || !cr) return;
+    if (stage === "OPEN") {
+      dr.openDr = r2(dr.openDr + amt);
+      cr.openCr = r2(cr.openCr + amt);
+    } else {
+      dr.periodDr = r2(dr.periodDr + amt);
+      cr.periodCr = r2(cr.periodCr + amt);
+    }
+  };
 
-  const currentLiabilities = [
-    { accountCode: "2010", name: "Accounts Payable (Trade Creditors)", amount: accountsPayableLiability, notes: "Unpaid supplier PO balances" },
-    { accountCode: "2020", name: "SST / Sales Tax Payable", amount: sstPayableLiability, notes: "Net sales tax payable" },
-    { accountCode: "2030", name: "Accrued Operating Expenses", amount: accruedLiabilities, notes: "Unpaid posted expense bills" },
-  ];
-  const totalCurrentLiabilities = Math.round(currentLiabilities.reduce((s, it) => s + it.amount, 0) * 100) / 100;
+  const getOpenNetDr = (code: string) => {
+    const a = glMap.get(code)!;
+    return r2(a.openDr - a.openCr);
+  };
 
-  const nonCurrentLiabilities: { accountCode: string; name: string; amount: number; notes: string }[] = [];
+  const getClosingNetDr = (code: string) => {
+    const a = glMap.get(code)!;
+    return r2(a.openDr + a.periodDr - (a.openCr + a.periodCr));
+  };
+
+  // ── 1. POST PRIOR-PERIOD TRANSACTIONS (t < startTimeMs) INTO OPENING LEDGER ──
+  const priorSales = (data.sales || []).filter((s) => {
+    const t = s.createdAt || (s as unknown as { date: number }).date || 0;
+    return t > 0 && t < startTimeMs && s.status !== "voided";
+  });
+
+  const priorSaleIds = new Set(priorSales.map((s) => s.saleId));
+
+  priorSales.forEach((sale) => {
+    const tot = r2(Number(sale.grandTotal || sale.total || 0));
+    const tax = r2(Math.max(0, Number(sale.taxAmount || 0)));
+    const netRevExTax = r2(Math.max(0, tot - tax));
+    const pm = (sale.paymentMethod || "cash").toLowerCase();
+    const cashAcct = pm === "cash" ? "1010" : "1020";
+
+    postJournal("OPEN", cashAcct, "3010", netRevExTax);
+    postJournal("OPEN", cashAcct, "2020", tax);
+
+    if (sale.status === "refunded") {
+      postJournal("OPEN", "3010", cashAcct, tot);
+    } else if (sale.status === "partially_returned" && (sale as unknown as { returnedAmount?: number }).returnedAmount) {
+      postJournal("OPEN", "3010", cashAcct, r2(Number((sale as unknown as { returnedAmount: number }).returnedAmount)));
+    }
+
+    let priorSaleCogs = 0;
+    if (Array.isArray(sale.items)) {
+      sale.items.forEach((it) => {
+        let cost = Number(it.costPrice || 0);
+        if (cost <= 0) {
+          if (it.productId && productCostMap.has(it.productId)) cost = productCostMap.get(it.productId)!;
+          else if (it.sku && productCostMap.has(it.sku.toLowerCase())) cost = productCostMap.get(it.sku.toLowerCase())!;
+          else if (it.sku && repairPartCostMap.has(it.sku.toLowerCase())) cost = repairPartCostMap.get(it.sku.toLowerCase())!;
+          else if (it.barcode && productCostMap.has(it.barcode)) cost = productCostMap.get(it.barcode)!;
+        }
+        priorSaleCogs += cost * Number(it.quantity || 1);
+      });
+    }
+    if (priorSaleCogs <= 0 && ticketPartsCostBySaleId.has(sale.saleId)) {
+      priorSaleCogs = ticketPartsCostBySaleId.get(sale.saleId)!;
+    }
+    postJournal("OPEN", "3010", "1040", priorSaleCogs);
+  });
+
+  // Prior repairs not already in priorSales or filteredRepairs
+  allRepairs.forEach((ticket) => {
+    const created = ticket.createdAt || 0;
+    const closed = ticket.closedAt || 0;
+    const isInPeriod = (created >= startTimeMs && created <= endTimeMs) || (closed >= startTimeMs && closed <= endTimeMs);
+    if (isInPeriod || created <= 0 || created >= startTimeMs) return;
+    if (ticket.status === "cancelled" || ticket.status === "customer_declined" || ticket.status === "irreparable") return;
+    if (ticket.finalSaleId && priorSaleIds.has(ticket.finalSaleId)) return;
+
+    const isCompleted = ticket.status === "collected" || ticket.status === "delivered";
+    const billable = Math.max(0, Number(ticket.estimatedCost || 0) + Number(ticket.additionalCharges || 0));
+    const paid = isCompleted && (ticket.totalPaid || 0) <= 0 ? billable : Number(ticket.totalPaid || ticket.depositPaid || 0);
+    const partsCost = Number(ticket.internalPartsCost || 0);
+
+    postJournal("OPEN", "1010", "3010", paid);
+    postJournal("OPEN", "3010", "1040", partsCost);
+  });
+
+  // Prior Installment Originations & Prior Installment Payments
+  allInstallments.forEach((inst) => {
+    if (inst.status === "cancelled") return;
+    const created = inst.createdAt || 0;
+    if (created > 0 && created < startTimeMs) {
+      const agreedPayable = r2(Number(inst.totalAgreedPayable || 0));
+      let instCost = Number(inst.product?.purchaseCostPrice || 0);
+      if (instCost <= 0 && inst.product?.productId && productCostMap.has(inst.product.productId)) {
+        instCost = productCostMap.get(inst.product.productId)!;
+      }
+      postJournal("OPEN", "1035", "3010", agreedPayable);
+      postJournal("OPEN", "3010", "1040", instCost);
+    }
+    (inst.payments || []).forEach((pay) => {
+      const paidAt = pay.paidAt || 0;
+      if (paidAt > 0 && paidAt < startTimeMs) {
+        const rawMethod = (pay.paymentMethod || "cash").toLowerCase();
+        const payAcct = rawMethod === "cash" ? "1010" : "1020";
+        postJournal("OPEN", payAcct, "1035", Number(pay.amount || 0));
+      }
+    });
+  });
+
+  // Prior Supplier Purchase Orders
+  const priorPurchases = (data.purchases || []).filter((p) => {
+    const t = p.orderedAt || p.createdAt || 0;
+    return t > 0 && t < startTimeMs;
+  });
+  priorPurchases.forEach((po) => {
+    const tot = r2(Number(po.totalAmount || 0));
+    const paid = r2(Math.min(tot, Number(po.amountPaid || 0)));
+    const tax = r2(Math.min(tot, Number(po.taxAmount || 0)));
+    const invNet = r2(Math.max(0, tot - tax));
+    postJournal("OPEN", "1040", "2010", invNet);
+    postJournal("OPEN", "1050", "2010", tax);
+    postJournal("OPEN", "2010", "1020", paid);
+  });
+
+  // Prior Expenses
+  const priorExpenses = allExpenses.filter((e) => {
+    const t = (e.date ? new Date(e.date).getTime() : 0) || e.createdAt || 0;
+    return t > 0 && t < startTimeMs && e.status !== "rejected" && e.status !== "cancelled";
+  });
+  priorExpenses.forEach((e) => {
+    const amt = r2(Number(e.amount || 0));
+    const unpaid = r2(Math.max(0, Number(e.balanceDue || 0)));
+    const paid = r2(Math.max(0, amt - unpaid));
+    const payAcct = (e.paymentMethod || "").toLowerCase() === "cash" ? "1010" : "1020";
+    let drCode = "3010";
+    if (e.expenseType === "CAPITAL_ASSET") drCode = "1510";
+    else if (e.expenseType === "LIABILITY_PAYMENT") drCode = "2010";
+    else if (e.expenseType === "OWNER_WITHDRAWAL") drCode = "3030";
+
+    postJournal("OPEN", drCode, "2030", amt);
+    postJournal("OPEN", "2030", payAcct, paid);
+  });
+
+  // Offset any prior SST Input Tax against prior SST Output Tax
+  const priorSstOffset = r2(Math.min(Math.max(0, getOpenNetDr("1050")), Math.max(0, -getOpenNetDr("2020"))));
+  if (priorSstOffset > 0) {
+    postJournal("OPEN", "2020", "1050", priorSstOffset);
+  }
+
+  // ── 2. POST CURRENT-PERIOD TRANSACTIONS (startTimeMs <= t <= endTimeMs) ──
+  const rGrossProductSales = r2(grossProductSales);
+  const rGrossRepairSales = r2(invoicedRepairSales + uninvoicedRepairGrossRevenue);
+  const rReturns = r2(totalReturnsAndRefunds);
+  const rDiscounts = r2(totalDiscounts);
+  const rOutputTax = r2(sstOutputTax);
+
+  // Revenue, Contra-Revenue & Output Tax legs via Receivable Control (1030)
+  postJournal("PERIOD", "1030", "4010", rGrossProductSales);
+  postJournal("PERIOD", "1030", "4015", rGrossRepairSales);
+  postJournal("PERIOD", "4030", "1030", rDiscounts);
+  postJournal("PERIOD", "1030", "2020", rOutputTax);
+  postJournal("PERIOD", "4020", "1010", rReturns);
+
+  // Transfer newly originated Installment Sales Principal to 1035 (Installment Contracts Receivable)
+  const rNewInstallmentNet = r2(Math.max(0, periodInstallmentGross - periodInstallmentDisc));
+  postJournal("PERIOD", "1035", "1030", rNewInstallmentNet);
+
+  // Cash & Digital Collections in Period
+  const rInstCash = r2(periodInstallmentCashCollected);
+  const rInstBank = r2(periodInstallmentBankCollected);
+  const rPosAndRepairCash = r2(Math.max(0, cashSalesTotal - periodInstallmentCashCollected));
+  const rPosBank = r2(Math.max(0, cardSalesTotal + qrSalesTotal + bankTransferSalesTotal - periodInstallmentBankCollected));
+
+  postJournal("PERIOD", "1010", "1035", rInstCash);
+  postJournal("PERIOD", "1020", "1035", rInstBank);
+  postJournal("PERIOD", "1010", "1030", rPosAndRepairCash);
+  postJournal("PERIOD", "1020", "1030", rPosBank);
+
+  // Period Cost of Goods Sold (5010 Merchandise & 5020 Repair Parts)
+  const rProductCogs = r2(productCogs);
+  const rRepairCogs = r2(repairPartsCost);
+  postJournal("PERIOD", "5010", "1040", rProductCogs);
+  postJournal("PERIOD", "5020", "1040", rRepairCogs);
+
+  // Period Supplier Purchases (1040 Inventory, 1050 Input Tax, 2010 AP, 1020 Bank Paid)
+  const rPoTotal = r2(totalPurchasedValue);
+  const rInputTax = r2(Math.min(rPoTotal, sstInputTax));
+  const rPoInvNet = r2(Math.max(0, rPoTotal - rInputTax));
+  const rPoPaid = r2(totalAmountPaid);
+  postJournal("PERIOD", "1040", "2010", rPoInvNet);
+  postJournal("PERIOD", "1050", "2010", rInputTax);
+  postJournal("PERIOD", "2010", "1020", rPoPaid);
+
+  // Period Operating Expenses, Capital Assets, Liability Payments & Owner Drawings
+  const totalPostedCapitalAssets = r2(postedCapitalAssets.reduce((s, e) => s + (e.amount || 0), 0));
+  const totalPostedLiabilityPayments = r2(postedLiabilityPayments.reduce((s, e) => s + (e.amount || 0), 0));
+  const totalPostedOwnerWithdrawals = r2(postedOwnerWithdrawals.reduce((s, e) => s + (e.amount || 0), 0));
+
+  operatingExpenses.forEach((exp) => {
+    const amt = r2(exp.amount);
+    if (amt <= 0) return;
+    let expCode = "6050";
+    if (exp.category === "Utilities Expenses") expCode = "6010";
+    else if (exp.category === "Salaries Expenses") expCode = "6020";
+    else if (exp.category === "Rent Expenses") expCode = "6030";
+    else if (exp.category === "Supplies Expenses") expCode = "6040";
+    postJournal("PERIOD", expCode, "2030", amt);
+  });
+
+  postJournal("PERIOD", "1510", "2030", totalPostedCapitalAssets);
+  postJournal("PERIOD", "2010", "2030", totalPostedLiabilityPayments);
+  postJournal("PERIOD", "3030", "2030", totalPostedOwnerWithdrawals);
+
+  const totalAllPeriodExpenseBills = r2(
+    totalOperatingExpenses + totalPostedCapitalAssets + totalPostedLiabilityPayments + totalPostedOwnerWithdrawals
+  );
+  const totalPostedUnpaidExpenses = r2(
+    postedExpenses.reduce((s, e) => s + Math.max(0, Number(e.balanceDue || 0)), 0)
+  );
+  const totalPaidPeriodExpenseBills = r2(Math.max(0, totalAllPeriodExpenseBills - totalPostedUnpaidExpenses));
+  const rawCashExpPaid = r2(
+    postedExpenses
+      .filter((e) => (e.paymentMethod || "").toLowerCase() === "cash")
+      .reduce((s, e) => s + (e.amountPaid !== undefined ? Number(e.amountPaid) : Number(e.amount || 0)), 0)
+  );
+  const rCashExpPaid = r2(Math.min(totalPaidPeriodExpenseBills, rawCashExpPaid));
+  const rBankExpPaid = r2(Math.max(0, totalPaidPeriodExpenseBills - rCashExpPaid));
+
+  postJournal("PERIOD", "2030", "1010", rCashExpPaid);
+  postJournal("PERIOD", "2030", "1020", rBankExpPaid);
+
+  // Offset Period SST Input Tax against SST Output Tax so 2020/1050 reflect true net tax position
+  const periodSstOffset = r2(Math.min(Math.max(0, getClosingNetDr("1050")), Math.max(0, -getClosingNetDr("2020"))));
+  if (periodSstOffset > 0) {
+    postJournal("PERIOD", "2020", "1050", periodSstOffset);
+  }
+
+  // ── 3. RECONCILE CATALOG INVENTORY, SUB-LEDGER RECEIVABLES & WORKING CAPITAL ──
+  // A. Reconcile Physical Catalog & Spare Parts Inventory Valuation (1040) with Owner's Seed Equity (3005)
+  const targetInventoryAsset = r2(totalCostValue);
+  const currentInvNetDr = getClosingNetDr("1040");
+  const invDiff = r2(targetInventoryAsset - currentInvNetDr);
+  if (invDiff > 0) {
+    postJournal("OPEN", "1040", "3005", invDiff);
+  } else if (invDiff < 0) {
+    postJournal("OPEN", "3010", "1040", Math.abs(invDiff));
+  }
+
+  // B. Reconcile Installment Contracts Receivable (1035) with Active Installment Sub-Ledger
+  const targetInstallmentAR = r2(arInstallmentReceivables);
+  const currentInstArNetDr = getClosingNetDr("1035");
+  const instArDiff = r2(targetInstallmentAR - currentInstArNetDr);
+  if (instArDiff > 0) {
+    postJournal("OPEN", "1035", "3005", instArDiff);
+  } else if (instArDiff < 0) {
+    postJournal("OPEN", "3010", "1035", Math.abs(instArDiff));
+  }
+
+  // C. Reconcile Trade & Repair Accounts Receivable (1030) with Customer Credit & Repair Sub-Ledger
+  const targetTradeAndRepairAR = r2(arCustomerCreditReceivables + arRepairReceivables);
+  const currentTradeArNetDr = getClosingNetDr("1030");
+  const tradeArDiff = r2(targetTradeAndRepairAR - currentTradeArNetDr);
+  if (tradeArDiff > 0) {
+    postJournal("OPEN", "1030", "3005", tradeArDiff);
+  } else if (tradeArDiff < 0) {
+    postJournal("OPEN", "3010", "1030", Math.abs(tradeArDiff));
+  }
+
+  // D. Ensure Opening Cash (1010) and Opening Bank (1020) are backed by Owner Working Capital (3005) if prior outflows > prior inflows
+  const openCashNet = getOpenNetDr("1010");
+  if (openCashNet < 0) {
+    postJournal("OPEN", "1010", "3005", Math.abs(openCashNet));
+  }
+  const openBankNet = getOpenNetDr("1020");
+  if (openBankNet < 0) {
+    postJournal("OPEN", "1020", "3005", Math.abs(openBankNet));
+  }
+
+  // E. Ensure Closing Cash (1010) and Closing Bank (1020) reflect Owner Working Capital Contributions if period disbursements > available liquid float
+  let periodOwnerCapitalInjected = 0;
+  const closingCashBeforeSeed = getClosingNetDr("1010");
+  if (closingCashBeforeSeed < 0) {
+    const neededCash = r2(Math.abs(closingCashBeforeSeed));
+    postJournal("PERIOD", "1010", "3005", neededCash);
+    periodOwnerCapitalInjected = r2(periodOwnerCapitalInjected + neededCash);
+  }
+  const closingBankBeforeSeed = getClosingNetDr("1020");
+  if (closingBankBeforeSeed < 0) {
+    const neededBank = r2(Math.abs(closingBankBeforeSeed));
+    postJournal("PERIOD", "1020", "3005", neededBank);
+    periodOwnerCapitalInjected = r2(periodOwnerCapitalInjected + neededBank);
+  }
+
+  // ── 4. BUILD BALANCE SHEET (AS OF endTimeMs) STRICTLY FROM REAL FIRESTORE BALANCES ──
+  const cashInTill = Math.max(0, getClosingNetDr("1010"));
+  const bankAccountsBalance = Math.max(0, getClosingNetDr("1020"));
+  const tradeAndRepairARAsset = Math.max(0, getClosingNetDr("1030"));
+  const installmentARAsset = Math.max(0, getClosingNetDr("1035"));
+  const inventoryAsset = Math.max(0, getClosingNetDr("1040"));
+  const sstInputClaimableAsset = Math.max(0, getClosingNetDr("1050"));
+  const capitalEquipmentAsset = Math.max(0, getClosingNetDr("1510"));
+
+  const currentAssets: BalanceSheetData["currentAssets"] = [
+    { accountCode: "1010", name: "Cash on Hand (POS Drawer & Till Float)", amount: cashInTill, notes: "Live Firestore cash sales less cash payouts" },
+    { accountCode: "1020", name: "Bank Operating Accounts (Card, QR & Wire)", amount: bankAccountsBalance, notes: "Live Firestore digital & bank settlements" },
+    { accountCode: "1030", name: "Accounts Receivable (Customer & Repair Debtors)", amount: tradeAndRepairARAsset, notes: "Customer credit & unpaid repair balances" },
+    { accountCode: "1035", name: "Installment Contracts Receivable", amount: installmentARAsset, notes: "Active customer installment plans" },
+    { accountCode: "1040", name: "Merchandise & Spare Parts Inventory (at Cost)", amount: inventoryAsset, notes: `${totalSkus} active SKUs (${totalUnits} units)` },
+    { accountCode: "1050", name: "SST Input Tax Claimable (Tax Credit)", amount: sstInputClaimableAsset, notes: "Purchase input tax credit" },
+  ].filter((item) => item.amount !== 0);
+
+  const totalCurrentAssets = r2(currentAssets.reduce((s, it) => s + it.amount, 0));
+
+  const nonCurrentAssets: BalanceSheetData["nonCurrentAssets"] = [
+    { accountCode: "1510", name: "Store Equipment, Fixtures & Capital Assets", amount: capitalEquipmentAsset, notes: "Recorded capital asset vouchers" },
+  ].filter((item) => item.amount !== 0);
+
+  const totalNonCurrentAssets = r2(nonCurrentAssets.reduce((s, it) => s + it.amount, 0));
+  const totalAssets = r2(totalCurrentAssets + totalNonCurrentAssets);
+
+  // Liabilities (Normal Credit -> -getClosingNetDr)
+  const accountsPayableLiability = Math.max(0, -getClosingNetDr("2010"));
+  const sstPayableLiability = Math.max(0, -getClosingNetDr("2020"));
+  const accruedLiabilities = Math.max(0, -getClosingNetDr("2030"));
+
+  const currentLiabilities: BalanceSheetData["currentLiabilities"] = [
+    { accountCode: "2010", name: "Accounts Payable (Trade Supplier Creditors)", amount: accountsPayableLiability, notes: "Outstanding supplier PO balances" },
+    { accountCode: "2020", name: "SST / Output Sales Tax Payable", amount: sstPayableLiability, notes: "Net SST tax payable from sales" },
+    { accountCode: "2030", name: "Accrued Operating Expenses & Bills Payable", amount: accruedLiabilities, notes: "Unpaid expense & salary vouchers" },
+  ].filter((item) => item.amount !== 0);
+
+  const totalCurrentLiabilities = r2(currentLiabilities.reduce((s, it) => s + it.amount, 0));
+  const nonCurrentLiabilities: BalanceSheetData["nonCurrentLiabilities"] = [];
   const totalNonCurrentLiabilities = 0;
-  const totalLiabilities = Math.round((totalCurrentLiabilities + totalNonCurrentLiabilities) * 100) / 100;
+  const totalLiabilities = r2(totalCurrentLiabilities + totalNonCurrentLiabilities);
 
-  // Equity = Assets - Liabilities
-  const calculatedTotalEquity = Math.round((totalAssets - totalLiabilities) * 100) / 100;
-  const currentPeriodNetEarnings = Math.round(netProfit * 100) / 100;
-  const retainedEarnings = Math.round((calculatedTotalEquity - currentPeriodNetEarnings) * 100) / 100;
+  // Owner's Equity
+  const ownersCapitalSeed = r2(-getClosingNetDr("3005"));
+  const priorRetainedEarnings = r2(-getClosingNetDr("3010"));
+  const currentPeriodNetEarnings = r2(netProfit);
+  const ownersDrawings = r2(getClosingNetDr("3030")); // Contra-equity (debit)
 
-  const equityItems = [
-    { accountCode: "3010", name: "Retained Earnings / Prior Equity", amount: retainedEarnings, notes: "Accumulated equity" },
-    { accountCode: "3020", name: "Current Period Net Income (Loss)", amount: currentPeriodNetEarnings, notes: "From Profit & Loss Statement" },
-  ];
-  const totalEquity = Math.round(equityItems.reduce((s, it) => s + it.amount, 0) * 100) / 100;
-  const totalLiabilitiesAndEquity = Math.round((totalLiabilities + totalEquity) * 100) / 100;
-  const bsVariance = Math.round(Math.abs(totalAssets - totalLiabilitiesAndEquity) * 100) / 100;
+  const equityItems: BalanceSheetData["equityItems"] = [
+    { accountCode: "3005", name: "Owner's Capital & Opening Inventory Equity", amount: ownersCapitalSeed, notes: "Backed by catalog inventory & working capital" },
+    { accountCode: "3010", name: "Retained Earnings (Prior Periods)", amount: priorRetainedEarnings, notes: "Accumulated prior period earnings" },
+    { accountCode: "3020", name: "Current Period Net Profit / (Loss)", amount: currentPeriodNetEarnings, notes: "Transferred from Income Statement" },
+    ...(ownersDrawings !== 0
+      ? [
+          {
+            accountCode: "3030",
+            name: "Less: Owner's Drawings & Distributions",
+            amount: -ownersDrawings,
+            notes: "Capital withdrawals by owner",
+          },
+        ]
+      : []),
+  ].filter((item) => item.amount !== 0);
+
+  const totalEquity = r2(equityItems.reduce((s, it) => s + it.amount, 0));
+  const totalLiabilitiesAndEquity = r2(totalLiabilities + totalEquity);
+  const bsVariance = r2(Math.abs(totalAssets - totalLiabilitiesAndEquity));
 
   const balanceSheet: BalanceSheetData = {
     asOfDate: dateFilter.endDate,
@@ -1109,36 +1948,39 @@ export function generateMasterAccountingReport(
     variance: bsVariance,
   };
 
-  // ─────────────────────────────────────────────────────────
-  // J. CASH FLOW STATEMENT (Pure Original Real Cash Flows)
-  // ─────────────────────────────────────────────────────────
-  const cashFromSales = cashSalesTotal + cardSalesTotal + qrSalesTotal + bankTransferSalesTotal;
-  const cashPaidSuppliers = totalAmountPaid;
-  const livePaidOperatingExpenses = Math.round(postedOperatingExpenses.reduce((s, e) => s + (e.amountPaid || e.amount || 0), 0) * 100) / 100;
-  const cashPaidRefunds = totalReturnsAndRefunds;
+  // ── 5. BUILD STATEMENT OF CASH FLOWS (STRICTLY FROM REAL FIRESTORE CASH & BANK FLOWS) ──
+  const retailAndRepairCashReceipts = r2(rPosAndRepairCash + rPosBank);
+  const installmentCashReceipts = r2(rInstCash + rInstBank);
+  const cashPaidToSuppliers = r2(rPoPaid);
+  const livePaidOperatingExpenses = r2(
+    Math.max(0, totalPaidPeriodExpenseBills - totalPostedCapitalAssets - totalPostedLiabilityPayments - totalPostedOwnerWithdrawals)
+  );
+  const cashPaidRefunds = rReturns;
 
-  const operatingActivities = [
-    { name: "Cash Receipts from Invoiced Sales & Services", amount: Math.round(cashFromSales * 100) / 100 },
-    { name: "Cash Payments for Merchandise Purchases", amount: -Math.round(cashPaidSuppliers * 100) / 100 },
-    { name: "Cash Payments for Operating Overhead Expenses", amount: -Math.round(livePaidOperatingExpenses * 100) / 100 },
-    { name: "Cash Refunds Disbursed to Customers", amount: -Math.round(cashPaidRefunds * 100) / 100 },
-  ];
-  const netOperatingCashFlow = Math.round(operatingActivities.reduce((s, a) => s + a.amount, 0) * 100) / 100;
+  const operatingActivities: CashFlowData["operatingActivities"] = [
+    { name: "Cash Receipts from POS Retail & Workshop Sales", amount: retailAndRepairCashReceipts },
+    { name: "Cash Receipts from Installment Down Payments & Collections", amount: installmentCashReceipts },
+    { name: "Cash Paid to Suppliers for Merchandise Purchases", amount: -cashPaidToSuppliers },
+    { name: "Cash Paid for Operating Expenses & Employee Salaries", amount: -livePaidOperatingExpenses },
+    { name: "Cash Refunds Disbursed to Customers", amount: -cashPaidRefunds },
+  ].filter((a) => a.amount !== 0);
+  const netOperatingCashFlow = r2(operatingActivities.reduce((s, a) => s + a.amount, 0));
 
-  const investingActivities = [
-    { name: "Acquisition of Capital Assets & Equipment", amount: -Math.round(totalPostedCapitalAssets * 100) / 100 },
-  ];
-  const netInvestingCashFlow = Math.round(investingActivities.reduce((s, a) => s + a.amount, 0) * 100) / 100;
+  const investingActivities: CashFlowData["investingActivities"] = [
+    { name: "Acquisition of Store Equipment & Capital Assets", amount: -totalPostedCapitalAssets },
+  ].filter((a) => a.amount !== 0);
+  const netInvestingCashFlow = r2(investingActivities.reduce((s, a) => s + a.amount, 0));
 
-  const financingActivities = [
-    { name: "Owner Capital Drawings & Distributions", amount: -Math.round(totalPostedOwnerWithdrawals * 100) / 100 },
-    { name: "Repayment of Liabilities & Debt Facilities", amount: -Math.round(totalPostedLiabilityPayments * 100) / 100 },
-  ];
-  const netFinancingCashFlow = Math.round(financingActivities.reduce((s, a) => s + a.amount, 0) * 100) / 100;
+  const financingActivities: CashFlowData["financingActivities"] = [
+    { name: "Owner Working Capital Contributions", amount: periodOwnerCapitalInjected },
+    { name: "Owner Capital Drawings & Distributions", amount: -totalPostedOwnerWithdrawals },
+    { name: "Repayment of Liabilities & Debt Facilities", amount: -totalPostedLiabilityPayments },
+  ].filter((a) => a.amount !== 0);
+  const netFinancingCashFlow = r2(financingActivities.reduce((s, a) => s + a.amount, 0));
 
-  const netChangeInCash = Math.round((netOperatingCashFlow + netInvestingCashFlow + netFinancingCashFlow) * 100) / 100;
-  const endingCashBalance = Math.round((cashInTill + bankAccountsBalance) * 100) / 100;
-  const beginningCashBalance = Math.round((endingCashBalance - netChangeInCash) * 100) / 100;
+  const beginningCashBalance = r2(Math.max(0, getOpenNetDr("1010")) + Math.max(0, getOpenNetDr("1020")));
+  const netChangeInCash = r2(netOperatingCashFlow + netInvestingCashFlow + netFinancingCashFlow);
+  const endingCashBalance = r2(cashInTill + bankAccountsBalance);
 
   const cashFlow: CashFlowData = {
     operatingActivities,
@@ -1152,45 +1994,39 @@ export function generateMasterAccountingReport(
     endingCashBalance,
   };
 
-  // ─────────────────────────────────────────────────────────
-  // K. TRIAL BALANCE & GENERAL LEDGER SUMMARIES (Original Ledger)
-  // ─────────────────────────────────────────────────────────
-  const trialBalanceRows: TrialBalanceData["rows"] = [
-    { code: "1010", name: "Cash on Hand (Till Drawer)", category: "ASSET", debit: cashInTill, credit: 0 },
-    { code: "1020", name: "Bank Operating Account", category: "ASSET", debit: bankAccountsBalance, credit: 0 },
-    { code: "1030", name: "Accounts Receivable", category: "ASSET", debit: accountsReceivableAsset, credit: 0 },
-    { code: "1040", name: "Inventory Asset", category: "ASSET", debit: inventoryAsset, credit: 0 },
-    { code: "1510", name: "Capital Assets & Equipment", category: "ASSET", debit: totalPostedCapitalAssets, credit: 0 },
-    { code: "2010", name: "Accounts Payable", category: "LIABILITY", debit: 0, credit: accountsPayableLiability },
-    { code: "2020", name: "SST Output Tax Payable", category: "LIABILITY", debit: 0, credit: sstPayableLiability },
-    { code: "2030", name: "Accrued Liabilities", category: "LIABILITY", debit: 0, credit: accruedLiabilities },
-    { code: "3010", name: "Retained Earnings & Prior Equity", category: "EQUITY", debit: 0, credit: Math.max(0, retainedEarnings) },
-    { code: "4010", name: "Sales Revenue (Gross)", category: "REVENUE", debit: 0, credit: grossSales },
-    { code: "4020", name: "Sales Returns & Allowances", category: "REVENUE", debit: totalReturnsAndRefunds, credit: 0 },
-    { code: "4030", name: "Sales Discounts Allowed", category: "REVENUE", debit: totalDiscounts, credit: 0 },
-    { code: "5010", name: "Cost of Goods Sold (COGS)", category: "EXPENSE", debit: totalCogs, credit: 0 },
-    { code: "6010", name: "Operating Expenses (OpEx)", category: "EXPENSE", debit: totalOperatingExpenses, credit: 0 },
-  ];
+  // ── 6. BUILD TRIAL BALANCE & GENERAL LEDGER ACTIVITY SCHEDULE (ONLY REAL ACTIVE ACCOUNTS) ──
+  const activeGLAccounts = chartOfAccounts.filter((acct) => {
+    return acct.openDr > 0 || acct.openCr > 0 || acct.periodDr > 0 || acct.periodCr > 0;
+  });
 
-  let totalDebits = Math.round(trialBalanceRows.reduce((s, r) => s + r.debit, 0) * 100) / 100;
-  let totalCredits = Math.round(trialBalanceRows.reduce((s, r) => s + r.credit, 0) * 100) / 100;
-  const tbVariance = Math.round(Math.abs(totalDebits - totalCredits) * 100) / 100;
-
-  if (tbVariance > 0 && tbVariance < 5) {
-    totalCredits = totalDebits;
-  }
-
-  const glSummaries: TrialBalanceData["glSummaries"] = trialBalanceRows.map((r) => {
-    const isDebitNormal = r.category === "ASSET" || r.category === "EXPENSE";
-    const closing = isDebitNormal ? r.debit - r.credit : r.credit - r.debit;
+  const trialBalanceRows: TrialBalanceData["rows"] = activeGLAccounts.map((acct) => {
+    const netDr = getClosingNetDr(acct.code);
     return {
-      code: r.code,
-      name: r.name,
-      openingBalance: 0,
-      periodDebits: r.debit,
-      periodCredits: r.credit,
-      closingBalance: Math.round(Math.abs(closing) * 100) / 100,
-      normalBalance: isDebitNormal ? "DEBIT" : "CREDIT",
+      code: acct.code,
+      name: acct.name,
+      category: acct.category,
+      debit: netDr > 0 ? netDr : 0,
+      credit: netDr < 0 ? Math.abs(netDr) : 0,
+    };
+  });
+
+  const totalDebits = r2(trialBalanceRows.reduce((s, r) => s + r.debit, 0));
+  const totalCredits = r2(trialBalanceRows.reduce((s, r) => s + r.credit, 0));
+  const tbVariance = r2(Math.abs(totalDebits - totalCredits));
+
+  const glSummaries: TrialBalanceData["glSummaries"] = activeGLAccounts.map((acct) => {
+    const openNetDr = getOpenNetDr(acct.code);
+    const closeNetDr = getClosingNetDr(acct.code);
+    const openingBalance = acct.normalBalance === "DEBIT" ? openNetDr : r2(-openNetDr);
+    const closingBalance = acct.normalBalance === "DEBIT" ? closeNetDr : r2(-closeNetDr);
+    return {
+      code: acct.code,
+      name: acct.name,
+      openingBalance,
+      periodDebits: acct.periodDr,
+      periodCredits: acct.periodCr,
+      closingBalance,
+      normalBalance: acct.normalBalance,
     };
   });
 
@@ -1198,8 +2034,8 @@ export function generateMasterAccountingReport(
     rows: trialBalanceRows,
     totalDebits,
     totalCredits,
-    isBalanced: tbVariance < 5,
-    variance: tbVariance < 5 ? 0 : tbVariance,
+    isBalanced: tbVariance < 0.05,
+    variance: tbVariance,
     glSummaries,
   };
 
@@ -1213,6 +2049,7 @@ export function generateMasterAccountingReport(
     cashFlow,
     trialBalance,
     salesStatement,
+    repairStatement,
     inventoryValuation,
     purchaseStatement,
     accountsReceivable,

@@ -120,7 +120,8 @@ function getDateRangeBounds(
 }
 
 export default function DedicatedStockAnalysisPage() {
-  const { shop, user, isAuthenticated } = useShopAuth();
+  const { shop, user, activeBranchId: ctxBranchId, isAuthenticated } = useShopAuth();
+  const activeBranchId = ctxBranchId || user?.primaryBranchId || "main";
   const router = useRouter();
 
   // ── Date Range State ──
@@ -180,8 +181,8 @@ export default function DedicatedStockAnalysisPage() {
     setLoadingData(true);
 
     Promise.all([
-      getProducts(shop.shopId),
-      getCategories(shop.shopId),
+      getProducts(shop.shopId, undefined, undefined, activeBranchId),
+      getCategories(shop.shopId, activeBranchId),
     ])
       .then(([prods, cats]) => {
         setProducts(prods);
@@ -207,7 +208,7 @@ export default function DedicatedStockAnalysisPage() {
     return () => {
       if (unsubTx) unsubTx();
     };
-  }, [isAuthenticated, shop?.shopId]);
+  }, [isAuthenticated, shop?.shopId, activeBranchId]);
 
   // ---------------------------------------------------------------------------
   // 2. Active Date Range Bounds & Filtered Transactions

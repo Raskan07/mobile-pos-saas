@@ -20,6 +20,7 @@ import {
 import {
   getDateFilter,
   fetchRawAccountingData,
+  getCachedRawAccountingData,
   generateMasterAccountingReport,
 } from "@/lib/services/accountingReportsService";
 import {
@@ -32,6 +33,7 @@ import AccountingStatementsSidebar, {
 import DateRangeDropdown from "@/components/reports/DateRangeDropdown";
 import FinancialStatementsView from "@/components/reports/FinancialStatementsView";
 import { IOSSpinner } from "@/components/ui/IOSSpinner";
+import { getStoredReceiptSettings, fetchReceiptSettings } from "@/lib/services/receiptSettingsService";
 
 function ReportsPageContent() {
   const router = useRouter();
@@ -66,7 +68,10 @@ function ReportsPageContent() {
     products: any[];
     customers: any[];
     expenses: any[];
-  }>({ sales: [], purchases: [], products: [], customers: [], expenses: [] });
+    repairs: any[];
+    repairParts: any[];
+    installments?: any[];
+  }>({ sales: [], purchases: [], products: [], customers: [], expenses: [], repairs: [], repairParts: [], installments: [] });
 
   const [isLoadingData, setIsLoadingData] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
@@ -80,9 +85,22 @@ function ReportsPageContent() {
   const currentShopId = shop?.shopId || "";
   const currentShopName = shop?.shopName || currentShopId || "Store";
 
-  const loadData = async (targetShopId: string) => {
+  const [shopCurrency, setShopCurrency] = useState<string>(() =>
+    getStoredReceiptSettings(currentShopId, currentShopName).currency || "LKR"
+  );
+
+  useEffect(() => {
+    if (!currentShopId) return;
+    const local = getStoredReceiptSettings(currentShopId, currentShopName);
+    setShopCurrency(local.currency || "LKR");
+    fetchReceiptSettings(currentShopId, currentShopName).then((remote) => {
+      setShopCurrency(remote.currency || "LKR");
+    });
+  }, [currentShopId, currentShopName]);
+
+  const loadData = async (targetShopId: string, silent = false) => {
     if (!targetShopId) return;
-    setIsLoadingData(true);
+    if (!silent) setIsLoadingData(true);
     try {
       const data = await fetchRawAccountingData(targetShopId);
       setRawData(data);
@@ -96,14 +114,21 @@ function ReportsPageContent() {
 
   useEffect(() => {
     if (isAuthenticated && currentShopId) {
-      loadData(currentShopId);
+      const cached = getCachedRawAccountingData(currentShopId);
+      if (cached) {
+        setRawData(cached);
+        setIsLoadingData(false);
+        loadData(currentShopId, true);
+      } else {
+        loadData(currentShopId, false);
+      }
     }
   }, [isAuthenticated, currentShopId]);
 
   const handleRefresh = () => {
     if (currentShopId) {
       setIsRefreshing(true);
-      loadData(currentShopId);
+      loadData(currentShopId, true);
     }
   };
 
@@ -142,7 +167,7 @@ function ReportsPageContent() {
       reportTitle: activeConfig.title,
       reportData: masterReport,
       operatorName: user?.displayName || user?.username || "Admin",
-      currency: "LKR",
+      currency: shopCurrency,
     });
   };
 
@@ -152,7 +177,7 @@ function ReportsPageContent() {
       reportTitle: activeConfig.title,
       reportData: masterReport,
       operatorName: user?.displayName || user?.username || "Admin",
-      currency: "LKR",
+      currency: shopCurrency,
     });
   };
 
@@ -212,7 +237,7 @@ function ReportsPageContent() {
             <span className="text-zinc-400 hidden md:inline">Statement:</span>
             <span className="text-white font-bold max-w-[140px] truncate">{activeConfig.title}</span>
             <span className="text-[9px] font-mono px-1 py-0.2 rounded bg-white/[0.08] text-zinc-300 border border-white/[0.08]">
-              12
+              {STATEMENTS_CONFIG.length}
             </span>
           </button>
 
@@ -303,7 +328,7 @@ function ReportsPageContent() {
             reportTitle={activeConfig.title}
             reportData={masterReport}
             operatorName={user?.displayName || user?.username || "Admin"}
-            currency="LKR"
+            currency={shopCurrency}
           />
         )}
       </main>

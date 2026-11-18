@@ -3,423 +3,563 @@
 /**
  * components/analytics/SalesTrendChart.tsx
  *
- * Interactive dark-glass SVG chart for Sales, Net Revenue, and Refunds.
- * Features:
- * - Responsive SVG area & line rendering with subtle gradients
- * - Interactive hover cursor with floating inspection tooltip
- * - Series toggles (Gross Sales, Refunds, Net Revenue)
- * - Secondary gray axis ticks and labels
- * - Graceful fallback for empty or single-point datasets
+ * Luminous Spotlight Bar Chart harmonized with the Skyfox root dark-glass theme:
+ * - Root container: `rounded-2xl bg-[#0c0d15]/85 backdrop-blur-xl border border-white/[0.08] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.08)]`
+ * - Root accent palette: emerald (`#10b981`) &zinc/white specular highlights
+ * - Filters by Daily (every day of month), Weekly, Monthly, or By Time (Hourly), plus Month, Year, and Day pickers
  */
 
 import React, { useState, useMemo } from "react";
-import { TimelineDataPoint } from "@/lib/services/salesAnalyticsService";
-import { TrendingUp, Layers, Check } from "lucide-react";
+import { SaleRecord } from "@/lib/types/sale";
+import {
+  TimelineDataPoint,
+  getSaleRefundAmount,
+} from "@/lib/services/salesAnalyticsService";
+import {
+  BarChart2,
+  MoreHorizontal,
+  Sparkles,
+  Calendar,
+} from "lucide-react";
+
+export type BarPeriodMode = "daily" | "weekly" | "monthly" | "hourly";
+export type MetricTabMode = "income" | "gross" | "net_margin";
 
 interface SalesTrendChartProps {
   timeline: TimelineDataPoint[];
+  sales?: SaleRecord[];
   currencySymbol?: string;
   className?: string;
 }
 
+interface BarBucket {
+  key: string;
+  label: string;
+  fullLabel: string;
+  income: number;
+  gross: number;
+  netMargin: number;
+  ordersCount: number;
+  itemsCount: number;
+}
+
+const MONTH_NAMES = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+const SHORT_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
 export default function SalesTrendChart({
-  timeline,
+  sales = [],
   currencySymbol = "LKR",
   className = "",
 }: SalesTrendChartProps) {
-  const [activeSeries, setActiveSeries] = useState<{
-    net: boolean;
-    gross: boolean;
-    refunds: boolean;
-  }>({
-    net: true,
-    gross: true,
-    refunds: true,
-  });
+  const now = new Date();
+  const [periodMode, setPeriodMode] = useState<BarPeriodMode>("daily");
+  const [metricTab, setMetricTab] = useState<MetricTabMode>("income");
+  const [selectedMonth, setSelectedMonth] = useState<number>(now.getMonth());
+  const [selectedYear, setSelectedYear] = useState<number>(now.getFullYear());
+  const [selectedDay, setSelectedDay] = useState<number | "ALL">("ALL");
+  const [activeBarIndex, setActiveBarIndex] = useState<number | null>(null);
 
-  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const daysInMonth = useMemo(
+    () => new Date(selectedYear, selectedMonth + 1, 0).getDate(),
+    [selectedYear, selectedMonth]
+  );
 
-  // Chart bounds & layout (Reduced ~25%)
-  const width = 800;
-  const height = 210;
-  const padding = { top: 20, right: 25, bottom: 35, left: 55 };
-  const innerWidth = width - padding.left - padding.right;
-  const innerHeight = height - padding.top - padding.bottom;
+  const buckets: BarBucket[] = useMemo(() => {
+    const validSales = (sales || []).filter((s) => s.status !== "voided");
 
-  // Max value calculation across visible series
-  const maxVal = useMemo(() => {
-    if (!timeline || timeline.length === 0) return 1000;
+    const calcSaleCost = (s: SaleRecord) => {
+      if (!Array.isArray(s.items)) return 0;
+      return s.items.reduce(
+        (sum, it) => sum + (Number(it.costPrice) || 0) * (Number(it.quantity) || 1),
+        0
+      );
+    };
+
+    if (periodMode === "daily") {
+      const map = new Map<number, BarBucket>();
+      for (let d = 1; d <= daysInMonth; d++) {
+        const dt = new Date(selectedYear, selectedMonth, d);
+        const wk = dt.toLocaleDateString("en-US", { weekday: "short" });
+        map.set(d, {
+          key: `D-${d}`,
+          label: String(d).padStart(2, "0"),
+          fullLabel: `${wk}, ${SHORT_MONTHS[selectedMonth]} ${d}, ${selectedYear}`,
+          income: 0,
+          gross: 0,
+          netMargin: 0,
+          ordersCount: 0,
+          itemsCount: 0,
+        });
+      }
+
+      validSales.forEach((s) => {
+        const dt = new Date(s.createdAt || Date.now());
+        if (dt.getFullYear() !== selectedYear || dt.getMonth() !== selectedMonth) return;
+        const d = dt.getDate();
+        if (selectedDay !== "ALL" && d !== selectedDay) return;
+
+        const b = map.get(d);
+        if (!b) return;
+        const gross = Number(s.grandTotal || s.total || 0);
+        const refund = getSaleRefundAmount(s);
+        const net = Math.max(0, gross - refund);
+        const cogs = calcSaleCost(s);
+        const items =
+          s.itemCount ||
+          (Array.isArray(s.items) ? s.items.reduce((acc, i) => acc + (i.quantity || 1), 0) : 1);
+
+        b.gross += gross;
+        b.income += net;
+        b.netMargin += Math.max(0, net - cogs);
+        b.ordersCount += 1;
+        b.itemsCount += items;
+      });
+
+      return Array.from(map.values());
+    }
+
+    if (periodMode === "weekly") {
+      const list: BarBucket[] = [
+        { key: "W1", label: "Wk 1", fullLabel: `${SHORT_MONTHS[selectedMonth]} 01 – 07`, income: 0, gross: 0, netMargin: 0, ordersCount: 0, itemsCount: 0 },
+        { key: "W2", label: "Wk 2", fullLabel: `${SHORT_MONTHS[selectedMonth]} 08 – 14`, income: 0, gross: 0, netMargin: 0, ordersCount: 0, itemsCount: 0 },
+        { key: "W3", label: "Wk 3", fullLabel: `${SHORT_MONTHS[selectedMonth]} 15 – 21`, income: 0, gross: 0, netMargin: 0, ordersCount: 0, itemsCount: 0 },
+        { key: "W4", label: "Wk 4", fullLabel: `${SHORT_MONTHS[selectedMonth]} 22 – 28`, income: 0, gross: 0, netMargin: 0, ordersCount: 0, itemsCount: 0 },
+      ];
+      if (daysInMonth > 28) {
+        list.push({
+          key: "W5",
+          label: "Wk 5",
+          fullLabel: `${SHORT_MONTHS[selectedMonth]} 29 – ${daysInMonth}`,
+          income: 0,
+          gross: 0,
+          netMargin: 0,
+          ordersCount: 0,
+          itemsCount: 0,
+        });
+      }
+
+      validSales.forEach((s) => {
+        const dt = new Date(s.createdAt || Date.now());
+        if (dt.getFullYear() !== selectedYear || dt.getMonth() !== selectedMonth) return;
+        const d = dt.getDate();
+        const idx = Math.min(list.length - 1, Math.floor((d - 1) / 7));
+        const b = list[idx];
+        const gross = Number(s.grandTotal || s.total || 0);
+        const refund = getSaleRefundAmount(s);
+        const net = Math.max(0, gross - refund);
+        const cogs = calcSaleCost(s);
+        const items =
+          s.itemCount ||
+          (Array.isArray(s.items) ? s.items.reduce((acc, i) => acc + (i.quantity || 1), 0) : 1);
+
+        b.gross += gross;
+        b.income += net;
+        b.netMargin += Math.max(0, net - cogs);
+        b.ordersCount += 1;
+        b.itemsCount += items;
+      });
+
+      return list;
+    }
+
+    if (periodMode === "monthly") {
+      const list: BarBucket[] = SHORT_MONTHS.map((m, idx) => ({
+        key: `M-${idx}`,
+        label: m,
+        fullLabel: `${MONTH_NAMES[idx]} ${selectedYear}`,
+        income: 0,
+        gross: 0,
+        netMargin: 0,
+        ordersCount: 0,
+        itemsCount: 0,
+      }));
+
+      validSales.forEach((s) => {
+        const dt = new Date(s.createdAt || Date.now());
+        if (dt.getFullYear() !== selectedYear) return;
+        const b = list[dt.getMonth()];
+        const gross = Number(s.grandTotal || s.total || 0);
+        const refund = getSaleRefundAmount(s);
+        const net = Math.max(0, gross - refund);
+        const cogs = calcSaleCost(s);
+        const items =
+          s.itemCount ||
+          (Array.isArray(s.items) ? s.items.reduce((acc, i) => acc + (i.quantity || 1), 0) : 1);
+
+        b.gross += gross;
+        b.income += net;
+        b.netMargin += Math.max(0, net - cogs);
+        b.ordersCount += 1;
+        b.itemsCount += items;
+      });
+
+      return list;
+    }
+
+    // 4. HOURLY TIME: Full 24 Hours (12 AM – 11 PM)
+    const list: BarBucket[] = Array.from({ length: 24 }, (_, hr) => {
+      const label =
+        hr === 0 ? "12a" : hr < 12 ? `${hr}a` : hr === 12 ? "12p" : `${hr - 12}p`;
+      const fullLabel =
+        hr === 0
+          ? "12:00 AM"
+          : hr < 12
+          ? `${hr}:00 AM`
+          : hr === 12
+          ? "12:00 PM"
+          : `${hr - 12}:00 PM`;
+      return {
+        key: `H-${hr}`,
+        label,
+        fullLabel,
+        income: 0,
+        gross: 0,
+        netMargin: 0,
+        ordersCount: 0,
+        itemsCount: 0,
+      };
+    });
+
+    validSales.forEach((s) => {
+      const dt = new Date(s.createdAt || Date.now());
+      if (dt.getFullYear() !== selectedYear || dt.getMonth() !== selectedMonth) return;
+      if (selectedDay !== "ALL" && dt.getDate() !== selectedDay) return;
+
+      const hr = dt.getHours();
+      const b = list[hr];
+      const gross = Number(s.grandTotal || s.total || 0);
+      const refund = getSaleRefundAmount(s);
+      const net = Math.max(0, gross - refund);
+      const cogs = calcSaleCost(s);
+      const items =
+        s.itemCount ||
+        (Array.isArray(s.items) ? s.items.reduce((acc, i) => acc + (i.quantity || 1), 0) : 1);
+
+      b.gross += gross;
+      b.income += net;
+      b.netMargin += Math.max(0, net - cogs);
+      b.ordersCount += 1;
+      b.itemsCount += items;
+    });
+
+    return list;
+  }, [sales, periodMode, selectedMonth, selectedYear, selectedDay, daysInMonth]);
+
+  const getVal = (b: BarBucket) => {
+    if (metricTab === "gross") return b.gross;
+    if (metricTab === "net_margin") return b.netMargin;
+    return b.income;
+  };
+
+  const peakIndex = useMemo(() => {
+    let bestIdx = 0;
+    let bestVal = -1;
+    buckets.forEach((b, idx) => {
+      const v = getVal(b);
+      if (v > bestVal) {
+        bestVal = v;
+        bestIdx = idx;
+      }
+    });
+    return bestVal > 0 ? bestIdx : Math.floor(buckets.length / 2);
+  }, [buckets, metricTab]);
+
+  const highlightedIndex = activeBarIndex !== null ? activeBarIndex : peakIndex;
+
+  const totalMetricValue = useMemo(
+    () => buckets.reduce((sum, b) => sum + getVal(b), 0),
+    [buckets, metricTab]
+  );
+
+  const maxBarValue = useMemo(() => {
     let m = 0;
-    for (const pt of timeline) {
-      if (activeSeries.gross) m = Math.max(m, pt.grossSales);
-      if (activeSeries.net) m = Math.max(m, pt.netRevenue);
-      if (activeSeries.refunds) m = Math.max(m, pt.refunds);
-    }
-    return m > 0 ? m * 1.15 : 1000; // 15% headroom
-  }, [timeline, activeSeries]);
-
-  // Coordinates computation
-  const points = useMemo(() => {
-    if (!timeline || timeline.length === 0) return [];
-    const count = timeline.length;
-    const step = count > 1 ? innerWidth / (count - 1) : innerWidth / 2;
-
-    return timeline.map((pt, i) => {
-      const x = padding.left + (count > 1 ? i * step : innerWidth / 2);
-      const grossY = padding.top + innerHeight - (pt.grossSales / maxVal) * innerHeight;
-      const netY = padding.top + innerHeight - (pt.netRevenue / maxVal) * innerHeight;
-      const refundY = padding.top + innerHeight - (pt.refunds / maxVal) * innerHeight;
-      return { x, grossY, netY, refundY, data: pt };
+    buckets.forEach((b) => {
+      const v = getVal(b);
+      if (v > m) m = v;
     });
-  }, [timeline, innerWidth, innerHeight, padding.left, padding.top, maxVal]);
+    return m > 0 ? m * 1.2 : 1000;
+  }, [buckets, metricTab]);
 
-  // SVG Path generators
-  const netAreaPath = useMemo(() => {
-    if (points.length < 2) return "";
-    const bottomY = padding.top + innerHeight;
-    let p = `M ${points[0].x} ${bottomY} L ${points[0].x} ${points[0].netY}`;
-    for (let i = 1; i < points.length; i++) {
-      p += ` L ${points[i].x} ${points[i].netY}`;
-    }
-    p += ` L ${points[points.length - 1].x} ${bottomY} Z`;
-    return p;
-  }, [points, padding.top, innerHeight]);
-
-  const netLinePath = useMemo(() => {
-    if (points.length < 2) return "";
-    return points.reduce((acc, pt, i) => `${acc} ${i === 0 ? "M" : "L"} ${pt.x} ${pt.netY}`, "");
-  }, [points]);
-
-  const grossLinePath = useMemo(() => {
-    if (points.length < 2) return "";
-    return points.reduce((acc, pt, i) => `${acc} ${i === 0 ? "M" : "L"} ${pt.x} ${pt.grossY}`, "");
-  }, [points]);
-
-  const refundLinePath = useMemo(() => {
-    if (points.length < 2) return "";
-    return points.reduce((acc, pt, i) => `${acc} ${i === 0 ? "M" : "L"} ${pt.x} ${pt.refundY}`, "");
-  }, [points]);
-
-  // Y-axis grid ticks
-  const yTicks = useMemo(() => {
-    const ticks = [0, 0.25, 0.5, 0.75, 1];
-    return ticks.map((ratio) => {
-      const val = maxVal * ratio;
-      const y = padding.top + innerHeight - ratio * innerHeight;
-      return { val, y };
-    });
-  }, [maxVal, innerHeight, padding.top]);
-
-  const hoveredData = hoveredIndex !== null && points[hoveredIndex] ? points[hoveredIndex] : null;
+  const formatYAxis = (v: number) => {
+    if (v >= 1_000_000) return `${currencySymbol} ${(v / 1_000_000).toFixed(1)}M`;
+    if (v >= 1_000) return `${currencySymbol} ${(v / 1_000).toFixed(0)}k`;
+    return `${currencySymbol} ${v.toFixed(0)}`;
+  };
 
   return (
-    <div className={`relative overflow-hidden rounded-2xl bg-[#0c0d15]/90 backdrop-blur-xl border border-white/[0.08] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.08)] p-4 sm:p-4.5 flex flex-col ${className}`}>
-      {/* Header bar: Title, Legend toggles */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
+    <div
+      className={`relative rounded-2xl bg-[#0c0d15]/85 backdrop-blur-xl border border-white/[0.08] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.08)] p-4 sm:p-5 overflow-hidden select-none ${className}`}
+    >
+      {/* ── TOP ROW: CASH FLOW / SALES HEADER + PERIOD SELECTORS ── */}
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
         <div>
-          <div className="flex items-center gap-1.5">
-            <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-400">
-              REVENUE & REFUNDS DYNAMICS
-            </span>
+          <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-400">
+            {metricTab === "income"
+              ? "CASH FLOW & NET SALES"
+              : metricTab === "gross"
+              ? "GROSS SALES VOLUME"
+              : "ESTIMATED NET PROFIT"}
+          </span>
+          <div className="text-xl sm:text-2xl font-bold text-white tracking-tight font-mono mt-0.5">
+            {currencySymbol}{" "}
+            {totalMetricValue.toLocaleString("en-US", {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2,
+            })}
           </div>
-          <h3 className="text-sm font-bold text-white tracking-tight flex items-center gap-2 mt-0.5">
-            <span>Sales Performance Trend</span>
-            <span className="text-[11px] font-normal text-zinc-400">({timeline.length} intervals)</span>
-          </h3>
         </div>
 
-        {/* Legend series toggles */}
-        <div className="flex flex-wrap items-center gap-1.5 text-xs">
-          {/* Net Revenue Toggle */}
-          <button
-            type="button"
-            onClick={() => setActiveSeries((s) => ({ ...s, net: !s.net }))}
-            className={`px-2 py-0.5 rounded-lg border flex items-center gap-1.5 transition-all cursor-pointer ${
-              activeSeries.net
-                ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300"
-                : "bg-white/[0.02] border-white/10 text-zinc-500 hover:text-zinc-300"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
-            <span className="font-semibold text-[10px]">Net Revenue</span>
-          </button>
+        {/* Right: Period Dropdowns matching root dark glass controls */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {/* Month Picker */}
+          <div className="flex items-center bg-white/[0.04] hover:bg-white/[0.07] border border-white/10 rounded-xl px-2.5 py-1 text-xs text-zinc-200 transition-colors">
+            <Calendar className="w-3.5 h-3.5 text-zinc-400 mr-1.5" />
+            <select
+              value={selectedMonth}
+              onChange={(e) => {
+                setSelectedMonth(Number(e.target.value));
+                setSelectedDay("ALL");
+                setActiveBarIndex(null);
+              }}
+              className="bg-transparent font-medium text-zinc-200 focus:outline-none cursor-pointer pr-1"
+            >
+              {MONTH_NAMES.map((m, idx) => (
+                <option key={m} value={idx} className="bg-[#0c0d15]">
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
 
-          {/* Gross Sales Toggle */}
-          <button
-            type="button"
-            onClick={() => setActiveSeries((s) => ({ ...s, gross: !s.gross }))}
-            className={`px-2 py-0.5 rounded-lg border flex items-center gap-1.5 transition-all cursor-pointer ${
-              activeSeries.gross
-                ? "bg-zinc-700/40 border-zinc-500/40 text-zinc-200"
-                : "bg-white/[0.02] border-white/10 text-zinc-500 hover:text-zinc-300"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-zinc-300 shrink-0" />
-            <span className="font-semibold text-[10px]">Gross Sales</span>
-          </button>
+          {/* Year Picker */}
+          <div className="flex items-center bg-white/[0.04] hover:bg-white/[0.07] border border-white/10 rounded-xl px-2.5 py-1 text-xs text-zinc-200 transition-colors">
+            <select
+              value={selectedYear}
+              onChange={(e) => {
+                setSelectedYear(Number(e.target.value));
+                setActiveBarIndex(null);
+              }}
+              className="bg-transparent font-mono font-medium text-zinc-200 focus:outline-none cursor-pointer"
+            >
+              {[2024, 2025, 2026, 2027].map((yr) => (
+                <option key={yr} value={yr} className="bg-[#0c0d15]">
+                  {yr}
+                </option>
+              ))}
+            </select>
+          </div>
 
-          {/* Refunds Toggle */}
-          <button
-            type="button"
-            onClick={() => setActiveSeries((s) => ({ ...s, refunds: !s.refunds }))}
-            className={`px-2 py-0.5 rounded-lg border flex items-center gap-1.5 transition-all cursor-pointer ${
-              activeSeries.refunds
-                ? "bg-rose-500/15 border-rose-500/30 text-rose-300"
-                : "bg-white/[0.02] border-white/10 text-zinc-500 hover:text-zinc-300"
-            }`}
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-rose-400 shrink-0" />
-            <span className="font-semibold text-[10px]">Refunds</span>
-          </button>
+          {/* Specific Day Filter when in Daily or Hourly mode */}
+          {(periodMode === "daily" || periodMode === "hourly") && (
+            <div className="flex items-center bg-white/[0.04] hover:bg-white/[0.07] border border-white/10 rounded-xl px-2.5 py-1 text-xs text-zinc-200 transition-colors">
+              <select
+                value={selectedDay}
+                onChange={(e) => {
+                  setSelectedDay(
+                    e.target.value === "ALL" ? "ALL" : Number(e.target.value)
+                  );
+                  setActiveBarIndex(null);
+                }}
+                className="bg-transparent font-medium text-zinc-200 focus:outline-none cursor-pointer"
+              >
+                <option value="ALL" className="bg-[#0c0d15]">
+                  All Days ({daysInMonth})
+                </option>
+                {Array.from({ length: daysInMonth }, (_, i) => i + 1).map((d) => (
+                  <option key={d} value={d} className="bg-[#0c0d15]">
+                    {SHORT_MONTHS[selectedMonth]} {String(d).padStart(2, "0")}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* Granularity Selector (Daily / Weekly / Monthly / Time) */}
+          <div className="flex items-center bg-white/[0.04] hover:bg-white/[0.07] border border-white/10 rounded-xl px-2.5 py-1 text-xs text-white transition-colors">
+            <select
+              value={periodMode}
+              onChange={(e) => {
+                setPeriodMode(e.target.value as BarPeriodMode);
+                setActiveBarIndex(null);
+              }}
+              className="bg-transparent font-semibold text-white focus:outline-none cursor-pointer pr-1"
+            >
+              <option value="daily" className="bg-[#0c0d15]">
+                Daily (Every Day)
+              </option>
+              <option value="weekly" className="bg-[#0c0d15]">
+                Weekly
+              </option>
+              <option value="monthly" className="bg-[#0c0d15]">
+                Monthly
+              </option>
+              <option value="hourly" className="bg-[#0c0d15]">
+                By Time (24h)
+              </option>
+            </select>
+          </div>
         </div>
       </div>
 
-      {/* Main Chart Area */}
-      <div className="relative w-full h-[210px]">
-        {timeline.length === 0 ? (
-          <div className="w-full h-full flex flex-col items-center justify-center text-center p-6 space-y-2">
-            <Layers className="w-8 h-8 text-zinc-600 animate-pulse" />
-            <div className="text-xs font-semibold text-zinc-400">No Sales Data for Current Range</div>
-            <div className="text-[11px] text-zinc-400 max-w-xs">
-              Transactions processed within this date range will automatically render here.
-            </div>
-          </div>
-        ) : (
-          <svg
-            viewBox={`0 0 ${width} ${height}`}
-            className="w-full h-full overflow-visible select-none"
-            preserveAspectRatio="none"
-          >
-            <defs>
-              {/* Net Revenue subtle glass gradient */}
-              <linearGradient id="netRevenueGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#10b981" stopOpacity="0.25" />
-                <stop offset="70%" stopColor="#10b981" stopOpacity="0.05" />
-                <stop offset="100%" stopColor="#10b981" stopOpacity="0.00" />
-              </linearGradient>
+      {/* ── SECOND ROW: PILL TABS (Income / Gross Sales / Net Profit) + RIGHT ICON BUTTONS ── */}
+      <div className="flex items-center justify-between gap-3 mt-3.5">
+        <div className="flex items-center gap-1 p-0.5 rounded-xl bg-black/30 border border-white/[0.07]">
+          {(
+            [
+              { id: "income", label: "Income" },
+              { id: "gross", label: "Gross Sales" },
+              { id: "net_margin", label: "Net Profit" },
+            ] as const
+          ).map((tab) => {
+            const isActive = metricTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setMetricTab(tab.id)}
+                className={`px-3 py-1 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
+                  isActive
+                    ? "bg-zinc-800 text-white border border-zinc-700/60 shadow-sm"
+                    : "text-zinc-400 hover:text-zinc-200 bg-transparent border border-transparent"
+                }`}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
 
-              {/* Refunds gradient */}
-              <linearGradient id="refundsGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#f43f5e" stopOpacity="0.2" />
-                <stop offset="100%" stopColor="#f43f5e" stopOpacity="0.0" />
-              </linearGradient>
-            </defs>
-
-            {/* Horizontal Grid lines & Y-axis labels */}
-            {yTicks.map((tick, i) => (
-              <g key={i}>
-                <line
-                  x1={padding.left}
-                  y1={tick.y}
-                  x2={width - padding.right}
-                  y2={tick.y}
-                  stroke="rgba(255,255,255,0.06)"
-                  strokeDasharray={i === 0 ? "none" : "3,3"}
-                  strokeWidth="1"
-                />
-                <text
-                  x={padding.left - 10}
-                  y={tick.y + 4}
-                  textAnchor="end"
-                  className="fill-zinc-500 font-mono text-[9px]"
-                >
-                  {tick.val >= 1000 ? `${(tick.val / 1000).toFixed(0)}k` : tick.val.toFixed(0)}
-                </text>
-              </g>
-            ))}
-
-            {/* X-axis date labels */}
-            {points.map((pt, i) => {
-              // Show evenly spaced labels to prevent crowding
-              const showLabel =
-                points.length <= 8 ||
-                i === 0 ||
-                i === points.length - 1 ||
-                i % Math.ceil(points.length / 7) === 0;
-
-              if (!showLabel) return null;
-
-              return (
-                <text
-                  key={i}
-                  x={pt.x}
-                  y={height - 12}
-                  textAnchor="middle"
-                  className="fill-zinc-500 font-medium text-[9px]"
-                >
-                  {pt.data.label}
-                </text>
-              );
-            })}
-
-            {/* Area Fill for Net Revenue */}
-            {activeSeries.net && netAreaPath && (
-              <path d={netAreaPath} fill="url(#netRevenueGrad)" />
-            )}
-
-            {/* Gross Sales Line */}
-            {activeSeries.gross && grossLinePath && (
-              <path
-                d={grossLinePath}
-                fill="none"
-                stroke="#a1a1aa"
-                strokeWidth="2"
-                strokeDasharray="4,3"
-                className="opacity-70"
-              />
-            )}
-
-            {/* Refunds Line */}
-            {activeSeries.refunds && refundLinePath && (
-              <path
-                d={refundLinePath}
-                fill="none"
-                stroke="#fb7185"
-                strokeWidth="2"
-                strokeLinecap="round"
-              />
-            )}
-
-            {/* Net Revenue Hero Line */}
-            {activeSeries.net && netLinePath && (
-              <path
-                d={netLinePath}
-                fill="none"
-                stroke="#34d399"
-                strokeWidth="2.5"
-                strokeLinecap="round"
-                filter="drop-shadow(0px 2px 8px rgba(16,185,129,0.3))"
-              />
-            )}
-
-            {/* Interactive Points & Vertical Marker on Hover */}
-            {hoveredData && (
-              <g>
-                <line
-                  x1={hoveredData.x}
-                  y1={padding.top}
-                  x2={hoveredData.x}
-                  y2={padding.top + innerHeight}
-                  stroke="rgba(255,255,255,0.3)"
-                  strokeWidth="1"
-                  strokeDasharray="2,2"
-                />
-
-                {activeSeries.net && (
-                  <circle
-                    cx={hoveredData.x}
-                    cy={hoveredData.netY}
-                    r="5"
-                    fill="#10b981"
-                    stroke="#ffffff"
-                    strokeWidth="2"
-                  />
-                )}
-                {activeSeries.gross && (
-                  <circle
-                    cx={hoveredData.x}
-                    cy={hoveredData.grossY}
-                    r="4"
-                    fill="#a1a1aa"
-                    stroke="#ffffff"
-                    strokeWidth="1.5"
-                  />
-                )}
-                {activeSeries.refunds && hoveredData.data.refunds > 0 && (
-                  <circle
-                    cx={hoveredData.x}
-                    cy={hoveredData.refundY}
-                    r="4"
-                    fill="#f43f5e"
-                    stroke="#ffffff"
-                    strokeWidth="1.5"
-                  />
-                )}
-              </g>
-            )}
-
-            {/* Invisible Hit Slices for Hover Interaction */}
-            {points.map((pt, i) => {
-              const sliceWidth = innerWidth / points.length;
-              return (
-                <rect
-                  key={i}
-                  x={pt.x - sliceWidth / 2}
-                  y={padding.top}
-                  width={sliceWidth}
-                  height={innerHeight}
-                  fill="transparent"
-                  className="cursor-pointer"
-                  onMouseEnter={() => setHoveredIndex(i)}
-                  onMouseLeave={() => setHoveredIndex(null)}
-                />
-              );
-            })}
-          </svg>
-        )}
-
-        {/* Floating Tooltip */}
-        {hoveredData && (
-          <div
-            className="absolute z-20 pointer-events-none p-3 rounded-2xl bg-[#121420]/95 backdrop-blur-xl border border-white/15 shadow-2xl space-y-1.5 transition-all text-xs"
-            style={{
-              left: `${Math.min(Math.max(10, (hoveredData.x / width) * 100), 75)}%`,
-              top: "10px",
-            }}
-          >
-            <div className="flex items-center justify-between gap-4 border-b border-white/10 pb-1.5">
-              <span className="font-bold text-white text-[11px]">{hoveredData.data.label}</span>
-              <span className="text-[10px] text-zinc-400 font-mono">
-                {hoveredData.data.transactions} {hoveredData.data.transactions === 1 ? "Order" : "Orders"}
+        <div className="flex items-center gap-1.5">
+          <div className="hidden sm:flex items-center gap-2 text-[11px] text-zinc-400 font-mono mr-1">
+            {buckets[highlightedIndex] && (
+              <span>
+                Selected:{" "}
+                <strong className="text-emerald-400">
+                  {buckets[highlightedIndex].fullLabel}
+                </strong>{" "}
+                ({buckets[highlightedIndex].ordersCount} orders)
               </span>
-            </div>
-
-            <div className="space-y-1 font-mono text-[11px]">
-              <div className="flex items-center justify-between gap-4 text-emerald-400 font-bold">
-                <span className="flex items-center gap-1.5 text-zinc-400 font-medium">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                  Net Revenue
-                </span>
-                <span>
-                  {currencySymbol} {hoveredData.data.netRevenue.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between gap-4 text-zinc-300">
-                <span className="flex items-center gap-1.5 text-zinc-400 font-medium">
-                  <span className="w-1.5 h-1.5 rounded-full bg-zinc-400" />
-                  Gross Sales
-                </span>
-                <span>
-                  {currencySymbol} {hoveredData.data.grossSales.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </span>
-              </div>
-
-              {hoveredData.data.refunds > 0 && (
-                <div className="flex items-center justify-between gap-4 text-rose-400">
-                  <span className="flex items-center gap-1.5 text-zinc-400 font-medium">
-                    <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
-                    Refunds
-                  </span>
-                  <span>
-                    -{currencySymbol} {hoveredData.data.refunds.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </span>
-                </div>
-              )}
-
-              <div className="flex items-center justify-between gap-4 text-zinc-400 pt-1 border-t border-white/5 text-[10px]">
-                <span>Items Sold</span>
-                <span>{hoveredData.data.itemsSold} units</span>
-              </div>
-            </div>
+            )}
           </div>
-        )}
+          <div className="w-7 h-7 rounded-lg bg-white/[0.04] border border-white/[0.08] flex items-center justify-center text-emerald-400">
+            <BarChart2 className="w-3.5 h-3.5" />
+          </div>
+          <div className="w-7 h-7 rounded-lg bg-white/[0.04] border border-white/[0.08] flex items-center justify-center text-zinc-400">
+            <MoreHorizontal className="w-3.5 h-3.5" />
+          </div>
+        </div>
       </div>
 
-      {/* Footer Summary note in gray */}
-      <div className="mt-3 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[11px] text-zinc-400">
-        <span>Formula: Net Revenue = Gross Sales − Total Processed Refunds</span>
-        <span>Strictly isolated to active store ID</span>
+      {/* ── LUMINOUS BAR CHART AREA (Root Emerald + Dark Glass Palette) ── */}
+      <div className="relative mt-8 h-52 w-full flex flex-col justify-end">
+        {/* Horizontal Y-Axis Grid Lines */}
+        {[0, 0.33, 0.66, 1].map((ratio, idx) => {
+          const val = maxBarValue * ratio;
+          return (
+            <div
+              key={idx}
+              style={{ bottom: `${ratio * 76 + 11}%` }}
+              className="pointer-events-none absolute inset-x-0 flex items-center gap-2.5"
+            >
+              <span className="text-[9.5px] font-mono text-zinc-500 w-16 text-right shrink-0">
+                {formatYAxis(val)}
+              </span>
+              <div className="flex-1 border-t border-white/[0.06]" />
+            </div>
+          );
+        })}
+
+        {/* Bars Container */}
+        <div className="relative z-10 pl-18 pr-2 h-full flex items-end gap-1 sm:gap-2 pb-6 pt-8">
+          {buckets.map((b, idx) => {
+            const val = getVal(b);
+            const isHighlighted = idx === highlightedIndex;
+            const rawPct = maxBarValue > 0 ? (val / maxBarValue) * 100 : 0;
+            const heightPct = Math.max(val > 0 ? 14 : 7, Math.min(100, rawPct));
+
+            return (
+              <div
+                key={b.key}
+                onMouseEnter={() => setActiveBarIndex(idx)}
+                onClick={() => setActiveBarIndex(idx)}
+                className="relative flex-1 h-full flex flex-col justify-end items-center group cursor-pointer"
+              >
+                {/* Floating Callout Pill + Glowing Star Sparkle on Highlighted Bar */}
+                {isHighlighted && (
+                  <div className="absolute -top-10 z-30 flex flex-col items-center pointer-events-none animate-in fade-in zoom-in-95 duration-150">
+                    <div className="px-2 py-0.5 rounded-full bg-[#121420]/95 border border-emerald-500/35 shadow-xl text-[10px] font-mono font-bold text-white whitespace-nowrap">
+                      {currencySymbol}{" "}
+                      {val.toLocaleString("en-US", {
+                        minimumFractionDigits: val % 1 === 0 ? 0 : 2,
+                        maximumFractionDigits: 2,
+                      })}
+                    </div>
+                    <div className="relative flex items-center justify-center mt-0.5">
+                      <div className="w-3.5 h-3.5 rounded-full bg-emerald-300/80 blur-[3px] animate-pulse" />
+                      <Sparkles className="w-3 h-3 text-white absolute drop-shadow-[0_0_8px_rgba(16,185,129,1)]" />
+                    </div>
+                  </div>
+                )}
+
+                {/* Rounded Bar Pillar (Root Dark Glass & Emerald Spotlight) */}
+                <div
+                  style={{ height: `${heightPct}%` }}
+                  className={`relative w-full max-w-[44px] rounded-t-xl transition-all duration-300 overflow-hidden ${
+                    isHighlighted
+                      ? "bg-gradient-to-b from-emerald-100 via-emerald-500 to-[#0c241d] shadow-[0_-6px_28px_rgba(16,185,129,0.5)] ring-1 ring-emerald-300/60 scale-x-[1.03]"
+                      : val > 0
+                      ? "bg-gradient-to-b from-zinc-700/70 to-zinc-900/80 hover:from-zinc-600/80 hover:to-zinc-800/90 border-t border-x border-white/[0.08]"
+                      : "bg-gradient-to-b from-white/[0.04] to-white/[0.015] border-t border-x border-white/[0.04]"
+                  }`}
+                >
+                  {isHighlighted && (
+                    <div className="absolute top-1 left-1/2 -translate-x-1/2 w-4 h-4 rounded-full bg-white blur-[5px] opacity-90" />
+                  )}
+                </div>
+
+                {/* X-Axis Label */}
+                <span
+                  className={`absolute -bottom-5 text-[9.5px] font-mono transition-colors ${
+                    isHighlighted
+                      ? "text-emerald-400 font-bold"
+                      : val > 0
+                      ? "text-zinc-400"
+                      : "text-zinc-600"
+                  }`}
+                >
+                  {b.label}
+                </span>
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );

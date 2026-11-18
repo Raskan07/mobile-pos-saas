@@ -18,6 +18,7 @@ export type StockStatus = "HEALTHY" | "LOW_STOCK" | "OUT_OF_STOCK";
 export interface StockTransaction {
   id: string;
   shopId: string;
+  branchId?: string;
   productId: string;
   productName: string;
   sku: string;
@@ -39,6 +40,7 @@ export interface StockTransaction {
 }
 
 export interface CreateStockMovementInput {
+  branchId?: string;
   productId: string;
   productName: string;
   sku: string;

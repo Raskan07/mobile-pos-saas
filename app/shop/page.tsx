@@ -14,7 +14,7 @@
  *   - Smooth cinematic exit transition on successful login into /shop/dashboard
  */
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Image from "next/image";
 import gsap from "gsap";
@@ -27,6 +27,9 @@ import {
   Check,
   RotateCcw,
   Sparkles,
+  Building2,
+  ChevronDown,
+  UserCheck,
 } from "lucide-react";
 import {
   verifyShopExists,
@@ -35,8 +38,11 @@ import {
   getShopUsersRef,
   createShopUserNested,
 } from "@/lib/services/shopAuthService";
+import { getBranches, ensureDefaultBranch } from "@/lib/services/branchService";
+import { getAuthorizedBranchIdsForUser, isShopAdmin } from "@/lib/rbac/permissions";
 import { useShopAuth } from "@/lib/context/ShopAuthContext";
 import { Shop } from "@/lib/types/shop";
+import { Branch, DEFAULT_BRANCH_ID } from "@/lib/types/branch";
 import { ShopUser } from "@/lib/types/user";
 import { getDocs } from "firebase/firestore";
 
@@ -52,7 +58,10 @@ export default function SpaceFoxShopAuthPage() {
   const [shopId, setShopId] = useState(initialShopId);
   const [verifiedShop, setVerifiedShop] = useState<Shop | null>(null);
 
-  // Step 2 inputs
+  // Step 2 inputs: Branch selection + Assigned User Credentials
+  const [shopBranches, setShopBranches] = useState<Branch[]>([]);
+  const [selectedBranchId, setSelectedBranchId] = useState<string>(DEFAULT_BRANCH_ID);
+  const [isLoadingBranches, setIsLoadingBranches] = useState<boolean>(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -127,6 +136,26 @@ export default function SpaceFoxShopAuthPage() {
     }
   }, []);
 
+  // Helper: check if a user is assigned/authorized for a given branchId
+  const isUserAssignedToBranch = (u: ShopUser, branchId: string): boolean => {
+    if (!branchId) return true;
+    if (isShopAdmin(u) || Boolean(u.allBranchesAccess)) return true;
+    const allowed = getAuthorizedBranchIdsForUser(u);
+    return allowed.includes(branchId);
+  };
+
+  // Users authorized for the currently selected branch
+  const branchAssignedUsers = useMemo(() => {
+    return existingStaff.filter(
+      (u) => u.status !== "suspended" && isUserAssignedToBranch(u, selectedBranchId)
+    );
+  }, [existingStaff, selectedBranchId]);
+
+  const selectedBranchObj = useMemo(
+    () => shopBranches.find((b) => b.branchId === selectedBranchId) || null,
+    [shopBranches, selectedBranchId]
+  );
+
   // Auto-verify if shopId is provided in URL query parameter
   useEffect(() => {
     async function checkInitialId() {
@@ -137,8 +166,8 @@ export default function SpaceFoxShopAuthPage() {
           if (shop) {
             setVerifiedShop(shop);
             setShopId(shop.shopId);
+            await loadShopBranchesAndStaff(shop);
             setStep(2);
-            fetchShopStaff(shop.shopId);
           } else {
             showFloatingToast("Shop not found");
           }
@@ -152,20 +181,46 @@ export default function SpaceFoxShopAuthPage() {
     checkInitialId();
   }, [initialShopId]);
 
-  // Fetch staff nested under shops/{shopId}/users
-  const fetchShopStaff = async (id: string) => {
+  // Load active branches and staff nested under shops/{shopId}
+  const loadShopBranchesAndStaff = async (shopObj: Shop) => {
+    setIsLoadingBranches(true);
     try {
-      const usersRef = getShopUsersRef(id);
-      const snap = await getDocs(usersRef);
-      const list: ShopUser[] = snap.docs.map((d) => d.data() as ShopUser);
-      setExistingStaff(list);
-      if (list.length > 0) {
-        setUsername(list[0].username || "admin");
-        setPassword(list[0].password || "shop123456");
+      const [fetchedBranches, usersSnap] = await Promise.all([
+        getBranches(shopObj.shopId),
+        getDocs(getShopUsersRef(shopObj.shopId)),
+      ]);
+
+      let activeBranches = fetchedBranches.filter((b) => b.status === "active");
+      if (activeBranches.length === 0) {
+        const defaultBranch = await ensureDefaultBranch(
+          shopObj.shopId,
+          shopObj.shopName,
+          shopObj.address,
+          shopObj.phone
+        );
+        activeBranches = [defaultBranch];
       }
+
+      setShopBranches(activeBranches);
+      const initialBranch =
+        activeBranches.find((b) => b.isDefault) || activeBranches[0];
+      const nextBranchId = initialBranch?.branchId || DEFAULT_BRANCH_ID;
+      setSelectedBranchId(nextBranchId);
+
+      const list: ShopUser[] = usersSnap.docs.map((d) => d.data() as ShopUser);
+      setExistingStaff(list);
+      setUsername("");
+      setPassword("");
     } catch (e) {
-      console.warn("Could not load nested staff:", e);
+      console.warn("Could not load branches or staff:", e);
+    } finally {
+      setIsLoadingBranches(false);
     }
+  };
+
+  // Handle changing the branch dropdown in Step 2
+  const handleSelectBranch = (nextBranchId: string) => {
+    setSelectedBranchId(nextBranchId);
   };
 
   // STEP 1: Handle Shop ID verification
@@ -189,7 +244,7 @@ export default function SpaceFoxShopAuthPage() {
       }
 
       setVerifiedShop(shop);
-      fetchShopStaff(shop.shopId);
+      await loadShopBranchesAndStaff(shop);
 
       // Smooth GSAP transition to Step 2
       if (stepContainerRef.current) {
@@ -245,6 +300,11 @@ export default function SpaceFoxShopAuthPage() {
     e.preventDefault();
     if (!verifiedShop) return;
 
+    if (!selectedBranchId) {
+      showFloatingToast("Please select a branch");
+      return;
+    }
+
     if (!username.trim() || !password) {
       showFloatingToast("Enter username & password");
       return;
@@ -253,13 +313,16 @@ export default function SpaceFoxShopAuthPage() {
     setIsLoggingIn(true);
 
     try {
+      const targetBranchName = selectedBranchObj?.name || "Main Branch";
       const { user, session } = await authenticateShopUser(
         verifiedShop.shopId,
         username.trim(),
-        password
+        password,
+        selectedBranchId,
+        targetBranchName
       );
 
-      login(session, verifiedShop, user);
+      login(session, verifiedShop, user, selectedBranchId, targetBranchName);
 
       // Smooth cinematic exit transition: subtle fade + slight scale
       setIsExiting(true);
@@ -288,12 +351,18 @@ export default function SpaceFoxShopAuthPage() {
     if (!verifiedShop) return;
     setIsSeedingStaff(true);
     try {
+      const targetBranchName = selectedBranchObj?.name || "Main Branch";
       const demo = await createShopUserNested({
         shopId: verifiedShop.shopId,
         username: "admin",
         password: "shop123456",
         displayName: `${verifiedShop.shopName} Admin`,
         role: "admin",
+        branchId: selectedBranchId || DEFAULT_BRANCH_ID,
+        branchName: targetBranchName,
+        primaryBranchId: selectedBranchId || DEFAULT_BRANCH_ID,
+        assignedBranchIds: [selectedBranchId || DEFAULT_BRANCH_ID],
+        allBranchesAccess: true,
       });
       setExistingStaff([demo]);
       setUsername("admin");
@@ -415,7 +484,7 @@ export default function SpaceFoxShopAuthPage() {
             )}
 
             {/* ═══════════════════════════════════════════
-                STEP 2: USERNAME & PASSWORD (SAME STYLE)
+                STEP 2: SELECT BRANCH + ASSIGNED USER LOGIN
             ═══════════════════════════════════════════ */}
             {step === 2 && verifiedShop && (
               <form onSubmit={handleLogin} className="space-y-4">
@@ -434,11 +503,47 @@ export default function SpaceFoxShopAuthPage() {
                   <button
                     type="button"
                     onClick={handleBackToStep1}
-                    className="text-[10px] text-zinc-400 hover:text-zinc-200 font-mono flex items-center gap-1 transition-colors"
+                    className="text-[10px] text-zinc-400 hover:text-zinc-200 font-mono flex items-center gap-1 transition-colors cursor-pointer"
                   >
                     <RotateCcw className="w-2.5 h-2.5" />
                     <span>Change</span>
                   </button>
+                </div>
+
+                {/* Branch Selector Dropdown Menu */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400 tracking-wider">
+                    <span className="flex items-center gap-1.5">
+                      <Building2 className="w-3.5 h-3.5 text-orange-400" />
+                      <span>Select Branch</span>
+                    </span>
+                    <span className="text-[10px] text-zinc-500">
+                      {isLoadingBranches
+                        ? "Loading…"
+                        : `${shopBranches.length} ${shopBranches.length === 1 ? "branch" : "branches"}`}
+                    </span>
+                  </div>
+
+                  <div className="relative">
+                    <select
+                      value={selectedBranchId}
+                      onChange={(e) => handleSelectBranch(e.target.value)}
+                      disabled={isLoggingIn || isExiting || isLoadingBranches}
+                      className="w-full h-12 pl-4 pr-10 rounded-xl bg-white/[0.04] hover:bg-white/[0.06] focus:bg-white/[0.08] border border-white/[0.1] focus:border-orange-500/60 text-white font-mono text-xs tracking-wider appearance-none backdrop-blur-xl shadow-inner focus:outline-none focus:ring-1 focus:ring-orange-500/40 transition-all duration-200 cursor-pointer"
+                    >
+                      {shopBranches.map((branch) => (
+                        <option
+                          key={branch.branchId}
+                          value={branch.branchId}
+                          className="bg-[#0e0d14] text-white"
+                        >
+                          {branch.name} ({branch.code})
+                          {branch.isDefault ? " · Default" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown className="w-4 h-4 text-zinc-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  </div>
                 </div>
 
                 {/* Username Input */}
@@ -545,7 +650,7 @@ export default function SpaceFoxShopAuthPage() {
             }`}
           >
             <span className={step >= 2 ? "text-orange-400 font-bold" : "text-zinc-400"}>02</span>
-            <span>Credentials</span>
+            <span>Branch & User</span>
           </div>
 
           <div

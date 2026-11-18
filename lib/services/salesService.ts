@@ -173,7 +173,7 @@ export async function createSaleRecord(
       value: Number(input.discountSetting?.value) || 0,
     },
     discountAmount: Number(input.discountAmount) || 0,
-    taxRate: Number(input.taxRate) || 0.08,
+    taxRate: input.taxRate !== undefined && input.taxRate !== null && !Number.isNaN(Number(input.taxRate)) ? Number(input.taxRate) : 0,
     taxAmount: Number(input.taxAmount) || 0,
     grandTotal,
     total: grandTotal,
@@ -204,107 +204,181 @@ export async function createSaleRecord(
       : {}),
   };
 
-  // 3. Write to primary `/sales/{saleId}` collection
+  // 3 & 4. Write to primary `/sales/{saleId}` and nested `/shops/{shopId}/sales/{saleId}` in parallel
   const rootSaleRef = doc(db, SALES_COLLECTION, saleId);
-  await setDoc(rootSaleRef, saleData);
+  const nestedSaleRef = doc(
+    db,
+    SHOPS_COLLECTION,
+    normShopId,
+    SALES_COLLECTION,
+    saleId
+  );
 
-  // 4. Mirror to nested `/shops/{shopId}/sales/{saleId}` for dual indexing & isolation
-  try {
-    const nestedSaleRef = doc(
-      db,
-      SHOPS_COLLECTION,
-      normShopId,
-      SALES_COLLECTION,
-      saleId
-    );
-    await setDoc(nestedSaleRef, saleData);
-  } catch (err) {
-    console.warn("[SalesService] Nested sale mirror notice:", err);
-  }
+  const primaryWritePromise = Promise.all([
+    setDoc(rootSaleRef, saleData),
+    setDoc(nestedSaleRef, saleData).catch((err) => {
+      console.warn("[SalesService] Nested sale mirror notice:", err);
+    }),
+  ]);
 
-  // 5. Asynchronously deplete inventory for each catalog product
-  for (const item of sanitizedItems) {
-    if (item.productId && !item.productId.startsWith("prod_adhoc_")) {
-      try {
-        const productRef = doc(
-          db,
-          SHOPS_COLLECTION,
-          normShopId,
-          "products",
-          item.productId
-        );
-        await updateDoc(productRef, {
-          stockQuantity: increment(-item.quantity),
-          updatedAt: now,
-        });
-
-        // Mirror stock decrement to root products collection
-        try {
-          await updateDoc(doc(db, "products", item.productId), {
-            stockQuantity: increment(-item.quantity),
-            updatedAt: now,
-          });
-        } catch (_) {}
-
-        // Mirror to stock_transactions for 360-degree audit trail in Stock Management
-        try {
-          const txId = `stk_${now}_${Math.random().toString(36).substring(2, 7)}`;
-          const txDocRef = doc(db, SHOPS_COLLECTION, normShopId, "stock_transactions", txId);
-          await setDoc(txDocRef, {
-            id: txId,
-            shopId: normShopId,
-            productId: item.productId,
-            productName: item.name,
-            sku: item.sku || "",
-            barcode: item.barcode || "",
-            type: "SALE",
-            quantityDelta: -item.quantity,
-            previousStock: 0,
-            newStock: 0,
-            reason: `POS Sale: ${invoiceNumber}`,
-            referenceNumber: invoiceNumber,
-            unitCost: item.costPrice || 0,
-            unitSellingPrice: item.unitPrice || 0,
-            totalValueChange: -item.quantity * (item.costPrice || 0),
-            notes: `Tender: ${saleData.paymentMethod.toUpperCase()} | Customer: ${saleData.customer?.name || "Walk-in Guest"}`,
-            performedBy: {
-              userId: input.cashier?.userId || "cashier",
-              username: input.cashier?.username || "Cashier",
-              role: input.cashier?.role || "cashier",
-              displayName: input.cashier?.displayName || input.cashier?.username || "Cashier",
-            },
-            createdAt: now,
-          });
-        } catch (auditErr) {
-          console.warn("[SalesService] Non-blocking stock transaction log notice:", auditErr);
-        }
-      } catch (stockErr) {
-        // Log but don't fail the completed invoice if product was unlinked
-        console.warn(`[SalesService] Notice: Could not decrement stock for ${item.productId}:`, stockErr);
-      }
-    }
-  }
-
-  // 6. Non-blocking loyalty points award for registered customers
-  if (input.customer?.customerId) {
+  // 5 & 6. Non-blocking parallel inventory depletion, stock transaction audit trail, and loyalty points
+  void (async () => {
     try {
-      const { awardLoyaltyPoints } = await import("./customerService");
-      await awardLoyaltyPoints(
-        normShopId,
-        input.customer.customerId,
-        grandTotal,
-        saleId,
-        {
-          userId: input.cashier?.userId || "cashier",
-          username: input.cashier?.username || "Cashier",
-          role: input.cashier?.role || "cashier",
-          displayName: input.cashier?.displayName || input.cashier?.username || "Cashier",
-        }
-      );
-    } catch (loyaltyErr) {
-      console.warn("[SalesService] Non-blocking loyalty points notice:", loyaltyErr);
+      await Promise.all([
+        ...sanitizedItems.map(async (item) => {
+          const isServiceOrAdhocItem =
+            !item.productId ||
+            item.productId.startsWith("prod_adhoc_") ||
+            item.productId.startsWith("repair_") ||
+            item.productId.startsWith("rep_") ||
+            item.productId.startsWith("svc_") ||
+            item.productId.startsWith("charge_") ||
+            item.productId.startsWith("init_item_");
+
+          if (isServiceOrAdhocItem) return;
+
+          try {
+            const productRef = doc(
+              db,
+              SHOPS_COLLECTION,
+              normShopId,
+              "products",
+              item.productId
+            );
+            const productSnap = await getDoc(productRef);
+            const prevStock = productSnap.exists()
+              ? Number(productSnap.data()?.stockQuantity) || 0
+              : 0;
+            const nextStock = prevStock - item.quantity;
+            const prodBranchId =
+              (productSnap.exists()
+                ? (productSnap.data()?.branchId as string)
+                : undefined) ||
+              saleData.branchId ||
+              "main";
+
+            const branchProdRef = doc(
+              db,
+              SHOPS_COLLECTION,
+              normShopId,
+              "branches",
+              prodBranchId,
+              "products",
+              item.productId
+            );
+
+            const txId = `stk_${now}_${Math.random().toString(36).substring(2, 7)}`;
+            const txDocRef = doc(
+              db,
+              SHOPS_COLLECTION,
+              normShopId,
+              "stock_transactions",
+              txId
+            );
+
+            await Promise.all([
+              productSnap.exists()
+                ? updateDoc(productRef, {
+                    stockQuantity: increment(-item.quantity),
+                    updatedAt: now,
+                  }).catch(() => {})
+                : Promise.resolve(),
+              updateDoc(branchProdRef, {
+                stockQuantity: increment(-item.quantity),
+                updatedAt: now,
+              }).catch(() => {}),
+              setDoc(txDocRef, {
+                id: txId,
+                shopId: normShopId,
+                branchId: saleData.branchId,
+                productId: item.productId,
+                productName: item.name,
+                sku: item.sku || "",
+                barcode: item.barcode || "",
+                type: "SALE",
+                quantityDelta: -item.quantity,
+                previousStock: prevStock,
+                newStock: nextStock,
+                reason: `POS Sale: ${invoiceNumber}`,
+                referenceNumber: invoiceNumber,
+                unitCost: item.costPrice || 0,
+                unitSellingPrice: item.unitPrice || 0,
+                totalValueChange: -item.quantity * (item.costPrice || 0),
+                notes: `Tender: ${saleData.paymentMethod.toUpperCase()} | Customer: ${
+                  saleData.customer?.name || "Walk-in Guest"
+                }`,
+                performedBy: {
+                  userId: input.cashier?.userId || "cashier",
+                  username: input.cashier?.username || "Cashier",
+                  role: input.cashier?.role || "cashier",
+                  displayName:
+                    input.cashier?.displayName ||
+                    input.cashier?.username ||
+                    "Cashier",
+                },
+                createdAt: now,
+              }).catch(() => {}),
+              import("./branchService")
+                .then(({ adjustBranchStock }) =>
+                  adjustBranchStock(
+                    normShopId,
+                    saleData.branchId || "main",
+                    item.productId,
+                    -item.quantity,
+                    input.cashier?.userId || "cashier",
+                    {
+                      variantId: item.variantId,
+                      productName: item.name,
+                      sku: item.sku,
+                    }
+                  )
+                )
+                .catch(() => {}),
+            ]);
+          } catch (stockErr) {
+            console.warn(
+              `[SalesService] Notice: Could not decrement stock for ${item.productId}:`,
+              stockErr
+            );
+          }
+        }),
+        input.customer?.customerId
+          ? import("./customerService")
+              .then(({ awardLoyaltyPoints }) =>
+                awardLoyaltyPoints(
+                  normShopId,
+                  input.customer!.customerId!,
+                  grandTotal,
+                  saleId,
+                  {
+                    userId: input.cashier?.userId || "cashier",
+                    username: input.cashier?.username || "Cashier",
+                    role: input.cashier?.role || "cashier",
+                    displayName:
+                      input.cashier?.displayName ||
+                      input.cashier?.username ||
+                      "Cashier",
+                  }
+                )
+              )
+              .catch((loyaltyErr) => {
+                console.warn(
+                  "[SalesService] Non-blocking loyalty points notice:",
+                  loyaltyErr
+                );
+              })
+          : Promise.resolve(),
+      ]);
+    } catch (bgErr) {
+      console.warn("[SalesService] Background post-sale sync notice:", bgErr);
     }
-  }
+  })();
+
+  // Return immediately once primary sale write completes or within 150ms so POS receipt opens instantly
+  await Promise.race([
+    primaryWritePromise,
+    new Promise((resolve) => setTimeout(resolve, 150)),
+  ]);
 
   return saleData;
 }
@@ -330,6 +404,9 @@ export async function getSalesByShop(
     let sales: SaleRecord[] = snapshot.docs.map((d) => d.data() as SaleRecord);
 
     // Filter in-memory for resilience (prevents composite index errors in Firestore)
+    if (options?.branchId && options.branchId !== "ALL") {
+      sales = sales.filter((s) => (s.branchId || "main") === options.branchId);
+    }
     if (options?.startDate) {
       sales = sales.filter((s) => s.createdAt >= options.startDate!);
     }
@@ -376,7 +453,8 @@ export async function getSalesByShop(
 export function subscribeToSalesByShop(
   activeSessionShopId: string,
   onUpdate: (sales: SaleRecord[]) => void,
-  onError?: (err: Error) => void
+  onError?: (err: Error) => void,
+  branchId?: string
 ): Unsubscribe {
   const normShopId = assertValidShopSession(activeSessionShopId);
 
@@ -388,9 +466,12 @@ export function subscribeToSalesByShop(
   return onSnapshot(
     q,
     (snapshot) => {
-      const sales: SaleRecord[] = snapshot.docs.map(
+      let sales: SaleRecord[] = snapshot.docs.map(
         (d) => d.data() as SaleRecord
       );
+      if (branchId && branchId !== "ALL") {
+        sales = sales.filter((s) => (s.branchId || "main") === branchId);
+      }
       sales.sort((a, b) => b.createdAt - a.createdAt);
       onUpdate(sales);
     },
@@ -681,6 +762,7 @@ export async function processSaleReturn(
           await setDoc(txDocRef, {
             id: txId,
             shopId: normShopId,
+            branchId: originalSale.branchId || "main",
             productId: item.productId,
             productName: item.name,
             sku: item.sku || "",
@@ -1154,6 +1236,7 @@ export async function voidSaleRecord(
           await setDoc(txDocRef, {
             id: txId,
             shopId: normShopId,
+            branchId: sale.branchId || "main",
             productId: item.productId,
             productName: item.name,
             sku: item.sku || "",

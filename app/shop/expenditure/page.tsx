@@ -156,6 +156,9 @@ export default function ShopExpenditurePage() {
   // Form States for New Expense
   const [formExpenseType, setFormExpenseType] = useState<ExpenseType>("OPERATING_EXPENSE");
   const [formCategory, setFormCategory] = useState<string>("");
+  const [isOtherCategorySelected, setIsOtherCategorySelected] = useState<boolean>(false);
+  const [customExpenseName, setCustomExpenseName] = useState<string>("");
+  const [storeCustomCategory, setStoreCustomCategory] = useState<boolean>(true);
   const [formAmount, setFormAmount] = useState<string>("");
   const [formDate, setFormDate] = useState<string>(() => new Date().toISOString().split("T")[0]);
   const [formPaymentMethod, setFormPaymentMethod] = useState<ExpensePaymentMethod>("cash");
@@ -399,9 +402,12 @@ export default function ShopExpenditurePage() {
     return computeExpenseAnalytics(filteredExpenses);
   }, [filteredExpenses]);
 
-  // Dedicated Employee Payroll Dataset & Metrics
+  // Dedicated Employee Payroll Dataset & Metrics (synchronized with activeDateBounds)
   const payrollExpenses = useMemo(() => {
     return expenses.filter((e) => {
+      if (activeDateBounds.start && e.date < activeDateBounds.start) return false;
+      if (activeDateBounds.end && e.date > activeDateBounds.end) return false;
+
       const isSalary =
         e.expenseType === "EMPLOYEE_SALARY" ||
         e.categoryCode === "SALARY" ||
@@ -423,7 +429,7 @@ export default function ShopExpenditurePage() {
 
       return true;
     });
-  }, [expenses, payrollSearch]);
+  }, [expenses, activeDateBounds, payrollSearch]);
 
   const payrollMetrics = useMemo(() => {
     let totalNet = 0;
@@ -546,8 +552,49 @@ export default function ShopExpenditurePage() {
         salaryDetails = cleanSalaryDetails;
       }
 
+      let resolvedCategoryId = formCategory;
+      let resolvedCategoryName: string | undefined = undefined;
+
+      if (isOtherCategorySelected || formCategory === "__OTHER__") {
+        const cleanOtherName = customExpenseName.trim();
+        if (!cleanOtherName) {
+          setActionErrorMsg("Please enter the name of the expense for Other category.");
+          setIsActionLoading(false);
+          return;
+        }
+        resolvedCategoryName = cleanOtherName;
+        const existingMatch = categories.find(
+          (c) => c.name.trim().toLowerCase() === cleanOtherName.toLowerCase()
+        );
+        if (existingMatch) {
+          resolvedCategoryId = existingMatch.id;
+          resolvedCategoryName = existingMatch.name;
+        } else if (storeCustomCategory) {
+          const createdCat = await createExpenseCategory(
+            currentShopId,
+            {
+              name: cleanOtherName,
+              code: cleanOtherName
+                .replace(/[^a-zA-Z0-9]/g, "")
+                .toUpperCase()
+                .slice(0, 8) || "OTHER",
+              type: formExpenseType,
+              defaultGlAccount: formExpenseType === "EMPLOYEE_SALARY" ? "6020" : "6090",
+              isTaxDeductible: formTaxDeductible,
+              isActive: true,
+            },
+            auditUser
+          );
+          resolvedCategoryId = createdCat.id;
+          resolvedCategoryName = createdCat.name;
+        } else {
+          resolvedCategoryId = "CAT-OTHER";
+        }
+      }
+
       const input: CreateExpenseInput = {
-        categoryId: formCategory,
+        categoryId: resolvedCategoryId,
+        categoryName: resolvedCategoryName,
         expenseType: formExpenseType,
         amount: numAmt,
         date: formDate,
@@ -555,6 +602,8 @@ export default function ShopExpenditurePage() {
         vendor: payee,
         description: isSalary
           ? `Staff Salary: ${payee} (${salaryPayPeriod}) ${formDescription ? "— " + formDescription : ""}`.trim()
+          : isOtherCategorySelected && customExpenseName.trim()
+          ? `${customExpenseName.trim()}${formDescription.trim() ? " — " + formDescription.trim() : ""}`
           : formDescription.trim(),
         referenceNumber: formReference.trim(),
         initialAmountPaid: initialPaid,
@@ -566,6 +615,8 @@ export default function ShopExpenditurePage() {
       const created = await createExpenseRecord(currentShopId, input, auditUser);
       setActionSuccessMsg(`Voucher ${created.id} recorded successfully!`);
       setIsRecordModalOpen(false);
+      setIsOtherCategorySelected(false);
+      setCustomExpenseName("");
 
       // Reset form
       setFormAmount("");
@@ -902,33 +953,35 @@ export default function ShopExpenditurePage() {
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 md:px-6 py-4 space-y-4">
         {/* Metric Cards Row (Gray & Mix Palette) */}
         <section className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {/* Card 1: Total Period Expenses */}
+          {/* Card 1: Total Period Expenses (Includes Operating + Employee Salaries + Assets) */}
           <div className="p-3.5 rounded-xl bg-zinc-900/50 backdrop-blur-md border border-zinc-800/80 relative overflow-hidden group shadow-sm">
             <div className="flex items-center justify-between text-zinc-400 text-xs mb-1.5">
-              <span>Total Expenses</span>
+              <span>Total Expenses (Incl. Salaries)</span>
               <DollarSign className="w-3.5 h-3.5 text-zinc-300" />
             </div>
             <div className="text-lg md:text-xl font-bold font-mono text-white tracking-tight">
               {formatLKR(analytics.totalExpenses)}
             </div>
-            <div className="text-[10px] text-zinc-400 mt-1 flex items-center gap-1 font-mono">
+            <div className="text-[10px] text-zinc-400 mt-1 flex items-center gap-1 font-mono flex-wrap">
               <span>{filteredExpenses.length} vouchers</span>
               <span>•</span>
-              <span className="text-zinc-300">{activeDateBounds.label}</span>
+              <span className="text-blue-300">
+                Salaries: {formatLKR(payrollMetrics.totalNet)}
+              </span>
             </div>
           </div>
 
-          {/* Card 2: Operating Expenses (OpEx & Salary) */}
+          {/* Card 2: Operating Expenses (OpEx + Employee Salaries) */}
           <div className="p-3.5 rounded-xl bg-zinc-900/50 backdrop-blur-md border border-zinc-800/80 relative overflow-hidden group shadow-sm">
             <div className="flex items-center justify-between text-zinc-400 text-xs mb-1.5">
-              <span>Operating (OpEx)</span>
+              <span>Operating &amp; Payroll (OpEx)</span>
               <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
             </div>
             <div className="text-lg md:text-xl font-bold font-mono text-emerald-300 tracking-tight">
               {formatLKR(analytics.totalOperatingExpenses)}
             </div>
             <div className="text-[10px] text-zinc-400 mt-1">
-              Hits P&L Income Statement
+              Includes Staff Salaries &amp; Overheads (Hits P&amp;L)
             </div>
           </div>
 
@@ -2362,12 +2415,46 @@ export default function ShopExpenditurePage() {
                 </div>
 
                 <div className="space-y-1">
-                  <label className="text-[11px] text-zinc-300 font-semibold">Expense Category *</label>
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] text-zinc-300 font-semibold">Expense Category *</label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsOtherCategorySelected((prev) => {
+                          const next = !prev;
+                          if (next) {
+                            setFormCategory("__OTHER__");
+                          } else if (categories.length > 0) {
+                            setFormCategory(categories[0].id);
+                          }
+                          return next;
+                        });
+                      }}
+                      className={`px-2 py-0.5 rounded-md text-[10px] font-bold border flex items-center gap-1 transition-all cursor-pointer ${
+                        isOtherCategorySelected
+                          ? "bg-emerald-500/20 border-emerald-500/50 text-emerald-300"
+                          : "bg-zinc-800 hover:bg-zinc-700 border-zinc-700 text-zinc-200"
+                      }`}
+                    >
+                      <Plus className="w-3 h-3" />
+                      <span>{isOtherCategorySelected ? "Using Other Expense" : "+ Other Expense"}</span>
+                    </button>
+                  </div>
                   <select
-                    value={formCategory}
+                    value={isOtherCategorySelected ? "__OTHER__" : formCategory}
                     onChange={(e) => {
-                      setFormCategory(e.target.value);
-                      const cat = categories.find((c) => c.id === e.target.value);
+                      const val = e.target.value;
+                      if (val === "__OTHER__") {
+                        setIsOtherCategorySelected(true);
+                        setFormCategory("__OTHER__");
+                        return;
+                      }
+                      setIsOtherCategorySelected(false);
+                      setFormCategory(val);
+                      const cat = categories.find((c) => c.id === val);
+                      if (cat?.code === "OTHER") {
+                        setIsOtherCategorySelected(true);
+                      }
                       if (cat?.type === "EMPLOYEE_SALARY" || cat?.code === "SALARY") {
                         setFormExpenseType("EMPLOYEE_SALARY");
                       }
@@ -2380,9 +2467,41 @@ export default function ShopExpenditurePage() {
                         {c.name} ({c.code})
                       </option>
                     ))}
+                    <option value="__OTHER__" className="bg-zinc-900 font-bold text-emerald-300">
+                      + Other (Add Custom Expense Name &amp; Store)
+                    </option>
                   </select>
                 </div>
               </div>
+
+              {/* CUSTOM EXPENSE NAME BOX WHEN "OTHER" IS SELECTED */}
+              {isOtherCategorySelected && (
+                <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2.5 animate-in fade-in duration-150">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Other Expense Name (Stored in Firestore) *</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 text-[11px] text-zinc-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={storeCustomCategory}
+                        onChange={(e) => setStoreCustomCategory(e.target.checked)}
+                        className="accent-emerald-500"
+                      />
+                      <span>Save to Expense Categories</span>
+                    </label>
+                  </div>
+                  <input
+                    type="text"
+                    value={customExpenseName}
+                    onChange={(e) => setCustomExpenseName(e.target.value)}
+                    placeholder="Enter name of the expense (e.g. Tea & Refreshments, Generator Fuel, Security)..."
+                    className="w-full bg-zinc-950/80 border border-emerald-500/40 rounded-lg px-3 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-emerald-400"
+                    required
+                  />
+                </div>
+              )}
 
               {/* SPECIALIZED SECTION: EMPLOYEE SALARY & OVERTIME MANAGEMENT */}
               {formExpenseType === "EMPLOYEE_SALARY" && (

@@ -18,6 +18,7 @@ import {
   X,
   Layers,
   ChevronRight,
+  Wrench,
 } from "lucide-react";
 import { AccountingReportType } from "@/lib/types/accountingReport";
 
@@ -82,6 +83,15 @@ export const STATEMENTS_CONFIG: StatementConfig[] = [
     description: "Invoiced sales, tender methods & totals",
     icon: ReceiptText,
     accentColor: "emerald",
+  },
+  {
+    id: "repair_statement",
+    title: "Repair Statement",
+    category: "Operations",
+    description: "Workshop revenue, part costs & net profit",
+    icon: Wrench,
+    accentColor: "teal",
+    badge: "Workshop",
   },
   {
     id: "inventory_valuation",
@@ -202,12 +212,12 @@ export default function AccountingStatementsSidebar({
             </div>
             <div>
               <h2 className="text-xs font-bold text-white tracking-tight leading-none">Statements</h2>
-              <p className="text-[9px] text-zinc-500 mt-0.5">12 Reports</p>
+              <p className="text-[9px] text-zinc-500 mt-0.5">{STATEMENTS_CONFIG.length} Reports</p>
             </div>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/[0.06] text-zinc-400 border border-white/[0.08]">
-              {filteredStatements.length} / 12
+              {filteredStatements.length} / {STATEMENTS_CONFIG.length}
             </span>
             {onClose && (
               <button

@@ -30,6 +30,10 @@ import {
   Tag,
   Store,
   Sparkles,
+  Pencil,
+  FolderInput,
+  GripVertical,
+  AlertTriangle,
 } from "lucide-react";
 import { useShopAuth } from "@/lib/context/ShopAuthContext";
 import {
@@ -53,7 +57,12 @@ import {
   deleteSubcategory,
   getProducts,
   createProduct,
+  updateProduct,
+  moveProductToSubcategory,
   deleteProduct,
+  ensureCommonCategory,
+  getCachedCatalogSnapshot,
+  saveCachedCatalogSnapshot,
   uploadProductImage,
   getBrands,
   createBrand,
@@ -85,6 +94,27 @@ const PRESET_COLORS = [
   "#ef4444",
 ];
 
+function getProductTotalStock(prod: ProductItem): number {
+  if (Array.isArray(prod.variants) && prod.variants.length > 0) {
+    const variantsSum = prod.variants.reduce(
+      (sum, v) => sum + (Number(v.stockQuantity) || 0),
+      0
+    );
+    if (variantsSum > 0 || prod.hasVariants) {
+      return variantsSum > 0 ? variantsSum : Number(prod.stockQuantity) || 0;
+    }
+  }
+  return Number(prod.stockQuantity) || 0;
+}
+
+function formatLKR(val: number): string {
+  const num = Number(val) || 0;
+  return `LKR ${num.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
 export default function ProductsCatalogPage() {
   const router = useRouter();
   const shopAuth = useShopAuth();
@@ -112,6 +142,13 @@ export default function ProductsCatalogPage() {
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
+
+  const activeBranchId = shopAuth?.activeBranchId || shopAuth?.user?.primaryBranchId || "main";
+  const activeBranchName =
+    activeBranchId === "ALL"
+      ? "Main Branch"
+      : shopAuth?.activeBranchName || "Main Branch";
+  const effectiveBranchId = activeBranchId === "ALL" ? "main" : activeBranchId;
 
   const auditUser: AuditUser = useMemo(
     () => ({
@@ -143,15 +180,21 @@ export default function ProductsCatalogPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchFilterTab, setSearchFilterTab] = useState<"all" | "categories" | "subcategories" | "products">("all");
   const [viewMode, setViewMode] = useState<"table" | "grid">("table");
+  const [showAllProducts, setShowAllProducts] = useState<boolean>(false);
 
   // Modals & Panels
   const [isAddCategoryOpen, setIsAddCategoryOpen] = useState(false);
   const [isAddSubcategoryOpen, setIsAddSubcategoryOpen] = useState(false);
   const [isAddProductOpen, setIsAddProductOpen] = useState(false);
+  const [isQuickProductOpen, setIsQuickProductOpen] = useState(false);
+  const [editingProduct, setEditingProduct] = useState<ProductItem | null>(null);
+  const [movingProduct, setMovingProduct] = useState<ProductItem | null>(null);
+  const [draggingProduct, setDraggingProduct] = useState<ProductItem | null>(null);
+  const [dragOverTargetId, setDragOverTargetId] = useState<string | null>(null);
   const [activeDetailProduct, setActiveDetailProduct] = useState<ProductItem | null>(null);
 
   // -------------------------------------------------------------
-  // DATA LOADING (Reloadable via Refresh Icon)
+  // DATA LOADING (Instant SWR Cache Hydration + Background Refresh)
   // -------------------------------------------------------------
   const loadData = async (silent = false) => {
     if (!silent) setIsLoading(true);
@@ -159,9 +202,9 @@ export default function ProductsCatalogPage() {
 
     try {
       const [cats, subs, prods, brds, sups] = await Promise.all([
-        getCategories(shop.shopId),
-        getSubcategories(shop.shopId),
-        getProducts(shop.shopId),
+        getCategories(shop.shopId, activeBranchId),
+        getSubcategories(shop.shopId, undefined, activeBranchId),
+        getProducts(shop.shopId, undefined, undefined, activeBranchId),
         getBrands(shop.shopId),
         getSuppliers(shop.shopId),
       ]);
@@ -170,14 +213,35 @@ export default function ProductsCatalogPage() {
       setProducts(prods);
       setBrands(brds);
       setSuppliers(sups);
+      saveCachedCatalogSnapshot(
+        shop.shopId,
+        {
+          categories: cats,
+          subcategories: subs,
+          products: prods,
+          brands: brds,
+          suppliers: sups,
+        },
+        activeBranchId
+      );
 
       if (selectedCategory) {
         const freshCat = cats.find((c) => c.id === selectedCategory.id);
         if (freshCat) setSelectedCategory(freshCat);
+        else {
+          setSelectedCategory(null);
+          setSelectedSubcategory(null);
+        }
       }
       if (selectedSubcategory) {
         const freshSub = subs.find((s) => s.id === selectedSubcategory.id);
         if (freshSub) setSelectedSubcategory(freshSub);
+        else setSelectedSubcategory(null);
+      }
+      if (activeDetailProduct) {
+        const freshProd = prods.find((p) => p.id === activeDetailProduct.id);
+        if (freshProd) setActiveDetailProduct(freshProd);
+        else setActiveDetailProduct(null);
       }
     } catch (err) {
       console.error("[ProductsCatalog] Error loading catalog:", err);
@@ -188,10 +252,87 @@ export default function ProductsCatalogPage() {
   };
 
   useEffect(() => {
-    if (shop?.shopId) {
-      loadData();
+    if (!shop?.shopId) return;
+    setSelectedCategory(null);
+    setSelectedSubcategory(null);
+    setActiveDetailProduct(null);
+    // Immediately hydrate from SWR cache if present so listing is 0ms instant!
+    const cached = getCachedCatalogSnapshot(shop.shopId, activeBranchId);
+    if (cached) {
+      setCategories(cached.categories);
+      setSubcategories(cached.subcategories);
+      setProducts(cached.products);
+      setBrands(cached.brands);
+      setSuppliers(cached.suppliers);
+      setIsLoading(false);
+      loadData(true);
+    } else {
+      loadData(false);
     }
-  }, [shop?.shopId]);
+  }, [shop?.shopId, activeBranchId]);
+
+  // Move single product to any subcategory (or direct in Main Category) via Drag & Drop or Modal
+  const handleMoveProduct = async (
+    prod: ProductItem,
+    targetCategoryId: string,
+    targetCategoryName: string,
+    targetSubcategoryId: string,
+    targetSubcategoryName: string
+  ) => {
+    if (
+      prod.categoryId === targetCategoryId &&
+      (prod.subcategoryId || "") === (targetSubcategoryId || "")
+    ) {
+      return;
+    }
+
+    // Optimistic UI update so drag & drop feels instantaneous
+    setProducts((prev) =>
+      prev.map((p) =>
+        p.id === prod.id
+          ? {
+              ...p,
+              categoryId: targetCategoryId,
+              categoryName: targetCategoryName,
+              subcategoryId: targetSubcategoryId,
+              subcategoryName: targetSubcategoryName,
+              updatedAt: Date.now(),
+            }
+          : p
+      )
+    );
+
+    if (activeDetailProduct?.id === prod.id) {
+      setActiveDetailProduct((prev) =>
+        prev
+          ? {
+              ...prev,
+              categoryId: targetCategoryId,
+              categoryName: targetCategoryName,
+              subcategoryId: targetSubcategoryId,
+              subcategoryName: targetSubcategoryName,
+            }
+          : null
+      );
+    }
+
+    try {
+      await moveProductToSubcategory(shop.shopId, prod.id, auditUser, {
+        categoryId: targetCategoryId,
+        categoryName: targetCategoryName,
+        subcategoryId: targetSubcategoryId,
+        subcategoryName: targetSubcategoryName,
+        previousCategoryId: prod.categoryId,
+        previousSubcategoryId: prod.subcategoryId,
+        branchId: prod.branchId || effectiveBranchId,
+      });
+      await loadData(true);
+    } catch (err) {
+      console.error("Failed to move product:", err);
+      alert("Failed to move product to selected subcategory.");
+      await loadData(true);
+    }
+  };
 
   // Clean Query for Unified Search
   const cleanQuery = searchQuery.trim().toLowerCase();
@@ -256,6 +397,19 @@ export default function ProductsCatalogPage() {
     return products;
   }, [products, selectedCategory, selectedSubcategory]);
 
+  // Direct products under a category (e.g. "Common" category or products with no subcategory)
+  const directCategoryProducts = useMemo(() => {
+    if (!selectedCategory) return [];
+    const isCommon =
+      selectedCategory.id === "cat_common" ||
+      selectedCategory.name.trim().toLowerCase() === "common";
+    return products.filter(
+      (p) =>
+        p.categoryId === selectedCategory.id &&
+        (isCommon || !p.subcategoryId || p.subcategoryId.trim() === "")
+    );
+  }, [products, selectedCategory]);
+
   // -------------------------------------------------------------
   // DELETE HANDLERS
   // -------------------------------------------------------------
@@ -292,7 +446,13 @@ export default function ProductsCatalogPage() {
     e.stopPropagation();
     if (!confirm(`Delete product "${prod.name}"?`)) return;
     try {
-      await deleteProduct(shop.shopId, prod.id, prod.categoryId, prod.subcategoryId);
+      await deleteProduct(
+        shop.shopId,
+        prod.id,
+        prod.categoryId,
+        prod.subcategoryId,
+        prod.branchId || effectiveBranchId
+      );
       if (activeDetailProduct?.id === prod.id) {
         setActiveDetailProduct(null);
       }
@@ -322,17 +482,18 @@ export default function ProductsCatalogPage() {
 
             <div className="h-4 w-px bg-white/10 shrink-0" />
 
-            {/* Compact Breadcrumbs */}
+            {/* Compact Breadcrumbs + All Products Toggle */}
             <nav className="flex items-center gap-1 text-xs shrink-0">
               <button
                 type="button"
                 onClick={() => {
+                  setShowAllProducts(false);
                   setSelectedCategory(null);
                   setSelectedSubcategory(null);
                   setSearchQuery("");
                 }}
                 className={`flex items-center gap-1.5 px-2 py-1 rounded-md transition-colors cursor-pointer ${
-                  !selectedCategory && !cleanQuery
+                  !showAllProducts && !selectedCategory && !cleanQuery
                     ? "bg-white/[0.08] text-white font-semibold"
                     : "text-zinc-400 hover:text-zinc-200"
                 }`}
@@ -343,20 +504,58 @@ export default function ProductsCatalogPage() {
                 </span>
               </button>
 
+              <button
+                type="button"
+                onClick={() => {
+                  setShowAllProducts(true);
+                  setSelectedCategory(null);
+                  setSelectedSubcategory(null);
+                  setSearchQuery("");
+                }}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-md transition-colors cursor-pointer ${
+                  showAllProducts && !cleanQuery
+                    ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold"
+                    : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                <Package className="w-3 h-3" />
+                <span>All Products</span>
+                <span className="text-[10px] px-1 py-0.2 rounded bg-white/10 text-zinc-300 font-mono">
+                  {products.length}
+                </span>
+              </button>
+
               {selectedCategory && (
                 <>
                   <ChevronRight className="w-3 h-3 text-zinc-600" />
                   <button
                     type="button"
                     onClick={() => {
+                      setShowAllProducts(false);
                       setSelectedSubcategory(null);
                       setSearchQuery("");
                     }}
+                    onDragOver={(e) => {
+                      if (!canManage || !draggingProduct) return;
+                      e.preventDefault();
+                      setDragOverTargetId(`cat_${selectedCategory.id}`);
+                    }}
+                    onDragLeave={() => setDragOverTargetId(null)}
+                    onDrop={(e) => {
+                      if (!canManage || !draggingProduct) return;
+                      e.preventDefault();
+                      setDragOverTargetId(null);
+                      handleMoveProduct(draggingProduct, selectedCategory.id, selectedCategory.name, "", "");
+                      setDraggingProduct(null);
+                    }}
                     className={`flex items-center gap-1 px-2 py-1 rounded-md transition-colors cursor-pointer ${
-                      selectedCategory && !selectedSubcategory && !cleanQuery
+                      dragOverTargetId === `cat_${selectedCategory.id}`
+                        ? "bg-emerald-500/25 text-emerald-200 ring-2 ring-emerald-500/60 font-semibold"
+                        : selectedCategory && !selectedSubcategory && !cleanQuery
                         ? "bg-white/[0.08] text-white font-semibold"
                         : "text-zinc-400 hover:text-zinc-200"
                     }`}
+                    title="Click to open Main Category, or drag & drop a product here to place directly in Main Category"
                   >
                     <span
                       className="w-1.5 h-1.5 rounded-full"
@@ -410,6 +609,16 @@ export default function ProductsCatalogPage() {
           <div className="flex items-center gap-2 shrink-0 self-end md:self-auto">
             {canManage && (
               <>
+                <button
+                  type="button"
+                  onClick={() => setIsQuickProductOpen(true)}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold shadow-sm transition-all cursor-pointer"
+                  title="Create Quick Product (Automatically saved under Common Category with no subcategory)"
+                >
+                  <Zap className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Quick Product</span>
+                </button>
+
                 {!selectedCategory ? (
                   <button
                     type="button"
@@ -420,14 +629,25 @@ export default function ProductsCatalogPage() {
                     <span className="hidden xs:inline">Category</span>
                   </button>
                 ) : !selectedSubcategory ? (
-                  <button
-                    type="button"
-                    onClick={() => setIsAddSubcategoryOpen(true)}
-                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium shadow-sm transition-all cursor-pointer"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span className="hidden xs:inline">Subcategory</span>
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setIsAddSubcategoryOpen(true)}
+                      className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium shadow-sm transition-all cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span className="hidden xs:inline">Subcategory</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsAddProductOpen(true)}
+                      className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium shadow-sm transition-all cursor-pointer"
+                      title={`Create individual product directly in ${selectedCategory.name} without a subcategory`}
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span className="hidden xs:inline">Product</span>
+                    </button>
+                  </>
                 ) : (
                   <button
                     type="button"
@@ -678,9 +898,14 @@ export default function ProductsCatalogPage() {
                 {/* 3. MATCHING PRODUCTS */}
                 {(searchFilterTab === "all" || searchFilterTab === "products") && matchingProducts.length > 0 && (
                   <div className="flex flex-col gap-2">
-                    <div className="flex items-center gap-2 text-xs font-semibold text-zinc-300">
-                      <Package className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Products ({matchingProducts.length})</span>
+                    <div className="flex items-center justify-between gap-2 text-xs font-semibold text-zinc-300">
+                      <div className="flex items-center gap-2">
+                        <Package className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Products ({matchingProducts.length})</span>
+                      </div>
+                      <span className="px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[11px]">
+                        Total Stock: {matchingProducts.reduce((sum, p) => sum + getProductTotalStock(p), 0)} pcs
+                      </span>
                     </div>
                     {viewMode === "table" ? (
                       <div className="overflow-x-auto rounded-xl border border-white/[0.08] bg-white/[0.02]">
@@ -690,125 +915,575 @@ export default function ProductsCatalogPage() {
                               <th className="py-2.5 px-3">Product</th>
                               <th className="py-2.5 px-3">Hierarchy</th>
                               <th className="py-2.5 px-3">SKU / Barcode</th>
-                              <th className="py-2.5 px-3">Price / Cost</th>
-                              <th className="py-2.5 px-3">Brand</th>
+                              <th className="py-2.5 px-3">Price / Cost (LKR)</th>
+                              <th className="py-2.5 px-3">Stocks (Total)</th>
                               <th className="py-2.5 px-3">Unit</th>
                               <th className="py-2.5 px-3">Created By</th>
                               <th className="py-2.5 px-3 text-right">Actions</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-white/[0.05]">
-                            {matchingProducts.map((prod) => (
-                              <tr
-                                key={prod.id}
-                                onClick={() => setActiveDetailProduct(prod)}
-                                className="group hover:bg-white/[0.04] transition-colors cursor-pointer"
-                              >
-                                <td className="py-2.5 px-3">
-                                  <div className="flex items-center gap-2.5">
-                                    <div className="w-8 h-8 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden shrink-0">
-                                      {prod.images && prod.images.length > 0 ? (
-                                        <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
-                                      ) : (
-                                        <Package className="w-4 h-4 text-zinc-500" />
+                            {matchingProducts.map((prod) => {
+                              const totalStock = getProductTotalStock(prod);
+                              const unitLabel = (prod.unit || "pcs").toLowerCase();
+                              const varCount = prod.variants?.length || 0;
+                              return (
+                                <tr
+                                  key={prod.id}
+                                  draggable={canManage}
+                                  onDragStart={() => setDraggingProduct(prod)}
+                                  onDragEnd={() => {
+                                    setDraggingProduct(null);
+                                    setDragOverTargetId(null);
+                                  }}
+                                  onClick={() => setActiveDetailProduct(prod)}
+                                  className="group hover:bg-white/[0.04] transition-colors cursor-pointer"
+                                >
+                                  <td className="py-2.5 px-3">
+                                    <div className="flex items-center gap-2.5">
+                                      {canManage && (
+                                        <GripVertical className="w-3.5 h-3.5 text-zinc-600 group-hover:text-zinc-400 shrink-0 cursor-grab" />
                                       )}
-                                    </div>
-                                    <div>
-                                      <div className="font-medium text-white group-hover:text-indigo-300 transition-colors truncate max-w-[180px]">
-                                        {prod.name}
+                                      <div className="w-8 h-8 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden shrink-0">
+                                        {prod.images && prod.images.length > 0 ? (
+                                          <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
+                                        ) : (
+                                          <Package className="w-4 h-4 text-zinc-500" />
+                                        )}
+                                      </div>
+                                      <div>
+                                        <div className="font-semibold text-white uppercase group-hover:text-indigo-300 transition-colors truncate max-w-[180px]">
+                                          {prod.name.toUpperCase()}
+                                        </div>
                                       </div>
                                     </div>
-                                  </div>
-                                </td>
-                                <td className="py-2.5 px-3">
-                                  <div className="text-[11px] text-zinc-400">
-                                    <span>{prod.categoryName || "Category"}</span> &rarr;{" "}
-                                    <span className="text-zinc-200">{prod.subcategoryName || "Subcategory"}</span>
-                                  </div>
-                                </td>
-                                <td className="py-2.5 px-3">
-                                  <div className="font-mono text-zinc-200">{prod.sku}</div>
-                                  {prod.barcode && <div className="text-[10px] text-zinc-500 font-mono">{prod.barcode}</div>}
-                                </td>
-                                <td className="py-2.5 px-3">
-                                  <div className="font-semibold text-emerald-400 font-mono">${prod.sellingPrice.toFixed(2)}</div>
-                                  <div className="text-[10px] text-zinc-500 font-mono">Cost: ${prod.costPrice.toFixed(2)}</div>
-                                </td>
-                                <td className="py-2.5 px-3 text-zinc-300">{prod.brand || "—"}</td>
-                                <td className="py-2.5 px-3">
-                                  <span className="px-1.5 py-0.5 rounded bg-white/[0.06] text-zinc-300 text-[10px] uppercase font-mono">
-                                    {prod.unit}
-                                  </span>
-                                </td>
-                                <td className="py-2.5 px-3">
-                                  <div className="text-zinc-300 font-medium">@{prod.createdBy?.username || "admin"}</div>
-                                  <div className="text-[10px] text-zinc-500">{new Date(prod.createdAt).toLocaleDateString()}</div>
-                                </td>
-                                <td className="py-2.5 px-3 text-right">
-                                  <div className="flex items-center justify-end gap-1">
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setActiveDetailProduct(prod);
-                                      }}
-                                      className="p-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white cursor-pointer"
-                                      title="Details"
-                                    >
-                                      <Info className="w-3.5 h-3.5" />
-                                    </button>
-                                    {canManage && (
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <div className="text-[11px] text-zinc-400">
+                                      <span>{prod.categoryName || "Common"}</span>
+                                      {prod.subcategoryName ? (
+                                        <>
+                                          {" "}
+                                          &rarr; <span className="text-zinc-200">{prod.subcategoryName}</span>
+                                        </>
+                                      ) : (
+                                        <span className="ml-1.5 px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 text-[9px] font-mono">
+                                          Direct
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <div className="font-mono text-zinc-200">{prod.sku}</div>
+                                    {prod.barcode && <div className="text-[10px] text-zinc-500 font-mono">{prod.barcode}</div>}
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <div className="font-semibold text-emerald-400 font-mono">{formatLKR(prod.sellingPrice)}</div>
+                                    <div className="text-[10px] text-zinc-500 font-mono">Cost: {formatLKR(prod.costPrice)}</div>
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <div className="flex flex-col items-start gap-0.5">
+                                      <span
+                                        className={`px-2 py-0.5 rounded-md font-mono font-semibold text-[11px] border ${
+                                          totalStock <= 0
+                                            ? "bg-red-500/15 text-red-300 border-red-500/30"
+                                            : totalStock <= (prod.minStockLevel || 5)
+                                            ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                                            : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                                        }`}
+                                      >
+                                        {totalStock} {unitLabel} in stock
+                                      </span>
+                                      {varCount > 0 && (
+                                        <span className="text-[10px] text-zinc-500">
+                                          Includes {varCount} variation{varCount > 1 ? "s" : ""}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <span className="px-1.5 py-0.5 rounded bg-white/[0.06] text-zinc-300 text-[10px] uppercase font-mono">
+                                      {prod.unit}
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <div className="text-zinc-300 font-medium">@{prod.createdBy?.username || "admin"}</div>
+                                    <div className="text-[10px] text-zinc-500">{new Date(prod.createdAt).toLocaleDateString()}</div>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right">
+                                    <div className="flex items-center justify-end gap-1">
+                                      {canManage && (
+                                        <>
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setMovingProduct(prod);
+                                            }}
+                                            className="p-1 rounded bg-cyan-500/10 hover:bg-cyan-500/25 text-cyan-300 hover:text-cyan-200 cursor-pointer"
+                                            title="Move Product to Subcategory / Main Category"
+                                          >
+                                            <FolderInput className="w-3.5 h-3.5" />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setEditingProduct(prod);
+                                            }}
+                                            className="p-1 rounded bg-indigo-500/10 hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-200 cursor-pointer"
+                                            title="Edit Product Details"
+                                          >
+                                            <Pencil className="w-3.5 h-3.5" />
+                                          </button>
+                                        </>
+                                      )}
                                       <button
                                         type="button"
-                                        onClick={(e) => handleDeleteProduct(prod, e)}
-                                        className="p-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-red-300 cursor-pointer"
-                                        title="Delete"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setActiveDetailProduct(prod);
+                                        }}
+                                        className="p-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white cursor-pointer"
+                                        title="Details"
                                       >
-                                        <Trash2 className="w-3.5 h-3.5" />
+                                        <Info className="w-3.5 h-3.5" />
                                       </button>
-                                    )}
-                                  </div>
-                                </td>
-                              </tr>
-                            ))}
+                                      {canManage && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => handleDeleteProduct(prod, e)}
+                                          className="p-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-red-300 cursor-pointer"
+                                          title="Delete"
+                                        >
+                                          <Trash2 className="w-3.5 h-3.5" />
+                                        </button>
+                                      )}
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })}
                           </tbody>
+                          <tfoot className="border-t border-white/[0.1] bg-white/[0.04] text-xs font-semibold">
+                            <tr>
+                              <td colSpan={4} className="py-2.5 px-3 text-zinc-300 uppercase tracking-wider text-[10px]">
+                                Total Stock Across {matchingProducts.length} Listed Product{matchingProducts.length === 1 ? "" : "s"} (All Variations Included)
+                              </td>
+                              <td colSpan={4} className="py-2.5 px-3 font-mono text-emerald-400 font-bold">
+                                {matchingProducts.reduce((sum, p) => sum + getProductTotalStock(p), 0)} pcs in stock
+                              </td>
+                            </tr>
+                          </tfoot>
                         </table>
                       </div>
                     ) : (
                       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
-                        {matchingProducts.map((prod) => (
-                          <div
-                            key={prod.id}
-                            onClick={() => setActiveDetailProduct(prod)}
-                            className="group flex flex-col justify-between p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.07] border border-white/[0.06] transition-all cursor-pointer hover:-translate-y-0.5"
-                          >
-                            <div>
-                              <div className="w-full h-24 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden mb-2">
-                                {prod.images && prod.images.length > 0 ? (
-                                  <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
-                                ) : (
-                                  <Package className="w-6 h-6 text-zinc-600" />
-                                )}
+                        {matchingProducts.map((prod) => {
+                          const totalStock = getProductTotalStock(prod);
+                          const unitLabel = (prod.unit || "pcs").toLowerCase();
+                          return (
+                            <div
+                              key={prod.id}
+                              draggable={canManage}
+                              onDragStart={() => setDraggingProduct(prod)}
+                              onDragEnd={() => {
+                                setDraggingProduct(null);
+                                setDragOverTargetId(null);
+                              }}
+                              onClick={() => setActiveDetailProduct(prod)}
+                              className="group flex flex-col justify-between p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.07] border border-white/[0.06] transition-all cursor-pointer hover:-translate-y-0.5"
+                            >
+                              <div>
+                                <div className="w-full h-24 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden mb-2">
+                                  {prod.images && prod.images.length > 0 ? (
+                                    <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
+                                  ) : (
+                                    <Package className="w-6 h-6 text-zinc-600" />
+                                  )}
+                                </div>
+                                <div className="text-[9px] text-zinc-500 truncate">
+                                  {prod.categoryName || "Common"}
+                                  {prod.subcategoryName ? ` → ${prod.subcategoryName}` : " (Direct)"}
+                                </div>
+                                <h4 className="text-xs font-semibold text-white uppercase group-hover:text-indigo-300 transition-colors truncate mt-0.5">
+                                  {prod.name.toUpperCase()}
+                                </h4>
+                                <div className="text-[10px] font-mono text-zinc-400">SKU: {prod.sku}</div>
+                                <div className="mt-1 text-[10px] font-mono text-emerald-300">
+                                  {totalStock} {unitLabel} in stock
+                                </div>
                               </div>
-                              <div className="text-[9px] text-zinc-500 truncate">
-                                {prod.categoryName} &rarr; {prod.subcategoryName}
+                              <div className="mt-2 pt-1.5 border-t border-white/[0.05] flex items-center justify-between">
+                                <div className="text-xs font-bold text-emerald-400 font-mono">{formatLKR(prod.sellingPrice)}</div>
+                                <div className="flex items-center gap-1">
+                                  {canManage && (
+                                    <>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setMovingProduct(prod);
+                                        }}
+                                        className="p-1 rounded bg-cyan-500/15 hover:bg-cyan-500/30 text-cyan-300 cursor-pointer"
+                                        title="Move Product"
+                                      >
+                                        <FolderInput className="w-3 h-3" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setEditingProduct(prod);
+                                        }}
+                                        className="p-1 rounded bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 cursor-pointer"
+                                        title="Edit Product"
+                                      >
+                                        <Pencil className="w-3 h-3" />
+                                      </button>
+                                    </>
+                                  )}
+                                  <span className="text-[9px] text-zinc-500">@{prod.createdBy?.username || "staff"}</span>
+                                </div>
                               </div>
-                              <h4 className="text-xs font-semibold text-white group-hover:text-indigo-300 transition-colors truncate mt-0.5">
-                                {prod.name}
-                              </h4>
-                              <div className="text-[10px] font-mono text-zinc-400">SKU: {prod.sku}</div>
                             </div>
-                            <div className="mt-2 pt-1.5 border-t border-white/[0.05] flex items-center justify-between">
-                              <div className="text-xs font-bold text-emerald-400 font-mono">${prod.sellingPrice.toFixed(2)}</div>
-                              <div className="text-[9px] text-zinc-500">@{prod.createdBy?.username || "staff"}</div>
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </div>
                 )}
               </>
+            )}
+          </div>
+        ) : showAllProducts ? (
+          /* ========================================================================= */
+          /* ALL PRODUCTS ACROSS ALL CATEGORIES VIEW                                   */
+          /* ========================================================================= */
+          <div className="flex flex-col gap-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <div className="text-xs text-zinc-300 font-medium">
+                  Showing all <span className="font-mono text-white font-semibold">{products.length}</span> products across{" "}
+                  <span className="text-emerald-300 font-semibold">All Categories</span>
+                </div>
+                <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[11px] font-semibold">
+                  Total Stock: {products.reduce((sum, p) => sum + getProductTotalStock(p), 0)} pcs (All variations)
+                </span>
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                <div className="flex items-center p-0.5 rounded-lg bg-white/[0.05] border border-white/[0.08]">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("table")}
+                    className={`p-1 rounded transition-colors cursor-pointer ${
+                      viewMode === "table" ? "bg-white/10 text-white" : "text-zinc-400"
+                    }`}
+                    title="Table View"
+                  >
+                    <TableIcon className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("grid")}
+                    className={`p-1 rounded transition-colors cursor-pointer ${
+                      viewMode === "grid" ? "bg-white/10 text-white" : "text-zinc-400"
+                    }`}
+                    title="Grid View"
+                  >
+                    <LayoutGrid className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                {canManage && (
+                  <button
+                    type="button"
+                    onClick={() => setIsQuickProductOpen(true)}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold cursor-pointer"
+                  >
+                    <Zap className="w-3.5 h-3.5 text-amber-400" />
+                    <span>+ Quick Product (Common)</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {products.length === 0 ? (
+              <div className="border border-dashed border-white/10 rounded-xl p-8 text-center flex flex-col items-center justify-center gap-2 bg-white/[0.01]">
+                <Package className="w-8 h-8 text-zinc-600" />
+                <div className="text-xs text-zinc-400">No products created yet in any category.</div>
+                {canManage && (
+                  <button
+                    type="button"
+                    onClick={() => setIsQuickProductOpen(true)}
+                    className="mt-1 px-3 py-1.5 rounded-lg bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-semibold cursor-pointer"
+                  >
+                    + Create Quick Product (Common)
+                  </button>
+                )}
+              </div>
+            ) : viewMode === "table" ? (
+              <div className="overflow-x-auto rounded-xl border border-white/[0.08] bg-white/[0.02]">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-white/[0.08] bg-white/[0.03] text-zinc-400 text-[10px] uppercase tracking-wider font-semibold">
+                      <th className="py-2.5 px-3">Product</th>
+                      <th className="py-2.5 px-3">Category / Subcategory</th>
+                      <th className="py-2.5 px-3">SKU / Barcode</th>
+                      <th className="py-2.5 px-3">Price / Cost (LKR)</th>
+                      <th className="py-2.5 px-3">Stocks (Total)</th>
+                      <th className="py-2.5 px-3">Unit</th>
+                      <th className="py-2.5 px-3">Variants</th>
+                      <th className="py-2.5 px-3">Created By</th>
+                      <th className="py-2.5 px-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/[0.05]">
+                    {products.map((prod) => {
+                      const totalStock = getProductTotalStock(prod);
+                      const unitLabel = (prod.unit || "pcs").toLowerCase();
+                      const varCount = prod.variants?.length || 0;
+                      return (
+                        <tr
+                          key={prod.id}
+                          draggable={canManage}
+                          onDragStart={() => setDraggingProduct(prod)}
+                          onDragEnd={() => {
+                            setDraggingProduct(null);
+                            setDragOverTargetId(null);
+                          }}
+                          onClick={() => setActiveDetailProduct(prod)}
+                          className="group hover:bg-white/[0.04] transition-colors cursor-pointer"
+                        >
+                          <td className="py-2.5 px-3">
+                            <div className="flex items-center gap-2.5">
+                              {canManage && (
+                                <GripVertical className="w-3.5 h-3.5 text-zinc-600 group-hover:text-zinc-400 shrink-0 cursor-grab" />
+                              )}
+                              <div className="w-8 h-8 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden shrink-0">
+                                {prod.images && prod.images.length > 0 ? (
+                                  <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
+                                ) : (
+                                  <Package className="w-4 h-4 text-zinc-500" />
+                                )}
+                              </div>
+                              <div>
+                                <div className="font-semibold text-white uppercase group-hover:text-indigo-300 transition-colors truncate max-w-[180px]">
+                                  {prod.name.toUpperCase()}
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+
+                          <td className="py-2.5 px-3">
+                            <div className="text-[11px] text-zinc-400">
+                              <span className="text-zinc-200 font-medium">{prod.categoryName || "Common"}</span>
+                              {prod.subcategoryName ? (
+                                <>
+                                  {" "}
+                                  &rarr; <span className="text-zinc-300">{prod.subcategoryName}</span>
+                                </>
+                              ) : (
+                                <span className="ml-1.5 px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 text-[9px] font-mono border border-amber-500/30">
+                                  Common / Direct
+                                </span>
+                              )}
+                            </div>
+                          </td>
+
+                          <td className="py-2.5 px-3">
+                            <div className="font-mono text-zinc-200">{prod.sku}</div>
+                            {prod.barcode && <div className="text-[10px] text-zinc-500 font-mono">{prod.barcode}</div>}
+                          </td>
+
+                          <td className="py-2.5 px-3">
+                            <div className="font-semibold text-emerald-400 font-mono">{formatLKR(prod.sellingPrice)}</div>
+                            <div className="text-[10px] text-zinc-500 font-mono">Cost: {formatLKR(prod.costPrice)}</div>
+                          </td>
+
+                          <td className="py-2.5 px-3">
+                            <div className="flex flex-col items-start gap-0.5">
+                              <span
+                                className={`px-2 py-0.5 rounded-md font-mono font-semibold text-[11px] border ${
+                                  totalStock <= 0
+                                    ? "bg-red-500/15 text-red-300 border-red-500/30"
+                                    : totalStock <= (prod.minStockLevel || 5)
+                                    ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                                    : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                                }`}
+                              >
+                                {totalStock} {unitLabel} in stock
+                              </span>
+                              <span className="text-[10px] text-zinc-500">
+                                {varCount > 0
+                                  ? `Total across ${varCount} variation${varCount > 1 ? "s" : ""}`
+                                  : "Total stock"}
+                              </span>
+                            </div>
+                          </td>
+
+                          <td className="py-2.5 px-3">
+                            <span className="px-1.5 py-0.5 rounded bg-white/[0.06] text-zinc-300 text-[10px] uppercase font-mono">
+                              {prod.unit}
+                            </span>
+                          </td>
+
+                          <td className="py-2.5 px-3">
+                            {prod.hasVariants && prod.variants && prod.variants.length > 0 ? (
+                              <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px] font-mono border border-indigo-500/30">
+                                {prod.variants.length} vars
+                              </span>
+                            ) : (
+                              <span className="text-zinc-600 text-[11px]">—</span>
+                            )}
+                          </td>
+
+                          <td className="py-2.5 px-3">
+                            <div className="text-zinc-300 font-medium">@{prod.createdBy?.username || "admin"}</div>
+                            <div className="text-[10px] text-zinc-500">{new Date(prod.createdAt).toLocaleDateString()}</div>
+                          </td>
+
+                          <td className="py-2.5 px-3 text-right">
+                            <div className="flex items-center justify-end gap-1">
+                              {canManage && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setMovingProduct(prod);
+                                    }}
+                                    className="p-1 rounded bg-cyan-500/10 hover:bg-cyan-500/25 text-cyan-300 hover:text-cyan-200 cursor-pointer"
+                                    title="Move Product to Subcategory / Main Category"
+                                  >
+                                    <FolderInput className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setEditingProduct(prod);
+                                    }}
+                                    className="p-1 rounded bg-indigo-500/10 hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-200 cursor-pointer"
+                                    title="Edit Product Details"
+                                  >
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  </button>
+                                </>
+                              )}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setActiveDetailProduct(prod);
+                                }}
+                                className="p-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white cursor-pointer"
+                                title="Details"
+                              >
+                                <Info className="w-3.5 h-3.5" />
+                              </button>
+                              {canManage && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleDeleteProduct(prod, e)}
+                                  className="p-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-red-300 cursor-pointer"
+                                  title="Delete"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot className="border-t border-white/[0.1] bg-white/[0.04] text-xs font-semibold">
+                    <tr>
+                      <td colSpan={4} className="py-2.5 px-3 text-zinc-300 uppercase tracking-wider text-[10px]">
+                        Total Stock Across All {products.length} Products & Categories (Includes All Variations)
+                      </td>
+                      <td colSpan={5} className="py-2.5 px-3 font-mono text-emerald-400 font-bold">
+                        {products.reduce((sum, p) => sum + getProductTotalStock(p), 0)} pcs in stock
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
+                {products.map((prod) => {
+                  const totalStock = getProductTotalStock(prod);
+                  const unitLabel = (prod.unit || "pcs").toLowerCase();
+                  return (
+                    <div
+                      key={prod.id}
+                      draggable={canManage}
+                      onDragStart={() => setDraggingProduct(prod)}
+                      onDragEnd={() => {
+                        setDraggingProduct(null);
+                        setDragOverTargetId(null);
+                      }}
+                      onClick={() => setActiveDetailProduct(prod)}
+                      className="group flex flex-col justify-between p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.07] border border-white/[0.06] transition-all cursor-pointer hover:-translate-y-0.5"
+                    >
+                      <div>
+                        <div className="w-full h-24 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden mb-2">
+                          {prod.images && prod.images.length > 0 ? (
+                            <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
+                          ) : (
+                            <Package className="w-6 h-6 text-zinc-600" />
+                          )}
+                        </div>
+                        <div className="text-[9px] text-zinc-500 truncate">
+                          {prod.categoryName || "Common"}
+                          {prod.subcategoryName ? ` → ${prod.subcategoryName}` : " (Direct)"}
+                        </div>
+                        <h4 className="text-xs font-semibold text-white uppercase group-hover:text-indigo-300 transition-colors truncate mt-0.5">
+                          {prod.name.toUpperCase()}
+                        </h4>
+                        <div className="text-[10px] font-mono text-zinc-400">SKU: {prod.sku}</div>
+                        <div className="mt-1 text-[10px] font-mono text-emerald-300 font-semibold">
+                          {totalStock} {unitLabel} in stock
+                        </div>
+                      </div>
+                      <div className="mt-2 pt-1.5 border-t border-white/[0.05] flex items-center justify-between">
+                        <div className="text-xs font-bold text-emerald-400 font-mono">{formatLKR(prod.sellingPrice)}</div>
+                        <div className="flex items-center gap-1">
+                          {canManage && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setMovingProduct(prod);
+                                }}
+                                className="p-1 rounded bg-cyan-500/15 hover:bg-cyan-500/30 text-cyan-300 cursor-pointer"
+                                title="Move Product"
+                              >
+                                <FolderInput className="w-3 h-3" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setEditingProduct(prod);
+                                }}
+                                className="p-1 rounded bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 cursor-pointer"
+                                title="Edit Product"
+                              >
+                                <Pencil className="w-3 h-3" />
+                              </button>
+                            </>
+                          )}
+                          <span className="text-[9px] text-zinc-500">@{prod.createdBy?.username || "staff"}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             )}
           </div>
         ) : (
@@ -823,13 +1498,22 @@ export default function ProductsCatalogPage() {
                     <Layers className="w-8 h-8 text-zinc-600" />
                     <div className="text-xs text-zinc-400">No categories created yet.</div>
                     {canManage && (
-                      <button
-                        type="button"
-                        onClick={() => setIsAddCategoryOpen(true)}
-                        className="mt-1 px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-medium cursor-pointer"
-                      >
-                        + Create Category
-                      </button>
+                      <div className="flex items-center gap-2 mt-1">
+                        <button
+                          type="button"
+                          onClick={() => setIsAddCategoryOpen(true)}
+                          className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-medium cursor-pointer"
+                        >
+                          + Create Category
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setIsQuickProductOpen(true)}
+                          className="px-3 py-1.5 rounded-lg bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-semibold cursor-pointer"
+                        >
+                          + Quick Product (Common)
+                        </button>
+                      </div>
                     )}
                   </div>
                 ) : (
@@ -897,72 +1581,433 @@ export default function ProductsCatalogPage() {
             )}
 
             {/* ------------------------------------------------------------- */}
-            {/* TIER 2: HALF-SIZE SUBCATEGORY CARDS                           */}
+            {/* TIER 2: HALF-SIZE SUBCATEGORY CARDS + DIRECT CATEGORY PRODUCTS */}
             {/* ------------------------------------------------------------- */}
             {selectedCategory && !selectedSubcategory && (
-              <div>
-                {currentSubcategories.length === 0 ? (
-                  <div className="border border-dashed border-white/10 rounded-xl p-8 text-center flex flex-col items-center justify-center gap-2 bg-white/[0.01]">
-                    <Box className="w-8 h-8 text-zinc-600" />
-                    <div className="text-xs text-zinc-400">No subcategories in {selectedCategory.name}.</div>
-                    {canManage && (
-                      <button
-                        type="button"
-                        onClick={() => setIsAddSubcategoryOpen(true)}
-                        className="mt-1 px-3 py-1.5 rounded-lg bg-cyan-600 text-white text-xs font-medium cursor-pointer"
-                      >
-                        + Add Subcategory
-                      </button>
-                    )}
-                  </div>
-                ) : (
-                  /* Compact Half-Size Grid */
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2 sm:gap-2.5">
-                    {currentSubcategories.map((sub) => {
-                      const subProds = products.filter((p) => p.subcategoryId === sub.id);
+              <div className="flex flex-col gap-4">
+                {/* Subcategories Grid (also acts as Drag-and-Drop targets for products!) */}
+                {currentSubcategories.length > 0 && (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-xs font-semibold text-zinc-300">
+                        <Box className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Subcategories in {selectedCategory.name} ({currentSubcategories.length})</span>
+                      </div>
+                      {canManage && (
+                        <span className="text-[10px] text-cyan-300/90 bg-cyan-500/10 border border-cyan-500/25 px-2 py-0.5 rounded-md">
+                          Drag &amp; drop any product onto a subcategory card below (or click Move) to move it
+                        </span>
+                      )}
+                    </div>
 
-                      return (
-                        <div
-                          key={sub.id}
-                          onClick={() => setSelectedSubcategory(sub)}
-                          className="group flex flex-col justify-between p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.07] border border-white/[0.06] hover:border-cyan-500/40 transition-all cursor-pointer hover:shadow-lg hover:-translate-y-0.5"
-                        >
-                          <div className="flex items-start justify-between gap-1.5 mb-1.5">
-                            <div className="w-7 h-7 rounded-lg bg-cyan-500/10 border border-cyan-500/25 flex items-center justify-center text-cyan-400">
-                              <Box className="w-3.5 h-3.5" />
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2 sm:gap-2.5">
+                      {currentSubcategories.map((sub) => {
+                        const subProds = products.filter((p) => p.subcategoryId === sub.id);
+                        const isDropActive = dragOverTargetId === `sub_${sub.id}`;
+
+                        return (
+                          <div
+                            key={sub.id}
+                            onClick={() => setSelectedSubcategory(sub)}
+                            onDragOver={(e) => {
+                              if (!canManage || !draggingProduct) return;
+                              e.preventDefault();
+                              setDragOverTargetId(`sub_${sub.id}`);
+                            }}
+                            onDragLeave={() => setDragOverTargetId(null)}
+                            onDrop={(e) => {
+                              if (!canManage || !draggingProduct) return;
+                              e.preventDefault();
+                              setDragOverTargetId(null);
+                              handleMoveProduct(
+                                draggingProduct,
+                                selectedCategory.id,
+                                selectedCategory.name,
+                                sub.id,
+                                sub.name
+                              );
+                              setDraggingProduct(null);
+                            }}
+                            className={`group flex flex-col justify-between p-2.5 rounded-xl border transition-all cursor-pointer hover:shadow-lg hover:-translate-y-0.5 ${
+                              isDropActive
+                                ? "bg-cyan-500/20 border-cyan-400 ring-2 ring-cyan-400/60 scale-[1.02]"
+                                : "bg-white/[0.03] hover:bg-white/[0.07] border-white/[0.06] hover:border-cyan-500/40"
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-1.5 mb-1.5">
+                              <div className="w-7 h-7 rounded-lg bg-cyan-500/10 border border-cyan-500/25 flex items-center justify-center text-cyan-400">
+                                <Box className="w-3.5 h-3.5" />
+                              </div>
+
+                              {canManage && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleDeleteSubcategory(sub, e)}
+                                  className="opacity-0 group-hover:opacity-100 p-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 transition-opacity"
+                                  title="Delete Subcategory"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              )}
                             </div>
 
-                            {canManage && (
-                              <button
-                                type="button"
-                                onClick={(e) => handleDeleteSubcategory(sub, e)}
-                                className="opacity-0 group-hover:opacity-100 p-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 transition-opacity"
-                                title="Delete Subcategory"
-                              >
-                                <Trash2 className="w-3 h-3" />
-                              </button>
-                            )}
-                          </div>
+                            <div>
+                              <h3 className="text-xs font-semibold text-white group-hover:text-cyan-300 transition-colors truncate">
+                                {sub.name}
+                              </h3>
+                              {isDropActive && (
+                                <span className="inline-block mt-1 text-[9px] font-semibold text-cyan-200 bg-cyan-500/30 px-1.5 py-0.5 rounded">
+                                  Drop to move here
+                                </span>
+                              )}
+                            </div>
 
-                          <div>
-                            <h3 className="text-xs font-semibold text-white group-hover:text-cyan-300 transition-colors truncate">
-                              {sub.name}
-                            </h3>
+                            <div className="mt-2 pt-1.5 border-t border-white/[0.05] flex items-center justify-between text-[10px] text-zinc-400">
+                              <span className="font-mono text-cyan-300 font-medium">
+                                {subProds.length} items
+                              </span>
+                              <span className="text-[9px] text-zinc-500 truncate">
+                                @{sub.createdBy?.username || "admin"}
+                              </span>
+                            </div>
                           </div>
-
-                          <div className="mt-2 pt-1.5 border-t border-white/[0.05] flex items-center justify-between text-[10px] text-zinc-400">
-                            <span className="font-mono text-cyan-300 font-medium">
-                              {subProds.length} items
-                            </span>
-                            <span className="text-[9px] text-zinc-500 truncate">
-                              @{sub.createdBy?.username || "admin"}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
+
+                {/* Direct Products in Main Category (No Subcategory Required) */}
+                <div className="flex flex-col gap-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <div className="text-xs text-zinc-300 font-medium">
+                        Individual Products in <span className="text-white font-semibold">{selectedCategory.name}</span>{" "}
+                        <span className="text-zinc-500">(Direct in Main Category — No Subcategory Needed)</span>
+                      </div>
+                      <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[11px] font-semibold">
+                        Total Stock: {directCategoryProducts.reduce((sum, p) => sum + getProductTotalStock(p), 0)} pcs (All variations)
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <div className="flex items-center p-0.5 rounded-lg bg-white/[0.05] border border-white/[0.08]">
+                        <button
+                          type="button"
+                          onClick={() => setViewMode("table")}
+                          className={`p-1 rounded transition-colors cursor-pointer ${
+                            viewMode === "table" ? "bg-white/10 text-white" : "text-zinc-400"
+                          }`}
+                          title="Table View"
+                        >
+                          <TableIcon className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setViewMode("grid")}
+                          className={`p-1 rounded transition-colors cursor-pointer ${
+                            viewMode === "grid" ? "bg-white/10 text-white" : "text-zinc-400"
+                          }`}
+                          title="Grid View"
+                        >
+                          <LayoutGrid className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      {canManage && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => setIsAddSubcategoryOpen(true)}
+                            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-300 text-xs font-medium cursor-pointer"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>Subcategory</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setIsAddProductOpen(true)}
+                            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>Add Product in {selectedCategory.name}</span>
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {directCategoryProducts.length === 0 ? (
+                    <div className="border border-dashed border-white/10 rounded-xl p-8 text-center flex flex-col items-center justify-center gap-2 bg-white/[0.01]">
+                      <Package className="w-8 h-8 text-zinc-600" />
+                      <div className="text-xs text-zinc-400">
+                        No direct products in <span className="text-zinc-200 font-medium">{selectedCategory.name}</span> yet. You can create individual products directly in this main category without creating a subcategory.
+                      </div>
+                      {canManage && (
+                        <div className="flex flex-wrap items-center justify-center gap-2 mt-1">
+                          <button
+                            type="button"
+                            onClick={() => setIsAddProductOpen(true)}
+                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                          >
+                            + Add Product Directly in {selectedCategory.name}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setIsAddSubcategoryOpen(true)}
+                            className="px-3 py-1.5 rounded-lg bg-cyan-600/20 border border-cyan-500/40 text-cyan-300 text-xs font-medium cursor-pointer"
+                          >
+                            + Add Subcategory
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ) : viewMode === "table" ? (
+                    <div className="overflow-x-auto rounded-xl border border-white/[0.08] bg-white/[0.02]">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="border-b border-white/[0.08] bg-white/[0.03] text-zinc-400 text-[10px] uppercase tracking-wider font-semibold">
+                            <th className="py-2.5 px-3">Product</th>
+                            <th className="py-2.5 px-3">SKU / Barcode</th>
+                            <th className="py-2.5 px-3">Price / Cost (LKR)</th>
+                            <th className="py-2.5 px-3">Stocks (Total)</th>
+                            <th className="py-2.5 px-3">Unit</th>
+                            <th className="py-2.5 px-3">Variants</th>
+                            <th className="py-2.5 px-3">Created By</th>
+                            <th className="py-2.5 px-3 text-right">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/[0.05]">
+                          {directCategoryProducts.map((prod) => {
+                            const totalStock = getProductTotalStock(prod);
+                            const unitLabel = (prod.unit || "pcs").toLowerCase();
+                            const varCount = prod.variants?.length || 0;
+                            return (
+                              <tr
+                                key={prod.id}
+                                draggable={canManage}
+                                onDragStart={() => setDraggingProduct(prod)}
+                                onDragEnd={() => {
+                                  setDraggingProduct(null);
+                                  setDragOverTargetId(null);
+                                }}
+                                onClick={() => setActiveDetailProduct(prod)}
+                                className="group hover:bg-white/[0.04] transition-colors cursor-pointer"
+                              >
+                                <td className="py-2.5 px-3">
+                                  <div className="flex items-center gap-2.5">
+                                    {canManage && (
+                                      <GripVertical className="w-3.5 h-3.5 text-zinc-600 group-hover:text-zinc-400 shrink-0 cursor-grab" />
+                                    )}
+                                    <div className="w-8 h-8 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden shrink-0">
+                                      {prod.images && prod.images.length > 0 ? (
+                                        <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
+                                      ) : (
+                                        <Package className="w-4 h-4 text-zinc-500" />
+                                      )}
+                                    </div>
+                                    <div>
+                                      <div className="font-semibold text-white uppercase group-hover:text-indigo-300 transition-colors truncate max-w-[200px]">
+                                        {prod.name.toUpperCase()}
+                                      </div>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="font-mono text-zinc-200">{prod.sku}</div>
+                                  {prod.barcode && (
+                                    <div className="text-[10px] text-zinc-500 font-mono">{prod.barcode}</div>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="font-semibold text-emerald-400 font-mono">
+                                    {formatLKR(prod.sellingPrice)}
+                                  </div>
+                                  <div className="text-[10px] text-zinc-500 font-mono">
+                                    Cost: {formatLKR(prod.costPrice)}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="flex flex-col items-start gap-0.5">
+                                    <span
+                                      className={`px-2 py-0.5 rounded-md font-mono font-semibold text-[11px] border ${
+                                        totalStock <= 0
+                                          ? "bg-red-500/15 text-red-300 border-red-500/30"
+                                          : totalStock <= (prod.minStockLevel || 5)
+                                          ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                                          : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                                      }`}
+                                    >
+                                      {totalStock} {unitLabel} in stock
+                                    </span>
+                                    <span className="text-[10px] text-zinc-500">
+                                      {varCount > 0
+                                        ? `Total across ${varCount} variation${varCount > 1 ? "s" : ""}`
+                                        : "Total stock"}
+                                    </span>
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <span className="px-1.5 py-0.5 rounded bg-white/[0.06] text-zinc-300 text-[10px] uppercase font-mono">
+                                    {prod.unit}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  {prod.hasVariants && prod.variants && prod.variants.length > 0 ? (
+                                    <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px] font-mono border border-indigo-500/30">
+                                      {prod.variants.length} vars
+                                    </span>
+                                  ) : (
+                                    <span className="text-zinc-600 text-[11px]">—</span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="text-zinc-300 font-medium">@{prod.createdBy?.username || "admin"}</div>
+                                  <div className="text-[10px] text-zinc-500">
+                                    {new Date(prod.createdAt).toLocaleDateString()}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3 text-right">
+                                  <div className="flex items-center justify-end gap-1">
+                                    {canManage && (
+                                      <>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setMovingProduct(prod);
+                                          }}
+                                          className="p-1 rounded bg-cyan-500/10 hover:bg-cyan-500/25 text-cyan-300 hover:text-cyan-200 cursor-pointer"
+                                          title="Move Product to Subcategory"
+                                        >
+                                          <FolderInput className="w-3.5 h-3.5" />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setEditingProduct(prod);
+                                          }}
+                                          className="p-1 rounded bg-indigo-500/10 hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-200 cursor-pointer"
+                                          title="Edit Product Details"
+                                        >
+                                          <Pencil className="w-3.5 h-3.5" />
+                                        </button>
+                                      </>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setActiveDetailProduct(prod);
+                                      }}
+                                      className="p-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white cursor-pointer"
+                                      title="Details"
+                                    >
+                                      <Info className="w-3.5 h-3.5" />
+                                    </button>
+                                    {canManage && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => handleDeleteProduct(prod, e)}
+                                        className="p-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-red-300 cursor-pointer"
+                                        title="Delete"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                        <tfoot className="border-t border-white/[0.1] bg-white/[0.04] text-xs font-semibold">
+                          <tr>
+                            <td colSpan={3} className="py-2.5 px-3 text-zinc-300 uppercase tracking-wider text-[10px]">
+                              Total Stock in {selectedCategory.name} (Includes All Variations)
+                            </td>
+                            <td colSpan={5} className="py-2.5 px-3 font-mono text-emerald-400 font-bold">
+                              {directCategoryProducts.reduce((sum, p) => sum + getProductTotalStock(p), 0)} pcs in stock
+                            </td>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
+                      {directCategoryProducts.map((prod) => {
+                        const totalStock = getProductTotalStock(prod);
+                        const unitLabel = (prod.unit || "pcs").toLowerCase();
+                        return (
+                          <div
+                            key={prod.id}
+                            draggable={canManage}
+                            onDragStart={() => setDraggingProduct(prod)}
+                            onDragEnd={() => {
+                              setDraggingProduct(null);
+                              setDragOverTargetId(null);
+                            }}
+                            onClick={() => setActiveDetailProduct(prod)}
+                            className="group flex flex-col justify-between p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.07] border border-white/[0.06] transition-all cursor-pointer hover:-translate-y-0.5"
+                          >
+                            <div>
+                              <div className="w-full h-24 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden mb-2">
+                                {prod.images && prod.images.length > 0 ? (
+                                  <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
+                                ) : (
+                                  <Package className="w-6 h-6 text-zinc-600" />
+                                )}
+                              </div>
+                              <div className="text-[10px] font-mono text-emerald-300 font-semibold">
+                                {totalStock} {unitLabel} in stock
+                              </div>
+                              <h4 className="text-xs font-semibold text-white uppercase group-hover:text-indigo-300 transition-colors truncate mt-0.5">
+                                {prod.name.toUpperCase()}
+                              </h4>
+                              <div className="text-[10px] font-mono text-zinc-400">SKU: {prod.sku}</div>
+                            </div>
+
+                            <div className="mt-2 pt-1.5 border-t border-white/[0.05] flex items-center justify-between">
+                              <div className="text-xs font-bold text-emerald-400 font-mono">
+                                {formatLKR(prod.sellingPrice)}
+                              </div>
+                              <div className="flex items-center gap-1">
+                                {canManage && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setMovingProduct(prod);
+                                      }}
+                                      className="p-1 rounded bg-cyan-500/15 hover:bg-cyan-500/30 text-cyan-300 cursor-pointer"
+                                      title="Move Product to Subcategory"
+                                    >
+                                      <FolderInput className="w-3 h-3" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setEditingProduct(prod);
+                                      }}
+                                      className="p-1 rounded bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 cursor-pointer"
+                                      title="Edit Product"
+                                    >
+                                      <Pencil className="w-3 h-3" />
+                                    </button>
+                                  </>
+                                )}
+                                <span className="text-[9px] text-zinc-500">@{prod.createdBy?.username || "staff"}</span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
@@ -971,11 +2016,93 @@ export default function ProductsCatalogPage() {
             {/* ------------------------------------------------------------- */}
             {selectedCategory && selectedSubcategory && (
               <div className="flex flex-col gap-2.5">
+                {/* Drag & Drop Subcategory Target Bar within Main Category */}
+                {canManage && (
+                  <div className="flex flex-wrap items-center gap-1.5 p-2 rounded-xl bg-cyan-500/[0.04] border border-cyan-500/20 text-xs">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-cyan-300 mr-1 flex items-center gap-1">
+                      <FolderInput className="w-3.5 h-3.5" />
+                      <span>Drag &amp; Drop Product To Move:</span>
+                    </span>
+
+                    {/* Drop Target: Direct in Main Category */}
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSubcategory(null)}
+                      onDragOver={(e) => {
+                        if (!draggingProduct) return;
+                        e.preventDefault();
+                        setDragOverTargetId(`direct_${selectedCategory.id}`);
+                      }}
+                      onDragLeave={() => setDragOverTargetId(null)}
+                      onDrop={(e) => {
+                        if (!draggingProduct) return;
+                        e.preventDefault();
+                        setDragOverTargetId(null);
+                        handleMoveProduct(draggingProduct, selectedCategory.id, selectedCategory.name, "", "");
+                        setDraggingProduct(null);
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all cursor-pointer border ${
+                        dragOverTargetId === `direct_${selectedCategory.id}`
+                          ? "bg-emerald-500/25 border-emerald-400 text-emerald-200 ring-2 ring-emerald-400/50 scale-105"
+                          : "bg-white/[0.04] hover:bg-white/[0.08] border-white/10 text-zinc-300"
+                      }`}
+                    >
+                      Direct in {selectedCategory.name} (No Subcategory)
+                    </button>
+
+                    {/* Drop Targets: Sibling Subcategories */}
+                    {currentSubcategories.map((sub) => {
+                      const isCurrent = sub.id === selectedSubcategory.id;
+                      const isDropTarget = dragOverTargetId === `subpill_${sub.id}`;
+                      return (
+                        <button
+                          key={sub.id}
+                          type="button"
+                          onClick={() => setSelectedSubcategory(sub)}
+                          onDragOver={(e) => {
+                            if (!draggingProduct || isCurrent) return;
+                            e.preventDefault();
+                            setDragOverTargetId(`subpill_${sub.id}`);
+                          }}
+                          onDragLeave={() => setDragOverTargetId(null)}
+                          onDrop={(e) => {
+                            if (!draggingProduct || isCurrent) return;
+                            e.preventDefault();
+                            setDragOverTargetId(null);
+                            handleMoveProduct(
+                              draggingProduct,
+                              selectedCategory.id,
+                              selectedCategory.name,
+                              sub.id,
+                              sub.name
+                            );
+                            setDraggingProduct(null);
+                          }}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all cursor-pointer border ${
+                            isCurrent
+                              ? "bg-indigo-500/20 border-indigo-500/40 text-indigo-200 font-semibold"
+                              : isDropTarget
+                              ? "bg-cyan-500/30 border-cyan-400 text-cyan-100 ring-2 ring-cyan-400/60 scale-105"
+                              : "bg-white/[0.04] hover:bg-white/[0.08] border-white/10 text-zinc-300"
+                          }`}
+                        >
+                          {sub.name} {isCurrent ? "(Current)" : ""}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
                 {/* View Toolbar */}
-                <div className="flex items-center justify-between gap-2 p-2 rounded-xl bg-white/[0.03] border border-white/[0.06]">
-                  <div className="text-xs text-zinc-400 font-medium">
-                    Showing <span className="font-mono text-zinc-200">{currentProducts.length}</span> products in{" "}
-                    <span className="text-white">{selectedSubcategory.name}</span>
+                <div className="flex flex-wrap items-center justify-between gap-2 p-2 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <div className="text-xs text-zinc-400 font-medium">
+                      Showing <span className="font-mono text-zinc-200">{currentProducts.length}</span> products in{" "}
+                      <span className="text-white">{selectedSubcategory.name}</span>
+                    </div>
+                    <span className="px-2.5 py-0.5 rounded-lg bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[11px] font-semibold">
+                      Total Stock: {currentProducts.reduce((sum, p) => sum + getProductTotalStock(p), 0)} pcs (All variations)
+                    </span>
                   </div>
 
                   <div className="flex items-center gap-1.5">
@@ -1039,8 +2166,8 @@ export default function ProductsCatalogPage() {
                         <tr className="border-b border-white/[0.08] bg-white/[0.03] text-zinc-400 text-[10px] uppercase tracking-wider font-semibold">
                           <th className="py-2.5 px-3">Product</th>
                           <th className="py-2.5 px-3">SKU / Barcode</th>
-                          <th className="py-2.5 px-3">Price / Cost</th>
-                          <th className="py-2.5 px-3">Brand / Supplier</th>
+                          <th className="py-2.5 px-3">Price / Cost (LKR)</th>
+                          <th className="py-2.5 px-3">Stocks (Total)</th>
                           <th className="py-2.5 px-3">Unit</th>
                           <th className="py-2.5 px-3">Variants</th>
                           <th className="py-2.5 px-3">Created By</th>
@@ -1048,134 +2175,240 @@ export default function ProductsCatalogPage() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-white/[0.05]">
-                        {currentProducts.map((prod) => (
-                          <tr
-                            key={prod.id}
-                            onClick={() => setActiveDetailProduct(prod)}
-                            className="group hover:bg-white/[0.04] transition-colors cursor-pointer"
-                          >
-                            <td className="py-2.5 px-3">
-                              <div className="flex items-center gap-2.5">
-                                <div className="w-8 h-8 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden shrink-0">
-                                  {prod.images && prod.images.length > 0 ? (
-                                    <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
-                                  ) : (
-                                    <Package className="w-4 h-4 text-zinc-500" />
+                        {currentProducts.map((prod) => {
+                          const totalStock = getProductTotalStock(prod);
+                          const unitLabel = (prod.unit || "pcs").toLowerCase();
+                          const varCount = prod.variants?.length || 0;
+                          return (
+                            <tr
+                              key={prod.id}
+                              draggable={canManage}
+                              onDragStart={() => setDraggingProduct(prod)}
+                              onDragEnd={() => {
+                                setDraggingProduct(null);
+                                setDragOverTargetId(null);
+                              }}
+                              onClick={() => setActiveDetailProduct(prod)}
+                              className="group hover:bg-white/[0.04] transition-colors cursor-pointer"
+                            >
+                              <td className="py-2.5 px-3">
+                                <div className="flex items-center gap-2.5">
+                                  {canManage && (
+                                    <GripVertical className="w-3.5 h-3.5 text-zinc-600 group-hover:text-zinc-400 shrink-0 cursor-grab" />
                                   )}
-                                </div>
-                                <div>
-                                  <div className="font-medium text-white group-hover:text-indigo-300 transition-colors truncate max-w-[200px]">
-                                    {prod.name}
+                                  <div className="w-8 h-8 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden shrink-0">
+                                    {prod.images && prod.images.length > 0 ? (
+                                      <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
+                                    ) : (
+                                      <Package className="w-4 h-4 text-zinc-500" />
+                                    )}
+                                  </div>
+                                  <div>
+                                    <div className="font-semibold text-white uppercase group-hover:text-indigo-300 transition-colors truncate max-w-[200px]">
+                                      {prod.name.toUpperCase()}
+                                    </div>
                                   </div>
                                 </div>
-                              </div>
-                            </td>
+                              </td>
 
-                            <td className="py-2.5 px-3">
-                              <div className="font-mono text-zinc-200">{prod.sku}</div>
-                              {prod.barcode && (
-                                <div className="text-[10px] text-zinc-500 font-mono">{prod.barcode}</div>
-                              )}
-                            </td>
+                              <td className="py-2.5 px-3">
+                                <div className="font-mono text-zinc-200">{prod.sku}</div>
+                                {prod.barcode && (
+                                  <div className="text-[10px] text-zinc-500 font-mono">{prod.barcode}</div>
+                                )}
+                              </td>
 
-                            <td className="py-2.5 px-3">
-                              <div className="font-semibold text-emerald-400 font-mono">
-                                ${prod.sellingPrice.toFixed(2)}
-                              </div>
-                              <div className="text-[10px] text-zinc-500 font-mono">
-                                Cost: ${prod.costPrice.toFixed(2)}
-                              </div>
-                            </td>
+                              <td className="py-2.5 px-3">
+                                <div className="font-semibold text-emerald-400 font-mono">
+                                  {formatLKR(prod.sellingPrice)}
+                                </div>
+                                <div className="text-[10px] text-zinc-500 font-mono">
+                                  Cost: {formatLKR(prod.costPrice)}
+                                </div>
+                              </td>
 
-                            <td className="py-2.5 px-3 text-zinc-300">
-                              <div>{prod.brand || "—"}</div>
-                              <div className="text-[10px] text-zinc-500">{prod.supplier || "—"}</div>
-                            </td>
+                              <td className="py-2.5 px-3">
+                                <div className="flex flex-col items-start gap-0.5">
+                                  <span
+                                    className={`px-2 py-0.5 rounded-md font-mono font-semibold text-[11px] border ${
+                                      totalStock <= 0
+                                        ? "bg-red-500/15 text-red-300 border-red-500/30"
+                                        : totalStock <= (prod.minStockLevel || 5)
+                                        ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                                        : "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                                    }`}
+                                  >
+                                    {totalStock} {unitLabel} in stock
+                                  </span>
+                                  <span className="text-[10px] text-zinc-500">
+                                    {varCount > 0
+                                      ? `Total across ${varCount} variation${varCount > 1 ? "s" : ""}`
+                                      : "Total stock"}
+                                  </span>
+                                </div>
+                              </td>
 
-                            <td className="py-2.5 px-3">
-                              <span className="px-1.5 py-0.5 rounded bg-white/[0.06] text-zinc-300 text-[10px] uppercase font-mono">
-                                {prod.unit}
-                              </span>
-                            </td>
-
-                            <td className="py-2.5 px-3">
-                              {prod.hasVariants && prod.variants && prod.variants.length > 0 ? (
-                                <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px] font-mono border border-indigo-500/30">
-                                  {prod.variants.length} vars
+                              <td className="py-2.5 px-3">
+                                <span className="px-1.5 py-0.5 rounded bg-white/[0.06] text-zinc-300 text-[10px] uppercase font-mono">
+                                  {prod.unit}
                                 </span>
-                              ) : (
-                                <span className="text-zinc-600 text-[11px]">—</span>
-                              )}
-                            </td>
+                              </td>
 
-                            <td className="py-2.5 px-3">
-                              <div className="text-zinc-300 font-medium">@{prod.createdBy?.username || "admin"}</div>
-                              <div className="text-[10px] text-zinc-500">
-                                {new Date(prod.createdAt).toLocaleDateString()}
-                              </div>
-                            </td>
+                              <td className="py-2.5 px-3">
+                                {prod.hasVariants && prod.variants && prod.variants.length > 0 ? (
+                                  <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px] font-mono border border-indigo-500/30">
+                                    {prod.variants.length} vars
+                                  </span>
+                                ) : (
+                                  <span className="text-zinc-600 text-[11px]">—</span>
+                                )}
+                              </td>
 
-                            <td className="py-2.5 px-3 text-right">
-                              <div className="flex items-center justify-end gap-1">
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setActiveDetailProduct(prod);
-                                  }}
-                                  className="p-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white cursor-pointer"
-                                  title="Details"
-                                >
-                                  <Info className="w-3.5 h-3.5" />
-                                </button>
-                                {canManage && (
+                              <td className="py-2.5 px-3">
+                                <div className="text-zinc-300 font-medium">@{prod.createdBy?.username || "admin"}</div>
+                                <div className="text-[10px] text-zinc-500">
+                                  {new Date(prod.createdAt).toLocaleDateString()}
+                                </div>
+                              </td>
+
+                              <td className="py-2.5 px-3 text-right">
+                                <div className="flex items-center justify-end gap-1">
+                                  {canManage && (
+                                    <>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setMovingProduct(prod);
+                                        }}
+                                        className="p-1 rounded bg-cyan-500/10 hover:bg-cyan-500/25 text-cyan-300 hover:text-cyan-200 cursor-pointer"
+                                        title="Move Product to Another Subcategory or Main Category"
+                                      >
+                                        <FolderInput className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setEditingProduct(prod);
+                                        }}
+                                        className="p-1 rounded bg-indigo-500/10 hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-200 cursor-pointer"
+                                        title="Edit Product Details"
+                                      >
+                                        <Pencil className="w-3.5 h-3.5" />
+                                      </button>
+                                    </>
+                                  )}
                                   <button
                                     type="button"
-                                    onClick={(e) => handleDeleteProduct(prod, e)}
-                                    className="p-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-red-300 cursor-pointer"
-                                    title="Delete"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setActiveDetailProduct(prod);
+                                    }}
+                                    className="p-1 rounded bg-white/[0.05] hover:bg-white/[0.1] text-zinc-400 hover:text-white cursor-pointer"
+                                    title="Details"
                                   >
-                                    <Trash2 className="w-3.5 h-3.5" />
+                                    <Info className="w-3.5 h-3.5" />
                                   </button>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
+                                  {canManage && (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => handleDeleteProduct(prod, e)}
+                                      className="p-1 rounded bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-red-300 cursor-pointer"
+                                      title="Delete"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
+                      <tfoot className="border-t border-white/[0.1] bg-white/[0.04] text-xs font-semibold">
+                        <tr>
+                          <td colSpan={3} className="py-2.5 px-3 text-zinc-300 uppercase tracking-wider text-[10px]">
+                            Total Stock in {selectedSubcategory.name} (Includes All Variations)
+                          </td>
+                          <td colSpan={5} className="py-2.5 px-3 font-mono text-emerald-400 font-bold">
+                            {currentProducts.reduce((sum, p) => sum + getProductTotalStock(p), 0)} pcs in stock
+                          </td>
+                        </tr>
+                      </tfoot>
                     </table>
                   </div>
                 ) : (
                   <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
-                    {currentProducts.map((prod) => (
-                      <div
-                        key={prod.id}
-                        onClick={() => setActiveDetailProduct(prod)}
-                        className="group flex flex-col justify-between p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.07] border border-white/[0.06] transition-all cursor-pointer hover:-translate-y-0.5"
-                      >
-                        <div>
-                          <div className="w-full h-24 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden mb-2">
-                            {prod.images && prod.images.length > 0 ? (
-                              <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
-                            ) : (
-                              <Package className="w-6 h-6 text-zinc-600" />
-                            )}
+                    {currentProducts.map((prod) => {
+                      const totalStock = getProductTotalStock(prod);
+                      const unitLabel = (prod.unit || "pcs").toLowerCase();
+                      return (
+                        <div
+                          key={prod.id}
+                          draggable={canManage}
+                          onDragStart={() => setDraggingProduct(prod)}
+                          onDragEnd={() => {
+                            setDraggingProduct(null);
+                            setDragOverTargetId(null);
+                          }}
+                          onClick={() => setActiveDetailProduct(prod)}
+                          className="group flex flex-col justify-between p-2.5 rounded-xl bg-white/[0.03] hover:bg-white/[0.07] border border-white/[0.06] transition-all cursor-pointer hover:-translate-y-0.5"
+                        >
+                          <div>
+                            <div className="w-full h-24 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center overflow-hidden mb-2">
+                              {prod.images && prod.images.length > 0 ? (
+                                <img src={prod.images[0]} alt={prod.name} className="w-full h-full object-cover" />
+                              ) : (
+                                <Package className="w-6 h-6 text-zinc-600" />
+                              )}
+                            </div>
+                            <div className="text-[10px] font-mono text-emerald-300 font-semibold">
+                              {totalStock} {unitLabel} in stock
+                            </div>
+                            <h4 className="text-xs font-semibold text-white uppercase group-hover:text-indigo-300 transition-colors truncate mt-0.5">
+                              {prod.name.toUpperCase()}
+                            </h4>
+                            <div className="text-[10px] font-mono text-zinc-400">SKU: {prod.sku}</div>
                           </div>
-                          <div className="text-[9px] text-zinc-400 uppercase font-semibold">{prod.brand || "—"}</div>
-                          <h4 className="text-xs font-semibold text-white group-hover:text-indigo-300 transition-colors truncate">
-                            {prod.name}
-                          </h4>
-                          <div className="text-[10px] font-mono text-zinc-400">SKU: {prod.sku}</div>
-                        </div>
 
-                        <div className="mt-2 pt-1.5 border-t border-white/[0.05] flex items-center justify-between">
-                          <div className="text-xs font-bold text-emerald-400 font-mono">
-                            ${prod.sellingPrice.toFixed(2)}
+                          <div className="mt-2 pt-1.5 border-t border-white/[0.05] flex items-center justify-between">
+                            <div className="text-xs font-bold text-emerald-400 font-mono">
+                              {formatLKR(prod.sellingPrice)}
+                            </div>
+                            <div className="flex items-center gap-1">
+                              {canManage && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setMovingProduct(prod);
+                                    }}
+                                    className="p-1 rounded bg-cyan-500/15 hover:bg-cyan-500/30 text-cyan-300 cursor-pointer"
+                                    title="Move Product"
+                                  >
+                                    <FolderInput className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setEditingProduct(prod);
+                                    }}
+                                    className="p-1 rounded bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 cursor-pointer"
+                                    title="Edit Product"
+                                  >
+                                    <Pencil className="w-3 h-3" />
+                                  </button>
+                                </>
+                              )}
+                              <span className="text-[9px] text-zinc-500">@{prod.createdBy?.username || "staff"}</span>
+                            </div>
                           </div>
-                          <div className="text-[9px] text-zinc-500">@{prod.createdBy?.username || "staff"}</div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1191,7 +2424,11 @@ export default function ProductsCatalogPage() {
         <AddCategoryModal
           onClose={() => setIsAddCategoryOpen(false)}
           onSubmit={async (input) => {
-            await createCategory(shop.shopId, auditUser, input);
+            await createCategory(shop.shopId, auditUser, {
+              ...input,
+              branchId: effectiveBranchId,
+              branchName: activeBranchName,
+            });
             setIsAddCategoryOpen(false);
             await loadData(true);
           }}
@@ -1206,7 +2443,11 @@ export default function ProductsCatalogPage() {
           parentCategory={selectedCategory}
           onClose={() => setIsAddSubcategoryOpen(false)}
           onSubmit={async (input) => {
-            await createSubcategory(shop.shopId, auditUser, input);
+            await createSubcategory(shop.shopId, auditUser, {
+              ...input,
+              branchId: selectedCategory.branchId || effectiveBranchId,
+              branchName: selectedCategory.branchName || activeBranchName,
+            });
             setIsAddSubcategoryOpen(false);
             await loadData(true);
           }}
@@ -1214,23 +2455,106 @@ export default function ProductsCatalogPage() {
       )}
 
       {/* ========================================================================= */}
-      {/* MODAL 3: ADD PRODUCT (VARIANTS, BRANDS/SUPPLIERS IN-PLACE, AUTO CODES)    */}
+      {/* MODAL 3: ADD PRODUCT (IN SUBCATEGORY OR DIRECT IN MAIN CATEGORY)          */}
       {/* ========================================================================= */}
-      {isAddProductOpen && selectedCategory && selectedSubcategory && (
+      {isAddProductOpen && selectedCategory && (
         <AddProductModal
           shopId={shop.shopId}
           auditUser={auditUser}
           category={selectedCategory}
           subcategory={selectedSubcategory}
+          availableSubcategories={currentSubcategories}
           brands={brands}
           suppliers={suppliers}
           onBrandCreated={(newBrand) => setBrands((prev) => [...prev, newBrand])}
           onSupplierCreated={(newSup) => setSuppliers((prev) => [...prev, newSup])}
           onClose={() => setIsAddProductOpen(false)}
           onSubmit={async (input) => {
-            await createProduct(shop.shopId, auditUser, input);
+            await createProduct(shop.shopId, auditUser, {
+              ...input,
+              branchId: selectedCategory.branchId || effectiveBranchId,
+              branchName: selectedCategory.branchName || activeBranchName,
+            });
             setIsAddProductOpen(false);
             await loadData(true);
+          }}
+        />
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 4: QUICK PRODUCT (GOES UNDER COMMON CATEGORY, NO SUBCATEGORY)       */}
+      {/* ========================================================================= */}
+      {isQuickProductOpen && (
+        <AddProductModal
+          shopId={shop.shopId}
+          auditUser={auditUser}
+          isQuickProduct
+          brands={brands}
+          suppliers={suppliers}
+          onBrandCreated={(newBrand) => setBrands((prev) => [...prev, newBrand])}
+          onSupplierCreated={(newSup) => setSuppliers((prev) => [...prev, newSup])}
+          onClose={() => setIsQuickProductOpen(false)}
+          onSubmit={async (input) => {
+            const commonCat = await ensureCommonCategory(shop.shopId, auditUser, effectiveBranchId);
+            await createProduct(shop.shopId, auditUser, {
+              ...input,
+              branchId: effectiveBranchId,
+              branchName: activeBranchName,
+              categoryId: commonCat.id,
+              categoryName: commonCat.name,
+              subcategoryId: "",
+              subcategoryName: "",
+            });
+            setIsQuickProductOpen(false);
+            await loadData(true);
+          }}
+        />
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 5: EDIT PRODUCT DETAILS                                             */}
+      {/* ========================================================================= */}
+      {editingProduct && (
+        <AddProductModal
+          shopId={shop.shopId}
+          auditUser={auditUser}
+          initialProduct={editingProduct}
+          availableSubcategories={subcategories.filter((s) => s.categoryId === editingProduct.categoryId)}
+          brands={brands}
+          suppliers={suppliers}
+          onBrandCreated={(newBrand) => setBrands((prev) => [...prev, newBrand])}
+          onSupplierCreated={(newSup) => setSuppliers((prev) => [...prev, newSup])}
+          onClose={() => setEditingProduct(null)}
+          onSubmit={async (input) => {
+            await updateProduct(shop.shopId, editingProduct.id, auditUser, {
+              ...input,
+              branchId: editingProduct.branchId || effectiveBranchId,
+              branchName: editingProduct.branchName || activeBranchName,
+            });
+            setEditingProduct(null);
+            await loadData(true);
+          }}
+        />
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 6: MOVE PRODUCT TO ANY SUBCATEGORY / MAIN CATEGORY                  */}
+      {/* ========================================================================= */}
+      {movingProduct && (
+        <MoveProductModal
+          product={movingProduct}
+          categories={categories}
+          subcategories={subcategories}
+          onClose={() => setMovingProduct(null)}
+          onMove={async (targetCategoryId, targetCategoryName, targetSubcategoryId, targetSubcategoryName) => {
+            await handleMoveProduct(
+              movingProduct,
+              targetCategoryId,
+              targetCategoryName,
+              targetSubcategoryId,
+              targetSubcategoryName
+            );
+            setMovingProduct(null);
           }}
         />
       )}
@@ -1243,6 +2567,16 @@ export default function ProductsCatalogPage() {
           product={activeDetailProduct}
           canManage={canManage}
           onClose={() => setActiveDetailProduct(null)}
+          onEdit={() => {
+            const prodToEdit = activeDetailProduct;
+            setActiveDetailProduct(null);
+            setEditingProduct(prodToEdit);
+          }}
+          onMove={() => {
+            const prodToMove = activeDetailProduct;
+            setActiveDetailProduct(null);
+            setMovingProduct(prodToMove);
+          }}
           onDelete={async () => {
             await handleDeleteProduct(activeDetailProduct, { stopPropagation: () => {} } as React.MouseEvent);
           }}
@@ -1453,13 +2787,16 @@ function AddSubcategoryModal({
 }
 
 // =============================================================================
-// MODAL: ADD PRODUCT (VARIANTS, IN-PLACE BRANDS/SUPPLIERS, AUTO SKU & BARCODE)
+// MODAL: ADD / EDIT / QUICK PRODUCT
 // =============================================================================
 function AddProductModal({
   shopId,
   auditUser,
   category,
   subcategory,
+  availableSubcategories = [],
+  isQuickProduct = false,
+  initialProduct = null,
   brands,
   suppliers,
   onBrandCreated,
@@ -1469,8 +2806,11 @@ function AddProductModal({
 }: {
   shopId: string;
   auditUser: AuditUser;
-  category: Category;
-  subcategory: Subcategory;
+  category?: Category | null;
+  subcategory?: Subcategory | null;
+  availableSubcategories?: Subcategory[];
+  isQuickProduct?: boolean;
+  initialProduct?: ProductItem | null;
   brands: Brand[];
   suppliers: Supplier[];
   onBrandCreated: (b: Brand) => void;
@@ -1479,33 +2819,59 @@ function AddProductModal({
   onSubmit: (input: CreateProductInput) => Promise<void>;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const isEditMode = Boolean(initialProduct);
 
-  // Auto-generate SKU on open
-  const [sku, setSku] = useState(() => generateUniqueSKU());
-  const [barcode, setBarcode] = useState("");
-  const [name, setName] = useState("");
-  const [sellingPrice, setSellingPrice] = useState("");
-  const [costPrice, setCostPrice] = useState("");
-  const [unit, setUnit] = useState("pcs");
-  const [description, setDescription] = useState(""); // Optional
-  const [stockQuantity, setStockQuantity] = useState("50");
+  // Initialize from initialProduct if editing, otherwise auto-generate SKU
+  const [sku, setSku] = useState(() => initialProduct?.sku || generateUniqueSKU());
+  const [barcode, setBarcode] = useState(() => initialProduct?.barcode || "");
+  const [name, setName] = useState(() => (initialProduct?.name || "").toUpperCase());
+  const [sellingPrice, setSellingPrice] = useState(() =>
+    initialProduct ? String(initialProduct.sellingPrice ?? 0) : ""
+  );
+  const [costPrice, setCostPrice] = useState(() =>
+    initialProduct ? String(initialProduct.costPrice ?? 0) : ""
+  );
+  const [unit, setUnit] = useState(() => initialProduct?.unit || "pcs");
+  const [description, setDescription] = useState(() => initialProduct?.description || "");
+  const [stockQuantity, setStockQuantity] = useState(() =>
+    initialProduct ? String(initialProduct.stockQuantity ?? 0) : "50"
+  );
+  const [minStockLevel, setMinStockLevel] = useState(() =>
+    initialProduct ? String(initialProduct.minStockLevel ?? 5) : "5"
+  );
+
+  // Subcategory placement (optional — allows creating directly in Main Category or inside any Subcategory)
+  const [selectedSubcategoryId, setSelectedSubcategoryId] = useState(() =>
+    initialProduct ? initialProduct.subcategoryId || "" : subcategory?.id || ""
+  );
 
   // Brands (with in-place creation)
-  const [selectedBrand, setSelectedBrand] = useState("");
+  const [selectedBrand, setSelectedBrand] = useState(() => initialProduct?.brand || "");
   const [isCreatingBrand, setIsCreatingBrand] = useState(false);
   const [newBrandName, setNewBrandName] = useState("");
 
   // Suppliers (with in-place creation)
-  const [selectedSupplier, setSelectedSupplier] = useState("");
+  const [selectedSupplier, setSelectedSupplier] = useState(() => initialProduct?.supplier || "");
   const [isCreatingSupplier, setIsCreatingSupplier] = useState(false);
   const [newSupplierName, setNewSupplierName] = useState("");
 
-  // Variants System (Size & Color)
-  const [hasVariants, setHasVariants] = useState(false);
-  const [variants, setVariants] = useState<ProductVariant[]>([]);
+  // Variants System (Size & Color, each with its own Selling Price & Cost Price)
+  const [hasVariants, setHasVariants] = useState(() =>
+    Boolean(initialProduct?.hasVariants || (initialProduct?.variants && initialProduct.variants.length > 0))
+  );
+  const [variants, setVariants] = useState<ProductVariant[]>(() =>
+    initialProduct?.variants
+      ? initialProduct.variants.map((v) => ({
+          ...v,
+          costPrice: v.costPrice ?? initialProduct.costPrice ?? 0,
+        }))
+      : []
+  );
 
   // Images
-  const [uploadedImages, setUploadedImages] = useState<string[]>([]);
+  const [uploadedImages, setUploadedImages] = useState<string[]>(() =>
+    initialProduct?.images ? [...initialProduct.images] : []
+  );
   const [isUploadingImage, setIsUploadingImage] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -1547,7 +2913,7 @@ function AddProductModal({
     }
   };
 
-  // Add Variant Row
+  // Add Variant Row (each variation has its own one-to-one Selling Price & Cost Price)
   const handleAddVariant = () => {
     const defaultSelling = Number(sellingPrice) || 0;
     const defaultCost = Number(costPrice) || 0;
@@ -1602,12 +2968,29 @@ function AddProductModal({
         ? variants.reduce((sum, v) => sum + (Number(v.stockQuantity) || 0), 0)
         : Number(stockQuantity) || 0;
 
+      const resolvedCategoryId = initialProduct
+        ? initialProduct.categoryId
+        : category?.id || "cat_common";
+      const resolvedCategoryName = initialProduct
+        ? initialProduct.categoryName || "Common"
+        : category?.name || "Common";
+
+      const matchedSub = availableSubcategories.find((s) => s.id === selectedSubcategoryId);
+      const resolvedSubcategoryId = isQuickProduct
+        ? ""
+        : selectedSubcategoryId || "";
+      const resolvedSubcategoryName = isQuickProduct
+        ? ""
+        : selectedSubcategoryId
+        ? matchedSub?.name || subcategory?.name || initialProduct?.subcategoryName || ""
+        : "";
+
       await onSubmit({
-        categoryId: category.id,
-        categoryName: category.name,
-        subcategoryId: subcategory.id,
-        subcategoryName: subcategory.name,
-        name: name.trim(),
+        categoryId: resolvedCategoryId,
+        categoryName: resolvedCategoryName,
+        subcategoryId: resolvedSubcategoryId,
+        subcategoryName: resolvedSubcategoryName,
+        name: name.trim().toUpperCase(),
         sku: sku.trim().toUpperCase(),
         barcode: barcode.trim() || undefined,
         sellingPrice: Number(sellingPrice) || 0,
@@ -1617,24 +3000,57 @@ function AddProductModal({
         supplier: selectedSupplier.trim(),
         description: description.trim(), // Optional!
         hasVariants,
-        variants: hasVariants ? variants : [],
+        variants: hasVariants
+          ? variants.map((v) => ({
+              ...v,
+              sellingPrice: Number(v.sellingPrice) || 0,
+              costPrice: Number(v.costPrice) || 0,
+              stockQuantity: Number(v.stockQuantity) || 0,
+            }))
+          : [],
         stockQuantity: totalVariantStock,
+        minStockLevel: Number(minStockLevel) || 5,
         images: uploadedImages,
       });
     } catch (e) {
-      alert("Failed to create product");
+      alert(isEditMode ? "Failed to update product details" : "Failed to create product");
       setIsSubmitting(false);
     }
   };
 
+  const activeCategoryLabel = initialProduct?.categoryName || category?.name || "Common";
+
   return (
     <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
-      <div className="w-full max-w-2xl rounded-2xl bg-[#0f111a] border border-white/10 p-5 shadow-2xl flex flex-col gap-4 my-6">
+      <div className="w-full max-w-3xl rounded-2xl bg-[#0f111a] border border-white/10 p-5 shadow-2xl flex flex-col gap-4 my-6">
         <div className="flex items-center justify-between">
           <div>
-            <h3 className="text-sm font-bold text-white">Add Product</h3>
+            <h3 className="text-sm font-bold text-white">
+              {isEditMode
+                ? "Edit Product Details"
+                : isQuickProduct
+                ? "Create Quick Product"
+                : "Add Product"}
+            </h3>
             <p className="text-[11px] text-zinc-400">
-              {category.name} &rarr; <span className="text-emerald-400">{subcategory.name}</span>
+              {isQuickProduct ? (
+                <span>
+                  Listed directly under <span className="text-amber-300 font-semibold">Common Category</span>{" "}
+                  (No subcategory needed)
+                </span>
+              ) : (
+                <>
+                  <span>{activeCategoryLabel}</span> &rarr;{" "}
+                  <span className="text-emerald-400 font-medium">
+                    {selectedSubcategoryId
+                      ? availableSubcategories.find((s) => s.id === selectedSubcategoryId)?.name ||
+                        subcategory?.name ||
+                        initialProduct?.subcategoryName ||
+                        "Subcategory"
+                      : `Direct in ${activeCategoryLabel} (No Subcategory)`}
+                  </span>
+                </>
+              )}
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-zinc-400 hover:text-white">
@@ -1643,17 +3059,41 @@ function AddProductModal({
         </div>
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-3.5 text-xs">
-          {/* Product Name */}
-          <div>
-            <label className="block text-zinc-300 font-medium mb-1">Product Name *</label>
-            <input
-              type="text"
-              required
-              placeholder="e.g. iPhone 15 Pro 256GB"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="w-full px-3 py-2 rounded-xl bg-white/[0.05] border border-white/[0.09] text-white focus:border-emerald-500 outline-hidden"
-            />
+          {/* Product Name (Always UPPERCASE) & Optional Subcategory Selector */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className={isQuickProduct ? "sm:col-span-3" : "sm:col-span-2"}>
+              <label className="block text-zinc-300 font-medium mb-1">
+                Product Name (UPPERCASE) *
+              </label>
+              <input
+                type="text"
+                required
+                placeholder="E.G. IPHONE 15 PRO 256GB"
+                value={name}
+                onChange={(e) => setName(e.target.value.toUpperCase())}
+                className="w-full px-3 py-2 rounded-xl bg-white/[0.05] border border-white/[0.09] text-white font-semibold uppercase focus:border-emerald-500 outline-hidden"
+              />
+            </div>
+
+            {!isQuickProduct && (
+              <div>
+                <label className="block text-zinc-300 font-medium mb-1">
+                  Placement in {activeCategoryLabel}
+                </label>
+                <select
+                  value={selectedSubcategoryId}
+                  onChange={(e) => setSelectedSubcategoryId(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-[#141624] border border-white/[0.09] text-white focus:border-emerald-500 outline-hidden"
+                >
+                  <option value="">Direct in {activeCategoryLabel} (No Subcategory)</option>
+                  {availableSubcategories.map((sub) => (
+                    <option key={sub.id} value={sub.id}>
+                      Subcategory: {sub.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           {/* Auto SKU & Barcode Options */}
@@ -1702,10 +3142,10 @@ function AddProductModal({
             </div>
           </div>
 
-          {/* Pricing & Unit */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {/* Pricing, Stock, Minimum Stock Alert & Unit */}
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             <div>
-              <label className="block text-zinc-300 font-medium mb-1">Selling Price ($) *</label>
+              <label className="block text-zinc-300 font-medium mb-1">Selling Price (LKR) *</label>
               <input
                 type="number"
                 step="0.01"
@@ -1718,7 +3158,7 @@ function AddProductModal({
             </div>
 
             <div>
-              <label className="block text-zinc-300 font-medium mb-1">Cost Price ($) *</label>
+              <label className="block text-zinc-300 font-medium mb-1">Cost Price (LKR) *</label>
               <input
                 type="number"
                 step="0.01"
@@ -1731,6 +3171,39 @@ function AddProductModal({
             </div>
 
             <div>
+              <label className="block text-zinc-300 font-medium mb-1">
+                {hasVariants ? "Total Variant Stock" : "Initial Stock *"}
+              </label>
+              <input
+                type="number"
+                min="0"
+                disabled={hasVariants}
+                value={
+                  hasVariants
+                    ? variants.reduce((sum, v) => sum + (Number(v.stockQuantity) || 0), 0)
+                    : stockQuantity
+                }
+                onChange={(e) => setStockQuantity(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-white/[0.05] border border-white/[0.09] text-white font-mono focus:border-emerald-500 outline-hidden disabled:opacity-60"
+              />
+            </div>
+
+            <div>
+              <label className="block text-amber-300 font-medium mb-1" title="Low stock warning threshold">
+                Min Stock Alert *
+              </label>
+              <input
+                type="number"
+                min="0"
+                required
+                placeholder="5"
+                value={minStockLevel}
+                onChange={(e) => setMinStockLevel(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-amber-500/[0.06] border border-amber-500/30 text-amber-300 font-mono font-semibold focus:border-amber-400 outline-hidden"
+              />
+            </div>
+
+            <div className="col-span-2 sm:col-span-1">
               <label className="block text-zinc-300 font-medium mb-1">Unit</label>
               <select
                 value={unit}
@@ -1865,7 +3338,7 @@ function AddProductModal({
             />
           </div>
 
-          {/* PRODUCT VARIANTS (SIZE & COLOR) */}
+          {/* PRODUCT VARIANTS (SIZE & COLOR — WITH INDIVIDUAL ONE-TO-ONE SELLING PRICE & COST PRICE) */}
           <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.08] flex flex-col gap-2.5">
             <div className="flex items-center justify-between">
               <label className="flex items-center gap-2 cursor-pointer">
@@ -1881,7 +3354,7 @@ function AddProductModal({
                   className="rounded border-white/20 text-indigo-600 focus:ring-indigo-500"
                 />
                 <span className="text-xs font-semibold text-white">
-                  Enable Variants (Size & Color)
+                  Enable Variants (Size, Color, Individual Selling Price &amp; Cost Price)
                 </span>
               </label>
 
@@ -1899,10 +3372,10 @@ function AddProductModal({
 
             {hasVariants && (
               <div className="flex flex-col gap-2 mt-1">
-                {variants.map((v, i) => (
+                {variants.map((v) => (
                   <div
                     key={v.id}
-                    className="p-2.5 rounded-lg bg-white/[0.03] border border-white/[0.06] grid grid-cols-2 sm:grid-cols-7 gap-2 items-center"
+                    className="p-2.5 rounded-lg bg-white/[0.03] border border-white/[0.06] grid grid-cols-2 sm:grid-cols-8 gap-2 items-center"
                   >
                     <div>
                       <span className="block text-[10px] text-zinc-400 mb-0.5">Size</span>
@@ -1947,13 +3420,24 @@ function AddProductModal({
                     </div>
 
                     <div>
-                      <span className="block text-[10px] text-zinc-400 mb-0.5">Price ($)</span>
+                      <span className="block text-[10px] text-emerald-400 mb-0.5 font-medium">Price (LKR)</span>
                       <input
                         type="number"
                         step="0.01"
                         value={v.sellingPrice}
                         onChange={(e) => handleUpdateVariant(v.id, "sellingPrice", Number(e.target.value))}
                         className="w-full px-2 py-1 rounded bg-black/40 border border-white/10 text-emerald-400 font-mono text-[11px] outline-hidden"
+                      />
+                    </div>
+
+                    <div>
+                      <span className="block text-[10px] text-amber-300 mb-0.5 font-medium">Cost (LKR)</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={v.costPrice ?? 0}
+                        onChange={(e) => handleUpdateVariant(v.id, "costPrice", Number(e.target.value))}
+                        className="w-full px-2 py-1 rounded bg-black/40 border border-amber-500/25 text-amber-200 font-mono text-[11px] outline-hidden"
                       />
                     </div>
 
@@ -2042,10 +3526,186 @@ function AddProductModal({
               disabled={isSubmitting || !name.trim() || !sku.trim()}
               className="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
             >
-              {isSubmitting ? "Saving..." : "Save Product"}
+              {isSubmitting
+                ? "Saving..."
+                : isEditMode
+                ? "Update Product Details"
+                : isQuickProduct
+                ? "Save Quick Product"
+                : "Save Product"}
             </button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// MODAL: MOVE PRODUCT TO ANY SUBCATEGORY OR MAIN CATEGORY
+// =============================================================================
+function MoveProductModal({
+  product,
+  categories,
+  subcategories,
+  onClose,
+  onMove,
+}: {
+  product: ProductItem;
+  categories: Category[];
+  subcategories: Subcategory[];
+  onClose: () => void;
+  onMove: (
+    targetCategoryId: string,
+    targetCategoryName: string,
+    targetSubcategoryId: string,
+    targetSubcategoryName: string
+  ) => Promise<void>;
+}) {
+  const [targetCategoryId, setTargetCategoryId] = useState(product.categoryId || "");
+  const [targetSubcategoryId, setTargetSubcategoryId] = useState(product.subcategoryId || "");
+  const [isMoving, setIsMoving] = useState(false);
+
+  const selectedCategoryObj = categories.find((c) => c.id === targetCategoryId) || {
+    id: product.categoryId,
+    name: product.categoryName || "Common",
+  };
+
+  const categorySubcategories = subcategories.filter((s) => s.categoryId === targetCategoryId);
+
+  const handleConfirmMove = async (subId: string, subName: string) => {
+    setIsMoving(true);
+    try {
+      await onMove(
+        selectedCategoryObj.id,
+        selectedCategoryObj.name,
+        subId,
+        subName
+      );
+    } finally {
+      setIsMoving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-xs flex items-center justify-center p-4">
+      <div className="w-full max-w-md rounded-2xl bg-[#0f111a] border border-white/10 p-5 shadow-2xl flex flex-col gap-4 text-xs">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-1.5">
+              <FolderInput className="w-4 h-4 text-cyan-400" />
+              <span>Move Product</span>
+            </h3>
+            <p className="text-[11px] text-zinc-400 mt-0.5 uppercase font-semibold">
+              {product.name.toUpperCase()}
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="text-zinc-400 hover:text-white">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Main Category Selector */}
+        <div>
+          <label className="block text-zinc-300 font-medium mb-1">Main Category</label>
+          <select
+            value={targetCategoryId}
+            onChange={(e) => {
+              setTargetCategoryId(e.target.value);
+              setTargetSubcategoryId("");
+            }}
+            className="w-full px-3 py-2 rounded-xl bg-[#141624] border border-white/[0.09] text-white focus:border-cyan-500 outline-hidden"
+          >
+            {!categories.some((c) => c.id === product.categoryId) && (
+              <option value={product.categoryId}>{product.categoryName || "Common"}</option>
+            )}
+            {categories.map((cat) => (
+              <option key={cat.id} value={cat.id}>
+                {cat.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Subcategory Destinations inside Main Category */}
+        <div className="flex flex-col gap-2">
+          <label className="block text-zinc-300 font-medium">
+            Select Destination in <span className="text-cyan-300">{selectedCategoryObj.name}</span>
+          </label>
+
+          {/* Option 1: Direct in Main Category (No Subcategory) */}
+          <button
+            type="button"
+            disabled={isMoving}
+            onClick={() => setTargetSubcategoryId("")}
+            className={`w-full text-left p-2.5 rounded-xl border transition-all flex items-center justify-between cursor-pointer ${
+              targetSubcategoryId === ""
+                ? "bg-emerald-500/15 border-emerald-500/50 text-emerald-200 font-semibold"
+                : "bg-white/[0.03] hover:bg-white/[0.06] border-white/[0.08] text-zinc-300"
+            }`}
+          >
+            <div>
+              <div className="text-xs">Direct in {selectedCategoryObj.name}</div>
+              <div className="text-[10px] text-zinc-400 font-normal">
+                No subcategory — listed directly under {selectedCategoryObj.name}
+              </div>
+            </div>
+            {targetSubcategoryId === "" && <Check className="w-4 h-4 text-emerald-400 shrink-0" />}
+          </button>
+
+          {/* Option 2..N: Subcategories within Main Category */}
+          {categorySubcategories.length === 0 ? (
+            <div className="p-3 rounded-xl bg-white/[0.02] border border-dashed border-white/10 text-zinc-500 text-center text-[11px]">
+              No subcategories in {selectedCategoryObj.name}. Product will be placed directly in {selectedCategoryObj.name}.
+            </div>
+          ) : (
+            <div className="max-h-52 overflow-y-auto flex flex-col gap-1.5 pr-1">
+              {categorySubcategories.map((sub) => {
+                const isSelected = targetSubcategoryId === sub.id;
+                return (
+                  <button
+                    key={sub.id}
+                    type="button"
+                    disabled={isMoving}
+                    onClick={() => setTargetSubcategoryId(sub.id)}
+                    className={`w-full text-left p-2.5 rounded-xl border transition-all flex items-center justify-between cursor-pointer ${
+                      isSelected
+                        ? "bg-cyan-500/15 border-cyan-500/50 text-cyan-200 font-semibold"
+                        : "bg-white/[0.03] hover:bg-white/[0.06] border-white/[0.08] text-zinc-300"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <Box className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                      <span>{sub.name}</span>
+                    </div>
+                    {isSelected && <Check className="w-4 h-4 text-cyan-400 shrink-0" />}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 pt-2 border-t border-white/[0.07]">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-3 py-1.5 rounded-lg bg-white/[0.05] text-zinc-300 text-xs cursor-pointer"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={isMoving}
+            onClick={() => {
+              const chosenSub = categorySubcategories.find((s) => s.id === targetSubcategoryId);
+              handleConfirmMove(targetSubcategoryId, chosenSub?.name || "");
+            }}
+            className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold cursor-pointer disabled:opacity-50"
+          >
+            {isMoving ? "Moving..." : "Move Product Here"}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -2058,16 +3718,19 @@ function ProductDetailDrawer({
   product,
   canManage,
   onClose,
+  onEdit,
+  onMove,
   onDelete,
 }: {
   product: ProductItem;
   canManage: boolean;
   onClose: () => void;
+  onEdit?: () => void;
+  onMove?: () => void;
   onDelete: () => Promise<void>;
 }) {
-  const margin = product.sellingPrice - product.costPrice;
-  const marginPct =
-    product.costPrice > 0 ? ((margin / product.costPrice) * 100).toFixed(1) : "100.0";
+  const totalStock = getProductTotalStock(product);
+  const minAlert = product.minStockLevel ?? 5;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex justify-end">
@@ -2093,39 +3756,52 @@ function ProductDetailDrawer({
 
             <div>
               <div className="text-[10px] font-bold uppercase tracking-wider text-indigo-400">
-                {product.brand} &bull; {product.categoryName} &rarr; {product.subcategoryName}
+                {product.brand ? `${product.brand} • ` : ""}
+                {product.categoryName || "Common"}
+                {product.subcategoryName ? ` → ${product.subcategoryName}` : " (Direct in Main Category)"}
               </div>
-              <h2 className="text-sm font-bold text-white mt-0.5">{product.name}</h2>
+              <h2 className="text-sm font-bold text-white uppercase mt-0.5">
+                {product.name.toUpperCase()}
+              </h2>
               {product.description && <p className="text-xs text-zinc-400 mt-0.5">{product.description}</p>}
             </div>
 
-            {/* Economics */}
-            <div className="grid grid-cols-3 gap-2 p-2.5 rounded-xl bg-white/[0.03] border border-white/[0.06] text-center">
+            {/* Economics & Stock Alert */}
+            <div className="grid grid-cols-4 gap-2 p-2.5 rounded-xl bg-white/[0.03] border border-white/[0.06] text-center">
               <div>
                 <div className="text-[9px] text-zinc-400">Selling Price</div>
                 <div className="text-xs font-bold text-emerald-400 font-mono mt-0.5">
-                  ${product.sellingPrice.toFixed(2)}
+                  {formatLKR(product.sellingPrice)}
                 </div>
               </div>
               <div>
                 <div className="text-[9px] text-zinc-400">Cost Price</div>
                 <div className="text-xs font-bold text-zinc-300 font-mono mt-0.5">
-                  ${product.costPrice.toFixed(2)}
+                  {formatLKR(product.costPrice)}
                 </div>
               </div>
               <div>
-                <div className="text-[9px] text-zinc-400">Margin</div>
+                <div className="text-[9px] text-zinc-400">Total Stock</div>
                 <div className="text-xs font-bold text-indigo-300 font-mono mt-0.5">
-                  +{marginPct}%
+                  {totalStock} {(product.unit || "pcs").toLowerCase()}
+                </div>
+              </div>
+              <div>
+                <div className="text-[9px] text-amber-300">Min Alert</div>
+                <div className="text-xs font-bold text-amber-300 font-mono mt-0.5">
+                  {minAlert} {(product.unit || "pcs").toLowerCase()}
                 </div>
               </div>
             </div>
 
-            {/* Variants table if present */}
+            {/* Variants table if present (shows both Selling Price & individual Cost Price per variation) */}
             {product.hasVariants && product.variants && product.variants.length > 0 && (
               <div className="p-3 rounded-xl bg-white/[0.02] border border-white/[0.06]">
                 <div className="text-[11px] font-semibold text-white mb-1.5 flex items-center justify-between">
                   <span>Product Variants ({product.variants.length})</span>
+                  <span className="font-mono text-emerald-400 text-[10px]">
+                    Total: {totalStock} {(product.unit || "pcs").toLowerCase()}
+                  </span>
                 </div>
                 <div className="divide-y divide-white/[0.05]">
                   {product.variants.map((v) => (
@@ -2139,7 +3815,10 @@ function ProductDetailDrawer({
                         </div>
                       </div>
                       <div className="text-right">
-                        <div className="font-mono text-emerald-400">${v.sellingPrice.toFixed(2)}</div>
+                        <div className="font-mono text-emerald-400">{formatLKR(v.sellingPrice)}</div>
+                        <div className="text-[10px] text-amber-300/90 font-mono">
+                          Cost: {formatLKR(v.costPrice ?? product.costPrice)}
+                        </div>
                         <div className="text-[10px] text-zinc-400">{v.stockQuantity} in stock</div>
                       </div>
                     </div>
@@ -2161,6 +3840,10 @@ function ProductDetailDrawer({
                 </div>
               )}
               <div className="flex justify-between py-0.5 border-b border-white/[0.04]">
+                <span className="text-zinc-400">Minimum Stock Alert</span>
+                <span className="font-mono text-amber-300">{minAlert} {(product.unit || "pcs").toLowerCase()}</span>
+              </div>
+              <div className="flex justify-between py-0.5 border-b border-white/[0.04]">
                 <span className="text-zinc-400">Unit</span>
                 <span className="uppercase text-zinc-200">{product.unit}</span>
               </div>
@@ -2178,7 +3861,7 @@ function ProductDetailDrawer({
             <div className="p-3 rounded-xl bg-indigo-500/[0.05] border border-indigo-500/20 flex flex-col gap-1.5">
               <div className="flex items-center gap-1.5 text-indigo-300 font-semibold text-xs">
                 <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Audit & Provenance Record</span>
+                <span>Audit &amp; Provenance Record</span>
               </div>
               <div className="text-[11px] text-zinc-300">
                 Created by <span className="font-semibold text-white">@{product.createdBy?.username || "cashier"}</span>{" "}
@@ -2190,15 +3873,37 @@ function ProductDetailDrawer({
         </div>
 
         {canManage && (
-          <div className="mt-4 pt-3 border-t border-white/[0.08] flex items-center justify-between">
-            <button
-              type="button"
-              onClick={onDelete}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 text-xs cursor-pointer"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>Delete Product</span>
-            </button>
+          <div className="mt-4 pt-3 border-t border-white/[0.08] flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              {onEdit && (
+                <button
+                  type="button"
+                  onClick={onEdit}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 text-indigo-300 text-xs font-medium cursor-pointer"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>Edit</span>
+                </button>
+              )}
+              {onMove && (
+                <button
+                  type="button"
+                  onClick={onMove}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-300 text-xs font-medium cursor-pointer"
+                >
+                  <FolderInput className="w-3.5 h-3.5" />
+                  <span>Move</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onDelete}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 text-xs cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Delete</span>
+              </button>
+            </div>
             <button
               type="button"
               onClick={onClose}

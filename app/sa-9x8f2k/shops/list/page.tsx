@@ -32,6 +32,8 @@ import {
   Compass,
   ArrowUpDown,
   X,
+  Bell,
+  Send,
 } from "lucide-react";
 import { AppShell } from "@/components/layout/AppShell";
 import { Shop } from "@/lib/types/shop";
@@ -44,6 +46,7 @@ import { EditShopModal } from "@/components/shops/EditShopModal";
 import { DeleteShopModal } from "@/components/shops/DeleteShopModal";
 import { AddShopModal } from "@/components/shops/AddShopModal";
 import { AssignUserModal } from "@/components/shops/AssignUserModal";
+import { SendShopNotificationModal } from "@/components/shops/SendShopNotificationModal";
 import { useLoading } from "@/lib/context/LoadingContext";
 
 type FilterTab = "all" | "active" | "hidden";
@@ -69,6 +72,8 @@ export default function RegisteredShopsPage() {
   const [selectedShopForEdit, setSelectedShopForEdit] = useState<Shop | null>(null);
   const [selectedShopForDelete, setSelectedShopForDelete] = useState<Shop | null>(null);
   const [selectedShopForStaff, setSelectedShopForStaff] = useState<Shop | null>(null);
+  const [selectedShopForMessage, setSelectedShopForMessage] = useState<Shop | null>(null);
+  const [isMessageModalOpen, setIsMessageModalOpen] = useState(false);
   const [isAddShopOpen, setIsAddShopOpen] = useState(false);
 
   // Copied shop ID feedback
@@ -295,6 +300,19 @@ export default function RegisteredShopsPage() {
               </select>
             </div>
 
+            {/* Broadcast / Send Update Button */}
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedShopForMessage(null);
+                setIsMessageModalOpen(true);
+              }}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/35 text-emerald-300 font-medium text-xs transition-all cursor-pointer"
+            >
+              <Bell className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Send Update / Message</span>
+            </button>
+
             {/* Rounded New Shop Button */}
             <button
               type="button"
@@ -476,6 +494,24 @@ export default function RegisteredShopsPage() {
 
                     {/* Action Icon Buttons with Hover Tooltips */}
                     <div className="col-span-3 sm:col-span-1 flex items-center justify-end gap-1">
+                      {/* Send Message / Update Button */}
+                      <div className="relative group/btn">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedShopForMessage(shop);
+                            setIsMessageModalOpen(true);
+                          }}
+                          aria-label="Send Message or Update"
+                          className="p-1.5 rounded-lg text-emerald-400 hover:text-emerald-200 hover:bg-emerald-500/20 transition-all cursor-pointer"
+                        >
+                          <Send className="w-3.5 h-3.5" />
+                        </button>
+                        <div className="pointer-events-none absolute bottom-full mb-1.5 left-1/2 -translate-x-1/2 px-2 py-0.5 rounded-md bg-zinc-900 border border-white/[0.1] text-[10px] text-emerald-300 whitespace-nowrap opacity-0 group-hover/btn:opacity-100 transition-opacity z-30 shadow-xl">
+                          Send message / update
+                        </div>
+                      </div>
+
                       {/* See Button */}
                       <div className="relative group/btn">
                         <button
@@ -573,6 +609,11 @@ export default function RegisteredShopsPage() {
           setSelectedShopForView(null);
           setSelectedShopForStaff(shop);
         }}
+        onSendMessage={(shop) => {
+          setSelectedShopForView(null);
+          setSelectedShopForMessage(shop);
+          setIsMessageModalOpen(true);
+        }}
       />
 
       {/* 2. Edit Option: Edit Modal */}
@@ -617,6 +658,24 @@ export default function RegisteredShopsPage() {
         onUserAssigned={() => {
           addToast("Staff member created and assigned successfully!");
           setSelectedShopForStaff(null);
+        }}
+      />
+
+      {/* 6. Send Shop Notification / Update Modal */}
+      <SendShopNotificationModal
+        isOpen={isMessageModalOpen}
+        targetShop={selectedShopForMessage}
+        allShops={shops}
+        onClose={() => {
+          setIsMessageModalOpen(false);
+          setSelectedShopForMessage(null);
+        }}
+        onSent={(notif) => {
+          addToast(
+            notif.targetType === "all_shops"
+              ? `Broadcast "${notif.title}" sent to all shops!`
+              : `Message "${notif.title}" sent to ${(notif.targetShopNames || notif.targetShopIds).join(", ")}!`
+          );
         }}
       />
     </AppShell>

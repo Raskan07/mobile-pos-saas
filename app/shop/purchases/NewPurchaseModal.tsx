@@ -55,7 +55,8 @@ export default function NewPurchaseModal({
   onClose,
   onCreated,
 }: NewPurchaseModalProps) {
-  const { shop, user } = useShopAuth();
+  const { shop, user, activeBranchId: ctxBranchId } = useShopAuth();
+  const activeBranchId = ctxBranchId || user?.primaryBranchId || "main";
 
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [catalogProducts, setCatalogProducts] = useState<ProductItem[]>([]);
@@ -113,7 +114,10 @@ export default function NewPurchaseModal({
     setLoadingCatalog(true);
     setErrorMsg("");
 
-    Promise.all([getSuppliers(shop.shopId), getProducts(shop.shopId)])
+    Promise.all([
+      getSuppliers(shop.shopId),
+      getProducts(shop.shopId, undefined, undefined, activeBranchId),
+    ])
       .then(([sups, prods]) => {
         setSuppliers(sups);
         setCatalogProducts(prods);
@@ -124,7 +128,7 @@ export default function NewPurchaseModal({
       .finally(() => {
         setLoadingCatalog(false);
       });
-  }, [isOpen, shop?.shopId]);
+  }, [isOpen, shop?.shopId, activeBranchId]);
 
   // Financial calculations
   const subtotal = items.reduce(

@@ -135,6 +135,7 @@ export interface SaleRecord {
   discountSetting: {
     type: "percentage" | "fixed";
     value: number;
+    scope?: "group" | "item";
   };
   discountAmount: number;      // Total discount applied
   taxRate: number;             // e.g. 0.08 for 8%
@@ -171,6 +172,14 @@ export interface SaleRecord {
   // Exchanges audit trail (linked exchanges without deleting original transaction integrity)
   hasExchanges?: boolean;
   exchanges?: SaleExchangeRecord[];
+
+  // WhatsApp E-Receipt Handoff Audit Trail (records handoff initiation only, never falsely marked delivered)
+  eReceiptToken?: string;
+  eReceiptUrl?: string;
+  whatsappHandoffStatus?: "not_initiated" | "handoff_initiated";
+  whatsappHandoffInitiatedAt?: number;
+  whatsappHandoffCount?: number;
+  whatsappTargetPhone?: string;
 
   // Timestamps
   createdAt: number;           // Unix millisecond timestamp
@@ -274,6 +283,7 @@ export interface CreateSaleInput {
 }
 
 export interface SalesFilterOptions {
+  branchId?: string;           // Filter by branchId ("ALL" or undefined = all branches)
   startDate?: number;          // Milliseconds epoch
   endDate?: number;            // Milliseconds epoch
   paymentMethod?: string;      // Filter by payment method

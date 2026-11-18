@@ -17,33 +17,52 @@ import {
   Trash2,
   Layers,
   Sparkles,
+  KeyRound,
+  Eye,
 } from "lucide-react";
+import { getDocs } from "firebase/firestore";
 import { AppShell } from "@/components/layout/AppShell";
-import { ShopUser, ROLE_CONFIG } from "@/lib/types/user";
+import { ShopUser, ROLE_CONFIG, getRoleBadge } from "@/lib/types/user";
 import { Shop } from "@/lib/types/shop";
 import { subscribeToAllUsers, deleteUser } from "@/lib/services/userService";
+import { getShopUsersRef } from "@/lib/services/shopAuthService";
 import { subscribeToShops } from "@/lib/services/shopService";
 import { AssignUserModal } from "@/components/shops/AssignUserModal";
 
 export default function StaffDirectoryPage() {
   const [users, setUsers] = useState<ShopUser[]>([]);
+  const [rootUsers, setRootUsers] = useState<ShopUser[]>([]);
+  const [nestedShopUsers, setNestedShopUsers] = useState<ShopUser[]>([]);
   const [shops, setShops] = useState<Shop[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedShopFilter, setSelectedShopFilter] = useState<string>("ALL");
   const [selectedRoleFilter, setSelectedRoleFilter] = useState<string>("ALL");
+  const [heldUserKey, setHeldUserKey] = useState<string | null>(null);
 
   const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
 
   useEffect(() => {
     setLoading(true);
     const unsubUsers = subscribeToAllUsers((fetchedUsers) => {
-      setUsers(fetchedUsers);
+      setRootUsers(fetchedUsers);
       setLoading(false);
     });
 
-    const unsubShops = subscribeToShops((fetchedShops) => {
+    const unsubShops = subscribeToShops(async (fetchedShops) => {
       setShops(fetchedShops);
+      try {
+        const snapshots = await Promise.all(
+          fetchedShops.map((s) => getDocs(getShopUsersRef(s.shopId)))
+        );
+        const allNested: ShopUser[] = [];
+        snapshots.forEach((snap) => {
+          snap.docs.forEach((d) => allNested.push(d.data() as ShopUser));
+        });
+        setNestedShopUsers(allNested);
+      } catch (e) {
+        console.warn("Could not load nested shop users:", e);
+      }
     });
 
     return () => {
@@ -51,6 +70,29 @@ export default function StaffDirectoryPage() {
       unsubShops();
     };
   }, []);
+
+  useEffect(() => {
+    const map = new Map<string, ShopUser>();
+    // Prefer nested shop user record if it has plain-text password or newer fields
+    [...nestedShopUsers, ...rootUsers].forEach((u) => {
+      const key = u.uid || `${u.shopId}_${u.username}`;
+      if (!key) return;
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, u);
+      } else {
+        map.set(key, {
+          ...existing,
+          ...u,
+          password: u.password || existing.password,
+        });
+      }
+    });
+    const combined = Array.from(map.values()).sort(
+      (a, b) => (b.createdAt || 0) - (a.createdAt || 0)
+    );
+    setUsers(combined);
+  }, [rootUsers, nestedShopUsers]);
 
   const filteredUsers = users.filter((u) => {
     const q = searchQuery.toLowerCase();
@@ -216,8 +258,9 @@ export default function StaffDirectoryPage() {
                 style={{ background: "rgba(255, 255, 255, 0.02)" }}
               >
                 <tr>
-                  <th className="py-4 px-5">Staff Member</th>
-                  <th className="py-4 px-5">Assigned Shop</th>
+                  <th className="py-4 px-5">Staff Member (Hold Name for Password)</th>
+                  <th className="py-4 px-5">Username & Password</th>
+                  <th className="py-4 px-5">Assigned Shop / Branch</th>
                   <th className="py-4 px-5">Role</th>
                   <th className="py-4 px-5">Firebase UID</th>
                   <th className="py-4 px-5 text-right">Actions</th>
@@ -225,19 +268,46 @@ export default function StaffDirectoryPage() {
               </thead>
               <tbody className="divide-y divide-white/[0.04]">
                 {filteredUsers.map((user) => {
-                  const cfg = ROLE_CONFIG[user.role] || ROLE_CONFIG.cashier;
+                  const cfg = getRoleBadge(user.role);
+                  const rowKey = user.uid || `${user.shopId}_${user.username}`;
+                  const isHolding = heldUserKey === rowKey;
+                  const holdHandlers = {
+                    onMouseDown: () => setHeldUserKey(rowKey),
+                    onMouseUp: () => setHeldUserKey(null),
+                    onMouseLeave: () => {
+                      if (heldUserKey === rowKey) setHeldUserKey(null);
+                    },
+                    onTouchStart: () => setHeldUserKey(rowKey),
+                    onTouchEnd: () => setHeldUserKey(null),
+                    onTouchCancel: () => setHeldUserKey(null),
+                  };
+
                   return (
                     <tr
-                      key={user.uid}
+                      key={rowKey}
                       className="hover:bg-white/[0.03] transition-colors group"
                     >
                       <td className="py-3.5 px-5">
-                        <div className="font-semibold text-zinc-200 group-hover:text-orange-200 transition-colors flex items-center gap-1.5">
-                          <span>{user.displayName || user.username}</span>
-                          {user.username && (
-                            <span className="text-[11px] font-mono text-orange-400/90 font-normal">
-                              @{user.username}
+                        <div
+                          {...holdHandlers}
+                          title="Press and hold name or username to reveal plain-text password"
+                          className="inline-flex flex-col cursor-pointer select-none"
+                        >
+                          <div className="font-semibold text-zinc-200 group-hover:text-orange-200 transition-colors flex items-center gap-1.5">
+                            <span className="underline decoration-dotted decoration-zinc-600 underline-offset-4">
+                              {user.displayName || user.username}
                             </span>
+                            {user.username && (
+                              <span className="text-[11px] font-mono text-orange-400/90 font-normal">
+                                @{user.username}
+                              </span>
+                            )}
+                          </div>
+                          {isHolding && (
+                            <div className="mt-1 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 font-mono text-[11px] w-fit">
+                              <KeyRound className="w-3 h-3 text-emerald-400" />
+                              <span>Password: {user.password || "Not set"}</span>
+                            </div>
                           )}
                         </div>
                         <div className="text-[11px] text-zinc-400 flex items-center gap-1.5 mt-0.5">
@@ -246,23 +316,55 @@ export default function StaffDirectoryPage() {
                         </div>
                       </td>
                       <td className="py-3.5 px-5">
-                        <span
-                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-mono font-semibold"
-                          style={{
-                            background: "rgba(249, 115, 22, 0.12)",
-                            border: "1px solid rgba(249, 115, 22, 0.3)",
-                            color: "rgb(253, 186, 116)",
-                            boxShadow: "0 0 10px rgba(249, 115, 22, 0.1)",
-                          }}
+                        <div
+                          {...holdHandlers}
+                          title="Press and hold to reveal password"
+                          className="inline-flex flex-col gap-1 cursor-pointer select-none"
                         >
-                          <Layers className="w-3 h-3 text-orange-400" />
-                          {user.shopId}
-                        </span>
-                        {user.shopName && (
-                          <span className="text-zinc-400 text-xs ml-2 font-normal">
-                            {user.shopName}
+                          <span className="text-xs font-mono text-zinc-200">
+                            @{user.username || "—"}
                           </span>
-                        )}
+                          <span
+                            className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-mono border w-fit transition-colors ${
+                              isHolding
+                                ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-200 font-semibold"
+                                : "bg-white/[0.04] border-white/10 text-zinc-400"
+                            }`}
+                          >
+                            <Eye className="w-3 h-3 text-zinc-400" />
+                            <span>
+                              {isHolding ? user.password || "Not stored" : "•••••••• (Hold)"}
+                            </span>
+                          </span>
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-5">
+                        <div className="flex flex-col gap-1">
+                          <div>
+                            <span
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-mono font-semibold"
+                              style={{
+                                background: "rgba(249, 115, 22, 0.12)",
+                                border: "1px solid rgba(249, 115, 22, 0.3)",
+                                color: "rgb(253, 186, 116)",
+                                boxShadow: "0 0 10px rgba(249, 115, 22, 0.1)",
+                              }}
+                            >
+                              <Layers className="w-3 h-3 text-orange-400" />
+                              {user.shopId}
+                            </span>
+                            {user.shopName && (
+                              <span className="text-zinc-400 text-xs ml-2 font-normal">
+                                {user.shopName}
+                              </span>
+                            )}
+                          </div>
+                          {(user.branchName || user.primaryBranchId || user.branchId) && (
+                            <span className="text-[10px] font-mono text-zinc-400">
+                              Branch: {user.branchName || user.primaryBranchId || user.branchId}
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="py-3.5 px-5">
                         <span

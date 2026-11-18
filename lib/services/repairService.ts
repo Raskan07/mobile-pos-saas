@@ -101,18 +101,20 @@ export function generateWarrantyCode(): string {
 // ── State Machine Transition Rules ──────────────────────────────────────────
 
 const ALLOWED_TRANSITIONS: Record<RepairStatus, RepairStatus[]> = {
-  received: ["diagnosing", "cancelled", "awaiting_parts"],
-  diagnosing: ["awaiting_approval", "in_repair", "irreparable", "cancelled"],
-  awaiting_approval: ["in_repair", "awaiting_parts", "customer_declined", "cancelled"],
-  awaiting_parts: ["in_repair", "customer_declined", "cancelled"],
-  in_repair: ["quality_check", "awaiting_parts", "irreparable", "cancelled"],
-  quality_check: ["ready_for_collection", "in_repair"], // Fails return to in_repair
-  ready_for_collection: ["collected", "cancelled"],
-  collected: ["warranty_rework"],
-  cancelled: [],
-  irreparable: ["collected"], // Hand back unrepairable device
-  customer_declined: ["collected"], // Hand back declined device
-  warranty_rework: ["diagnosing", "in_repair", "quality_check"],
+  pending: ["received", "diagnosing", "awaiting_approval", "awaiting_parts", "in_repair", "cancelled"],
+  received: ["diagnosing", "awaiting_approval", "awaiting_parts", "in_repair", "quality_check", "cancelled"],
+  diagnosing: ["awaiting_approval", "awaiting_parts", "in_repair", "quality_check", "irreparable", "cancelled"],
+  awaiting_approval: ["in_repair", "awaiting_parts", "quality_check", "customer_declined", "cancelled"],
+  awaiting_parts: ["in_repair", "quality_check", "customer_declined", "cancelled"],
+  in_repair: ["quality_check", "awaiting_parts", "ready_for_collection", "irreparable", "cancelled"],
+  quality_check: ["ready_for_collection", "in_repair", "awaiting_parts"],
+  ready_for_collection: ["collected", "delivered", "in_repair", "quality_check", "cancelled"],
+  collected: ["delivered", "warranty_rework"],
+  delivered: ["warranty_rework"],
+  cancelled: ["received", "in_repair"],
+  irreparable: ["collected", "delivered"], // Hand back unrepairable device
+  customer_declined: ["collected", "delivered"], // Hand back declined device
+  warranty_rework: ["received", "diagnosing", "in_repair", "quality_check", "ready_for_collection", "collected"],
 };
 
 export function isValidStatusTransition(from: RepairStatus, to: RepairStatus): boolean {
@@ -146,7 +148,24 @@ export async function createRepairTicket(
 
   const initialDeposit = Number(input.initialDepositAmount) || 0;
   const estimatedCost = Number(input.estimatedCost) || 0;
+  const serviceChargeAmount = Number(input.serviceChargeAmount) || 0;
+  const discountAmount = Number(input.discountAmount) || 0;
+  const additionalCharges = Number(input.additionalCharges) || 0;
+  const internalPartsCost = (input.initialLineItems || []).reduce(
+    (sum, it) => sum + (Number(it.unitCost) || 0) * (Number(it.quantity) || 1),
+    0
+  );
   const balanceDue = Math.max(0, estimatedCost - initialDeposit);
+  const intakeReceiptNumber = `JRC-${ticketNumber.slice(4)}`;
+
+  const intakeLineItems = (input.initialLineItems || []).map((it) => ({
+    type: it.type,
+    description: it.description,
+    sku: it.sku,
+    quantity: it.quantity,
+    unitSellingPrice: it.unitSellingPrice,
+    totalPrice: it.totalPrice,
+  }));
 
   const ticketData: RepairTicket = {
     id: ticketId,
@@ -189,9 +208,15 @@ export async function createRepairTicket(
     assignedTechnicianName: input.assignedTechnicianName,
 
     estimatedCost,
+    serviceChargeAmount,
+    discountAmount,
+    additionalCharges,
+    internalPartsCost,
     depositPaid: initialDeposit,
     totalPaid: initialDeposit,
+    intakeReceiptNumber,
     balanceDue,
+    intakeLineItems,
 
     estimatedCompletionDate: input.estimatedCompletionDate,
     createdAt: now,
@@ -207,18 +232,19 @@ export async function createRepairTicket(
   };
 
   const sanitized = cleanUndefined(ticketData);
+  const writePromises: Promise<unknown>[] = [];
 
   // 1. Write parent ticket under shops/{shopId}/repairs/{ticketId}
   const ticketRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId);
-  await setDoc(ticketRef, sanitized);
+  writePromises.push(setDoc(ticketRef, sanitized));
 
   // 2. Also dual-index root /repairs/{ticketId} for fallback querying
-  try {
-    const rootRef = doc(db, REPAIRS_COLLECTION, ticketId);
-    await setDoc(rootRef, sanitized);
-  } catch (err) {
-    console.warn("[RepairService] Root mirror save notice:", err);
-  }
+  const rootRef = doc(db, REPAIRS_COLLECTION, ticketId);
+  writePromises.push(
+    setDoc(rootRef, sanitized).catch((err) => {
+      console.warn("[RepairService] Root mirror save notice:", err);
+    })
+  );
 
   // 3. Write initial status history entry
   const statusEventId = `sth_${now}`;
@@ -233,7 +259,7 @@ export async function createRepairTicket(
     timestamp: now,
   };
   const statusRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId, "status_history", statusEventId);
-  await setDoc(statusRef, cleanUndefined(statusEvent));
+  writePromises.push(setDoc(statusRef, cleanUndefined(statusEvent)));
 
   // 4. If initial deposit was provided, log into payments subcollection
   if (initialDeposit > 0) {
@@ -251,8 +277,50 @@ export async function createRepairTicket(
       recordedAt: now,
     };
     const paymentRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId, "payments", paymentId);
-    await setDoc(paymentRef, cleanUndefined(paymentRecord));
+    writePromises.push(setDoc(paymentRef, cleanUndefined(paymentRecord)));
   }
+
+  // 5. If initial line items were provided from POS intake, create Estimate Version 1
+  if (input.initialLineItems && input.initialLineItems.length > 0) {
+    const estItems = input.initialLineItems.map((it, idx) => ({
+      id: `init_item_${idx}_${now}`,
+      type: it.type,
+      description: it.description,
+      sku: it.sku,
+      quantity: it.quantity,
+      unitCost: it.unitCost,
+      unitSellingPrice: it.unitSellingPrice,
+      totalPrice: it.totalPrice,
+    }));
+    const subtotal = estItems.reduce((sum, item) => sum + item.totalPrice, 0);
+    const grandTotal = Math.max(0, subtotal - discountAmount + additionalCharges);
+    const estimateId = `est_v1_${now}`;
+    const estimateDoc: RepairEstimate = {
+      id: estimateId,
+      ticketId,
+      shopId: normShop,
+      version: 1,
+      items: estItems,
+      subtotal,
+      discountAmount,
+      taxAmount: 0,
+      grandTotal,
+      status: "approved",
+      customerApproval: {
+        approvedAt: now,
+        approvedBy: ticketData.customerName,
+        approvalMethod: "in_person",
+        notes: "Agreed at intake counter",
+      },
+      createdBy: user,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const estRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId, "estimates", estimateId);
+    writePromises.push(setDoc(estRef, cleanUndefined(estimateDoc)));
+  }
+
+  await Promise.all(writePromises);
 
   return ticketData;
 }
@@ -267,12 +335,20 @@ export function subscribeToRepairTickets(
   const normShop = assertValidShop(activeSessionShopId);
   const repairsRef = collection(db, "shops", normShop, REPAIRS_COLLECTION);
 
-  let q = query(repairsRef, orderBy("createdAt", "desc"), firestoreLimit(100));
+  let q = query(repairsRef, orderBy("createdAt", "desc"), firestoreLimit(500));
 
   return onSnapshot(
     q,
     (snapshot) => {
       let tickets = snapshot.docs.map((docSnap) => docSnap.data() as RepairTicket);
+
+      // Deduplicate by ticket.id just in case
+      const seenIds = new Set<string>();
+      tickets = tickets.filter((t) => {
+        if (!t || !t.id || seenIds.has(t.id)) return false;
+        seenIds.add(t.id);
+        return true;
+      });
 
       // In-memory filters for flexibility
       if (options?.status && options.status !== "all") {
@@ -292,8 +368,11 @@ export function subscribeToRepairTickets(
             t.customerName.toLowerCase().includes(queryClean) ||
             t.customerPhone.toLowerCase().includes(queryClean) ||
             t.model.toLowerCase().includes(queryClean) ||
+            t.brand.toLowerCase().includes(queryClean) ||
             (t.imei1 && t.imei1.toLowerCase().includes(queryClean)) ||
-            (t.serialNumber && t.serialNumber.toLowerCase().includes(queryClean))
+            (t.serialNumber && t.serialNumber.toLowerCase().includes(queryClean)) ||
+            (t.finalInvoiceNumber && t.finalInvoiceNumber.toLowerCase().includes(queryClean)) ||
+            (t.intakeReceiptNumber && t.intakeReceiptNumber.toLowerCase().includes(queryClean))
         );
       }
 
@@ -438,6 +517,87 @@ export async function updateRepairStatus(
   );
 }
 
+// ── 4.5. Update Technician Assignment & Financial Adjustments ───────────────
+
+export async function assignTechnicianToTicket(
+  activeSessionShopId: string,
+  user: AuditUser,
+  ticketId: string,
+  technicianId: string,
+  technicianName: string
+): Promise<void> {
+  const normShop = assertValidShop(activeSessionShopId);
+  const now = Date.now();
+  const ticketRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId);
+
+  const payload = cleanUndefined({
+    assignedTechnicianId: technicianId || "unassigned",
+    assignedTechnicianName: technicianName.trim() || "Unassigned",
+    updatedAt: now,
+  });
+
+  await updateDoc(ticketRef, payload);
+  try {
+    await updateDoc(doc(db, REPAIRS_COLLECTION, ticketId), payload);
+  } catch (err) {}
+}
+
+export async function updateTicketFinancials(
+  activeSessionShopId: string,
+  user: AuditUser,
+  ticketId: string,
+  updates: {
+    estimatedCost?: number;
+    serviceChargeAmount?: number;
+    discountAmount?: number;
+    additionalCharges?: number;
+  }
+): Promise<void> {
+  const normShop = assertValidShop(activeSessionShopId);
+  const now = Date.now();
+  const ticketRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId);
+  const snap = await getDoc(ticketRef);
+  if (!snap.exists()) return;
+
+  const current = snap.data() as RepairTicket;
+  const est = updates.estimatedCost !== undefined ? updates.estimatedCost : current.estimatedCost || 0;
+  const svc = updates.serviceChargeAmount !== undefined ? updates.serviceChargeAmount : current.serviceChargeAmount || 0;
+  const disc = updates.discountAmount !== undefined ? updates.discountAmount : current.discountAmount || 0;
+  const addl = updates.additionalCharges !== undefined ? updates.additionalCharges : current.additionalCharges || 0;
+  const totalPaid = current.totalPaid || 0;
+  const balanceDue = Math.max(0, est - totalPaid);
+
+  const payload = cleanUndefined({
+    estimatedCost: est,
+    serviceChargeAmount: svc,
+    discountAmount: disc,
+    additionalCharges: addl,
+    balanceDue,
+    updatedAt: now,
+  });
+
+  await updateDoc(ticketRef, payload);
+  try {
+    await updateDoc(doc(db, REPAIRS_COLLECTION, ticketId), payload);
+  } catch (err) {}
+}
+
+export async function deleteRepairTicket(
+  activeSessionShopId: string,
+  user: AuditUser,
+  ticketId: string
+): Promise<void> {
+  const normShop = assertValidShop(activeSessionShopId);
+  const ticketRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId);
+  await deleteDoc(ticketRef);
+
+  try {
+    await deleteDoc(doc(db, REPAIRS_COLLECTION, ticketId));
+  } catch (err) {
+    // Ignore if root mirror does not exist
+  }
+}
+
 // ── 5. Diagnostics Subcollection Operations ──────────────────────────────────
 
 export async function saveRepairDiagnostic(
@@ -515,11 +675,32 @@ export async function createEstimateVersion(
 
   await setDoc(doc(estColl, estimateId), cleanUndefined(estimateDoc));
 
-  // Update parent ticket estimated cost
-  await updateDoc(doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId), {
+  // Update parent ticket estimated cost & balanceDue
+  const ticketRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId);
+  const tSnap = await getDoc(ticketRef);
+  const currentPaid = tSnap.exists() ? (tSnap.data().totalPaid || 0) : 0;
+  const newBalanceDue = Math.max(0, grandTotal - currentPaid);
+  const estInternalCost = items.reduce(
+    (sum, item) => sum + (Number(item.unitCost) || 0) * (Number(item.quantity) || 1),
+    0
+  );
+
+  await updateDoc(ticketRef, {
     estimatedCost: grandTotal,
+    discountAmount,
+    balanceDue: newBalanceDue,
+    ...(estInternalCost > 0 ? { internalPartsCost: estInternalCost } : {}),
     updatedAt: now,
   });
+  try {
+    await updateDoc(doc(db, REPAIRS_COLLECTION, ticketId), {
+      estimatedCost: grandTotal,
+      discountAmount,
+      balanceDue: newBalanceDue,
+      ...(estInternalCost > 0 ? { internalPartsCost: estInternalCost } : {}),
+      updatedAt: now,
+    });
+  } catch (e) {}
 
   // Automatically transition status to awaiting_approval
   await updateRepairStatus(normShop, user, ticketId, "awaiting_approval", `Estimate v${nextVersion} created`);
@@ -675,6 +856,22 @@ export async function recordPartUsage(
     cleanUndefined(partUsageDoc)
   );
 
+  // Sync internalPartsCost onto parent ticket
+  try {
+    const partsColl = collection(db, "shops", normShop, REPAIRS_COLLECTION, ticketId, "parts_usage");
+    const allParts = await getDocs(partsColl);
+    let totalPartCost = 0;
+    allParts.docs.forEach((d) => {
+      const p = d.data() as RepairPartUsage;
+      if (p.status !== "returned_to_stock") {
+        totalPartCost += (Number(p.unitCost) || 0) * (Number(p.quantity) || 1);
+      }
+    });
+    const tRef = doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId);
+    await updateDoc(tRef, { internalPartsCost: totalPartCost, updatedAt: now });
+    await updateDoc(doc(db, REPAIRS_COLLECTION, ticketId), { internalPartsCost: totalPartCost, updatedAt: now }).catch(() => {});
+  } catch (e) {}
+
   return partUsageDoc;
 }
 
@@ -779,6 +976,14 @@ export async function recordRepairPayment(
     balanceDue,
     updatedAt: now,
   });
+  try {
+    await updateDoc(doc(db, REPAIRS_COLLECTION, ticketId), {
+      totalPaid,
+      depositPaid,
+      balanceDue,
+      updatedAt: now,
+    });
+  } catch (e) {}
 
   return paymentRecord;
 }
@@ -797,24 +1002,147 @@ export async function completeRepairAndInvoice(
   const bundle = await getRepairTicketDetails(normShop, ticketId);
   const ticket = bundle.ticket;
 
-  // Generate official POS invoice record linking labor & parts
-  const invoiceNumber = generateInvoiceNumber();
+  // Build itemized sale line items from the latest estimate, intake line items, and/or consumed parts
+  const latestEstimate = bundle.estimates[0] || null;
+  const consumedParts = bundle.partsUsage.filter(
+    (p) => p.status === "consumed" || p.status === "reserved"
+  );
 
-  // Create sale line items
-  const items = [
-    {
-      productId: `repair_service_${ticket.id}`,
-      name: `Repair Service: ${ticket.brand} ${ticket.model}`,
+  const items: {
+    productId: string;
+    name: string;
+    sku: string;
+    quantity: number;
+    unitPrice: number;
+    subtotal: number;
+    costPrice: number;
+    totalCost: number;
+    discount: number;
+  }[] = [];
+
+  if (latestEstimate && latestEstimate.items.length > 0) {
+    latestEstimate.items.forEach((it, idx) => {
+      items.push({
+        productId: `prod_adhoc_rep_est_${ticket.id}_${idx}`,
+        name: it.description,
+        sku: it.sku || (it.type === "part" ? "REP-PART" : "SVC-LABOR"),
+        quantity: it.quantity || 1,
+        unitPrice: it.unitSellingPrice,
+        subtotal: it.totalPrice,
+        costPrice: it.unitCost || 0,
+        totalCost: (it.unitCost || 0) * (it.quantity || 1),
+        discount: 0,
+      });
+    });
+
+    // Also include any consumed parts not already present in the estimate
+    consumedParts.forEach((p, idx) => {
+      const alreadyIncluded = items.some(
+        (existing) =>
+          existing.name.toLowerCase().includes(p.productName.toLowerCase()) ||
+          (p.sku && existing.sku === p.sku)
+      );
+      if (!alreadyIncluded) {
+        const sub = p.unitSellingPrice * p.quantity;
+        items.push({
+          productId: `prod_adhoc_rep_part_${ticket.id}_${idx}`,
+          name: p.productName,
+          sku: p.sku || "REP-PART",
+          quantity: p.quantity,
+          unitPrice: p.unitSellingPrice,
+          subtotal: sub,
+          costPrice: p.unitCost || 0,
+          totalCost: (p.unitCost || 0) * p.quantity,
+          discount: 0,
+        });
+      }
+    });
+  } else if (ticket.intakeLineItems && ticket.intakeLineItems.length > 0) {
+    ticket.intakeLineItems.forEach((it, idx) => {
+      items.push({
+        productId: `prod_adhoc_rep_intake_${ticket.id}_${idx}`,
+        name: it.description,
+        sku: it.sku || (it.type === "part" ? "REP-PART" : "SVC-LABOR"),
+        quantity: it.quantity || 1,
+        unitPrice: it.unitSellingPrice,
+        subtotal: it.totalPrice,
+        costPrice: 0,
+        totalCost: 0,
+        discount: 0,
+      });
+    });
+  } else if (consumedParts.length > 0) {
+    consumedParts.forEach((p, idx) => {
+      const sub = p.unitSellingPrice * p.quantity;
+      items.push({
+        productId: `prod_adhoc_rep_part_${ticket.id}_${idx}`,
+        name: p.productName,
+        sku: p.sku || "REP-PART",
+        quantity: p.quantity,
+        unitPrice: p.unitSellingPrice,
+        subtotal: sub,
+        costPrice: p.unitCost || 0,
+        totalCost: (p.unitCost || 0) * p.quantity,
+        discount: 0,
+      });
+    });
+  } else if ((ticket.estimatedCost || 0) > 0) {
+    items.push({
+      productId: `prod_adhoc_repair_service_${ticket.id}`,
+      name: `Repair Service: ${ticket.brand} ${ticket.model} (${(ticket.reportedFaults || []).join(", ") || "Service"})`,
       sku: `REP-${ticket.deviceType.toUpperCase()}`,
       quantity: 1,
-      unitPrice: ticket.estimatedCost,
-      subtotal: ticket.estimatedCost,
+      unitPrice: (ticket.estimatedCost || 0) + (ticket.discountAmount || 0),
+      subtotal: (ticket.estimatedCost || 0) + (ticket.discountAmount || 0),
       costPrice: 0,
       totalCost: 0,
       discount: 0,
-    },
-  ];
+    });
+  }
 
+  const hasServiceFeeInSource =
+    (latestEstimate?.items || []).some((it) => it.type === "service_fee") ||
+    (ticket.intakeLineItems || []).some((it) => it.type === "service_fee") ||
+    items.some(
+      (it) =>
+        Math.abs(it.subtotal - (ticket.serviceChargeAmount || 0)) < 0.01 ||
+        it.name.toLowerCase().includes("labor") ||
+        it.name.toLowerCase().includes("labour") ||
+        it.name.toLowerCase().includes("service fee") ||
+        it.name.toLowerCase().includes("service charge")
+    );
+
+  if (ticket.serviceChargeAmount && ticket.serviceChargeAmount > 0 && !hasServiceFeeInSource) {
+    items.push({
+      productId: `prod_adhoc_rep_svcfee_${ticket.id}`,
+      name: "Service / Labour Charge",
+      sku: "SVC-FEE",
+      quantity: 1,
+      unitPrice: ticket.serviceChargeAmount,
+      subtotal: ticket.serviceChargeAmount,
+      costPrice: 0,
+      totalCost: 0,
+      discount: 0,
+    });
+  }
+
+  if (ticket.additionalCharges && ticket.additionalCharges > 0) {
+    items.push({
+      productId: `prod_adhoc_rep_addl_${ticket.id}`,
+      name: "Additional Workshop / Express Charges",
+      sku: "SVC-ADDL",
+      quantity: 1,
+      unitPrice: ticket.additionalCharges,
+      subtotal: ticket.additionalCharges,
+      costPrice: 0,
+      totalCost: 0,
+      discount: 0,
+    });
+  }
+
+  const rawSubtotal = items.reduce((acc, it) => acc + it.subtotal, 0);
+  const finalDiscount = ticket.discountAmount || latestEstimate?.discountAmount || 0;
+  const finalPayable = Math.max(0, rawSubtotal - finalDiscount);
   const now = Date.now();
 
   // Invoke salesService to record permanent POS sale
@@ -828,19 +1156,20 @@ export async function completeRepairAndInvoice(
       customerId: ticket.customerId,
       name: ticket.customerName,
       phone: ticket.customerPhone,
+      email: ticket.customerEmail,
     },
     items,
-    subtotal: ticket.estimatedCost,
+    subtotal: rawSubtotal,
     discountSetting: {
       type: "fixed",
-      value: 0,
+      value: finalDiscount,
     },
-    discountAmount: 0,
+    discountAmount: finalDiscount,
     taxRate: 0,
     taxAmount: 0,
-    grandTotal: ticket.estimatedCost,
+    grandTotal: finalPayable,
     paymentMethod,
-    cashReceived: ticket.estimatedCost,
+    cashReceived: finalPayable,
     notes: `Repair settlement for Job Ticket #${ticket.ticketNumber} (${ticket.brand} ${ticket.model})`,
   });
 
@@ -895,15 +1224,21 @@ export async function completeRepairAndInvoice(
     `Device collected by customer. POS Invoice #${saleRecord.invoiceNumber} issued. Warranty: ${warrantyCode}`
   );
 
-  // Update parent ticket with invoice refs and clear passcode
-  await updateDoc(doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId), {
+  // Update parent ticket with invoice refs and clear passcode (using cleanUndefined so Firestore updateDoc never throws)
+  const finalUpdate = cleanUndefined({
     finalInvoiceNumber: saleRecord.invoiceNumber,
     finalSaleId: saleRecord.saleId,
-    passcodeMasked: undefined,
-    patternMatrix: undefined,
+    passcodeMasked: "",
+    patternMatrix: "",
     passcodeClearedOnDelivery: true,
+    closedAt: now,
     updatedAt: now,
   });
+
+  await updateDoc(doc(db, "shops", normShop, REPAIRS_COLLECTION, ticketId), finalUpdate);
+  try {
+    await updateDoc(doc(db, REPAIRS_COLLECTION, ticketId), finalUpdate);
+  } catch (e) {}
 
   return {
     saleId: saleRecord.saleId,
@@ -1134,12 +1469,19 @@ export function subscribeToCustomRepairParts(
   const normShop = assertValidShop(activeSessionShopId);
   const cacheKey = `custom_repair_parts_${normShop}`;
 
-  // Quick fallback from local cache
+  // Quick fallback from local cache (strictly clean out any legacy part_init mock data)
   if (typeof window !== "undefined") {
     try {
       const cached = localStorage.getItem(cacheKey);
       if (cached) {
-        callback(JSON.parse(cached));
+        const parsed = JSON.parse(cached);
+        const cleaned = Array.isArray(parsed)
+          ? parsed.filter((p: CustomRepairPart) => !p.id?.startsWith("part_init_"))
+          : [];
+        if (Array.isArray(parsed) && parsed.length !== cleaned.length) {
+          localStorage.setItem(cacheKey, JSON.stringify(cleaned));
+        }
+        callback(cleaned);
       }
     } catch (e) {}
   }
@@ -1150,7 +1492,10 @@ export function subscribeToCustomRepairParts(
   return onSnapshot(
     q,
     (snapshot) => {
-      const items = snapshot.docs.map((docSnap) => docSnap.data() as CustomRepairPart);
+      // Exclude any legacy mock items that might have been seeded
+      const items = snapshot.docs
+        .map((docSnap) => docSnap.data() as CustomRepairPart)
+        .filter((p) => !p.id?.startsWith("part_init_"));
       if (typeof window !== "undefined") {
         try {
           localStorage.setItem(cacheKey, JSON.stringify(items));

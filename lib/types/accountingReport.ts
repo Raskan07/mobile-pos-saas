@@ -23,6 +23,7 @@ export type AccountingReportType =
   | "cash_flow"
   | "trial_balance"
   | "sales_statement"
+  | "repair_statement"
   | "inventory_valuation"
   | "purchase_statement"
   | "accounts_receivable"
@@ -73,6 +74,12 @@ export interface PnLData {
   discounts: number;
   returnsAndRefunds: number;
   netRevenue: number;
+
+  // Channel Revenue & Cost Breakdown (Product vs. Workshop Repair)
+  productSalesRevenue?: number;
+  repairServiceRevenue?: number;
+  productCogs?: number;
+  repairPartsCost?: number;
 
   cogs: number;
   grossProfit: number;
@@ -422,6 +429,55 @@ export interface SSTTaxStatementData {
 }
 
 // ─────────────────────────────────────────────────────────────
+// 13. Repair Statement (Workshop Revenue, Component Cost & Profit)
+// ─────────────────────────────────────────────────────────────
+export interface RepairStatementTicketRow {
+  ticketId: string;
+  ticketNumber: string;
+  date: string;
+  customerName: string;
+  customerPhone: string;
+  device: string;
+  faultsSummary: string;
+  status: string;
+  technicianName: string;
+  partsRevenue: number;
+  serviceRevenue: number;
+  discountAmount: number;
+  totalBillableRevenue: number;
+  partsCost: number;
+  grossProfit: number;
+  marginPct: number;
+  amountPaid: number;
+  balanceDue: number;
+  invoiceNumber?: string;
+}
+
+export interface RepairStatementData {
+  tickets: RepairStatementTicketRow[];
+  totalTicketsCount: number;
+  completedTicketsCount: number;
+  activeTicketsCount: number;
+  cancelledTicketsCount: number;
+  totalPartsRevenue: number;
+  totalServiceRevenue: number;
+  totalDiscounts: number;
+  totalGrossRepairRevenue: number;
+  totalCollectedRevenue: number;
+  totalOutstandingReceivables: number;
+  totalPartsCost: number;
+  netRepairProfit: number;
+  repairMarginPct: number;
+  statusBreakdown: {
+    status: string;
+    count: number;
+    revenue: number;
+    cost: number;
+    profit: number;
+  }[];
+}
+
+// ─────────────────────────────────────────────────────────────
 // Master Report Container Interface
 // ─────────────────────────────────────────────────────────────
 export interface MasterAccountingReportsData {
@@ -435,6 +491,7 @@ export interface MasterAccountingReportsData {
   cashFlow: CashFlowData;
   trialBalance: TrialBalanceData;
   salesStatement: SalesStatementData;
+  repairStatement: RepairStatementData;
   inventoryValuation: InventoryValuationData;
   purchaseStatement: PurchaseStatementData;
   accountsReceivable: ARAgingData;

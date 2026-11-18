@@ -32,10 +32,10 @@ export function downloadRepairExcel(
       "IMEI / Serial": t.imei1 || t.serialNumber || "",
       "Reported Faults": (t.reportedFaults || []).join(", "),
       "Assigned Technician": t.assignedTechnicianName || "Unassigned",
-      "Estimated Cost ($)": Number(t.estimatedCost || 0).toFixed(2),
-      "Deposit Paid ($)": Number(t.depositPaid || 0).toFixed(2),
-      "Total Paid ($)": Number(t.totalPaid || 0).toFixed(2),
-      "Balance Due ($)": Number(t.balanceDue || 0).toFixed(2),
+      "Estimated Cost (LKR)": Number(t.estimatedCost || 0).toFixed(2),
+      "Deposit Paid (LKR)": Number(t.depositPaid || 0).toFixed(2),
+      "Total Paid (LKR)": Number(t.totalPaid || 0).toFixed(2),
+      "Balance Due (LKR)": Number(t.balanceDue || 0).toFixed(2),
       "Invoice #": t.finalInvoiceNumber || "Pending",
       "Is Warranty Rework": t.isWarrantyRework ? "YES" : "NO",
       Operator: t.intakeOperator?.displayName || t.intakeOperator?.username || "",
@@ -87,8 +87,8 @@ export function downloadRepairExcel(
     { Metric: "Active Jobs In Workshop", Value: activeCount },
     { Metric: "Completed & Collected Devices", Value: collectedCount },
     { Metric: "Warranty Rework Jobs", Value: warrantyReworkCount },
-    { Metric: "Total Revenue Collected ($)", Value: totalRevenue.toFixed(2) },
-    { Metric: "Total Outstanding Balance Due ($)", Value: totalBalanceDue.toFixed(2) },
+    { Metric: "Total Revenue Collected (LKR)", Value: totalRevenue.toFixed(2) },
+    { Metric: "Total Outstanding Balance Due (LKR)", Value: totalBalanceDue.toFixed(2) },
   ];
 
   const wsSummary = XLSX.utils.json_to_sheet(summaryData);

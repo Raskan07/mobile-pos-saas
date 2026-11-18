@@ -14,13 +14,14 @@
  */
 
 import React, { useState, useEffect, useRef } from "react";
-import { Plus, Store, Users, Layers, Sparkles } from "lucide-react";
+import { Plus, Store, Users, Layers, Sparkles, Bell } from "lucide-react";
 import { AppShell } from "@/components/layout/AppShell";
 import { Shop } from "@/lib/types/shop";
 import { subscribeToShops } from "@/lib/services/shopService";
 import { AddShopModal } from "@/components/shops/AddShopModal";
 import { AssignUserModal } from "@/components/shops/AssignUserModal";
 import { ShopStaffDrawer } from "@/components/shops/ShopStaffDrawer";
+import { SendShopNotificationModal } from "@/components/shops/SendShopNotificationModal";
 
 import { useLoading } from "@/lib/context/LoadingContext";
 
@@ -33,6 +34,7 @@ export default function ShopsPage() {
   const [isAddShopOpen, setIsAddShopOpen] = useState(false);
   const [isAssignStaffOpen, setIsAssignStaffOpen] = useState(false);
   const [isStaffDrawerOpen, setIsStaffDrawerOpen] = useState(false);
+  const [isSendMessageOpen, setIsSendMessageOpen] = useState(false);
   const [selectedShop, setSelectedShop] = useState<Shop | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -280,12 +282,22 @@ export default function ShopsPage() {
               <button
                 type="button"
                 onClick={() => handleOpenAssignStaff(selectedShop || shops[0])}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.09] border border-white/[0.08] text-zinc-300 hover:text-zinc-100 text-xs font-medium transition-all"
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white/[0.05] hover:bg-white/[0.09] border border-white/[0.08] text-zinc-300 hover:text-zinc-100 text-xs font-medium transition-all cursor-pointer"
               >
                 <Users className="w-3.5 h-3.5 text-orange-400" />
                 <span>Assign Staff</span>
               </button>
             )}
+
+            {/* Send Update / Message to Shops */}
+            <button
+              type="button"
+              onClick={() => setIsSendMessageOpen(true)}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/35 text-emerald-300 text-xs font-medium transition-all cursor-pointer"
+            >
+              <Bell className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Send Update / Message</span>
+            </button>
           </div>
 
           {/* Registered Shops Minimal Quick Selector Bar */}
@@ -343,6 +355,13 @@ export default function ShopsPage() {
           setSelectedShop(shop);
           setIsAssignStaffOpen(true);
         }}
+      />
+
+      <SendShopNotificationModal
+        isOpen={isSendMessageOpen}
+        targetShop={selectedShop}
+        allShops={shops}
+        onClose={() => setIsSendMessageOpen(false)}
       />
     </AppShell>
   );

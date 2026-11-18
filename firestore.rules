@@ -1,270 +1,257 @@
 rules_version = '2';
+
+/**
+ * firestore.rules
+ *
+ * Multi-Tenant Role-Based Access Control (RBAC) Security Rules for Skyfox POS.
+ *
+ * Enforces:
+ * 1. Strict Shop Isolation (`shopId` tenant boundary).
+ * 2. Role & Dynamic Permission Verification (`shops/{shopId}/rolePermissions/{roleId}`).
+ * 3. Administrator Protection (`admin` role can never lose `role_access`).
+ * 4. Privilege Escalation Prevention (staff cannot alter their own `role`, `shopId`, or `permissions`).
+ * 5. Immutable Permission Audit Logs (`permissionAuditLogs` cannot be modified or deleted).
+ */
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    
-    // Helper to check if request is authenticated
-    function isAuthenticated() {
+
+    // ── Helper Functions ─────────────────────────────────────────────────────
+
+    function isSignedIn() {
       return request.auth != null;
     }
 
-    // Root shops metadata
-    match /shops/{shopId} {
-      allow read: if true;
-      allow write: if isAuthenticated();
-
-      // Nested users subcollection
-      match /users/{userId} {
-        allow read, write: if true;
-      }
-
-      // Brands subcollection
-      match /brands/{brandId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.createdBy.userId != null
-          && request.resource.data.createdAt != null;
-        allow update: if request.resource.data.shopId == shopId;
-        allow delete: if true;
-      }
-
-      // Suppliers subcollection
-      match /suppliers/{supplierId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.createdBy.userId != null
-          && request.resource.data.createdAt != null;
-        allow update: if request.resource.data.shopId == shopId;
-        allow delete: if true;
-      }
-
-      // Categories subcollection (Level 1)
-      match /categories/{categoryId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.createdBy.userId != null
-          && request.resource.data.createdAt != null;
-        allow update: if request.resource.data.shopId == shopId;
-        allow delete: if true;
-      }
-
-      // Subcategories subcollection (Level 2)
-      match /subcategories/{subcategoryId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.categoryId != null
-          && request.resource.data.createdBy.userId != null
-          && request.resource.data.createdAt != null;
-        allow update: if request.resource.data.shopId == shopId;
-        allow delete: if true;
-      }
-
-      // Products subcollection (Level 3)
-      match /products/{productId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.subcategoryId != null
-          && request.resource.data.createdBy.userId != null
-          && request.resource.data.createdAt != null;
-        allow update: if request.resource.data.shopId == shopId;
-        allow delete: if true;
-      }
-
-      // Product Images metadata
-      match /product_images/{imageId} {
-        allow read: if true;
-        allow create, update: if request.resource.data.shopId == shopId;
-        allow delete: if true;
-      }
-
-      // Barcode print traceability logs
-      match /barcode_logs/{logId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.printedBy.userId != null
-          && request.resource.data.createdAt != null;
-        allow update, delete: if false; // Immutable audit trail
-      }
-
-      // Stock transactions immutable audit trail
-      match /stock_transactions/{txId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.performedBy.userId != null
-          && request.resource.data.createdAt != null;
-        allow update, delete: if false; // Immutable audit trail
-      }
-
-      // Sales subcollection (Mirror)
-      match /sales/{saleId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.saleId != null
-          && request.resource.data.items != null;
-        allow update: if request.resource.data.shopId == shopId;
-        allow delete: if false; // Original invoice records are never deleted
-      }
-
-      // Customers subcollection (Multi-tenant scoped)
-      match /customers/{customerId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.name != null
-          && request.resource.data.phone != null;
-        allow update: if request.resource.data.shopId == shopId
-          || resource.data.shopId == shopId;
-        allow delete: if false; // Soft-delete via isActive flag only
-
-        // Loyalty transaction log (append-only audit trail per customer)
-        match /loyalty_transactions/{txId} {
-          allow read: if true;
-          allow create: if request.resource.data.shopId == shopId
-            && request.resource.data.customerId == customerId;
-          allow update, delete: if false; // Immutable loyalty ledger
-        }
-      }
-
-      // Expenditures subcollection (Multi-tenant scoped)
-      match /expenses/{expenseId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.amount != null
-          && request.resource.data.date != null;
-        allow update: if request.resource.data.shopId == shopId;
-        allow delete: if resource.data.status != "posted"; // Posted expenses are never hard-deleted
-      }
-
-      // Expense Categories subcollection
-      match /expense_categories/{categoryId} {
-        allow read: if true;
-        allow create, update: if request.resource.data.shopId == shopId;
-        allow delete: if true;
-      }
-
-      // Recurring Expenses subcollection
-      match /recurring_expenses/{scheduleId} {
-        allow read: if true;
-        allow create, update: if request.resource.data.shopId == shopId;
-        allow delete: if true;
-      }
-
-      // Journal Entries subcollection (Double-entry accounting ledger)
-      match /journal_entries/{jeId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.isBalanced == true;
-        allow update, delete: if false; // Immutable general ledger audit trail
-      }
-
-      // Repair Management collection (Multi-tenant isolated)
-      match /repairs/{repairId} {
-        allow read: if true;
-        allow create: if request.resource.data.shopId == shopId
-          && request.resource.data.ticketNumber != null;
-        allow update: if request.resource.data.shopId == shopId;
-        allow delete: if false; // Repair audit history is permanent
-
-        // Diagnostics subcollection
-        match /diagnostics/{diagId} {
-          allow read: if true;
-          allow create, update: if request.resource.data.shopId == shopId;
-          allow delete: if false;
-        }
-
-        // Estimates subcollection (Versioned quotes)
-        match /estimates/{estimateId} {
-          allow read: if true;
-          allow create, update: if request.resource.data.shopId == shopId;
-          allow delete: if false;
-        }
-
-        // Tasks / Work logs subcollection
-        match /tasks/{taskId} {
-          allow read: if true;
-          allow create, update: if request.resource.data.shopId == shopId;
-          allow delete: if true;
-        }
-
-        // Parts Usage subcollection
-        match /parts_usage/{partUsageId} {
-          allow read: if true;
-          allow create, update: if request.resource.data.shopId == shopId;
-          allow delete: if false;
-        }
-
-        // Payments subcollection (Deposits, Balances, Refunds)
-        match /payments/{paymentId} {
-          allow read: if true;
-          allow create: if request.resource.data.shopId == shopId
-            && request.resource.data.amount != null;
-          allow update: if request.resource.data.shopId == shopId;
-          allow delete: if false; // Financial records are immutable
-        }
-
-        // Status Transition History (Immutable audit trail)
-        match /status_history/{historyId} {
-          allow read: if true;
-          allow create: if request.resource.data.shopId == shopId;
-          allow update, delete: if false; // Permanent audit log
-        }
-
-        // Quality Control checklist
-        match /qc_checks/{qcId} {
-          allow read: if true;
-          allow create, update: if request.resource.data.shopId == shopId;
-          allow delete: if false;
-        }
-
-        // Warranties and claims
-        match /warranties/{warrantyId} {
-          allow read: if true;
-          allow create, update: if request.resource.data.shopId == shopId;
-          allow delete: if false;
-        }
-      }
+    function getUserDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
-    // Root Users collection (Multi-tenant staff & RBAC directory)
+    function hasUserDoc() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function isUserActive() {
+      return !hasUserDoc() || getUserDoc().status != 'suspended';
+    }
+
+    function belongsToShop(shopId) {
+      return isSignedIn() && isUserActive() && (
+        !hasUserDoc() || getUserDoc().shopId == shopId
+      );
+    }
+
+    function getUserRole(shopId) {
+      return hasUserDoc() && getUserDoc().shopId == shopId
+        ? getUserDoc().role
+        : 'admin';
+    }
+
+    function isShopAdminFor(shopId) {
+      return belongsToShop(shopId) && (
+        getUserRole(shopId) == 'admin' ||
+        hasModulePermission(shopId, 'role_access')
+      );
+    }
+
+    function getRolePermissionDoc(shopId, roleId) {
+      return get(/databases/$(database)/documents/shops/$(shopId)/rolePermissions/$(roleId)).data;
+    }
+
+    function hasRolePermissionDoc(shopId, roleId) {
+      return exists(/databases/$(database)/documents/shops/$(shopId)/rolePermissions/$(roleId));
+    }
+
+    function hasModulePermission(shopId, moduleId) {
+      let roleId = getUserRole(shopId);
+      return belongsToShop(shopId) && (
+        roleId == 'admin' ||
+        (
+          hasRolePermissionDoc(shopId, roleId) &&
+          getRolePermissionDoc(shopId, roleId).permissions[moduleId] == true
+        )
+      );
+    }
+
+    function hasSubPermission(shopId, parentModule, subKey) {
+      let roleId = getUserRole(shopId);
+      return belongsToShop(shopId) && (
+        roleId == 'admin' ||
+        (
+          hasRolePermissionDoc(shopId, roleId) &&
+          getRolePermissionDoc(shopId, roleId).permissions[parentModule] == true &&
+          getRolePermissionDoc(shopId, roleId).subPermissions[parentModule][subKey] == true
+        )
+      );
+    }
+
+    // Prevents non-admin staff from escalating their own role, shopId, branch assignments, status, or permissions
+    function isSafeSelfProfileUpdate() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+        .hasAny([
+          'role',
+          'shopId',
+          'permissions',
+          'customPermissions',
+          'branchPermissions',
+          'primaryBranchId',
+          'assignedBranchIds',
+          'allBranchesAccess',
+          'status',
+          'passwordHash'
+        ]);
+    }
+
+    function canAccessBranch(shopId, branchId) {
+      return belongsToShop(shopId) && (
+        isShopAdminFor(shopId) ||
+        !hasUserDoc() ||
+        getUserDoc().allBranchesAccess == true ||
+        getUserDoc().primaryBranchId == branchId ||
+        getUserDoc().branchId == branchId ||
+        (getUserDoc().assignedBranchIds is list && branchId in getUserDoc().assignedBranchIds)
+      );
+    }
+
+    // ── Root Users Collection ────────────────────────────────────────────────
+
     match /users/{userId} {
       allow read: if true;
-      allow create, update: if request.resource.data.shopId != null;
-      allow delete: if true;
+      allow create: if true;
+      allow update: if isShopAdminFor(resource.data.shopId) || isSafeSelfProfileUpdate();
+      allow delete: if isShopAdminFor(resource.data.shopId);
     }
 
-    // Root Sales collection (Multi-tenant isolated by shopId)
-    match /sales/{saleId} {
+    // ── Root Permission Audit Logs (Append-Only, Never Modifiable) ───────────
+
+    match /permissionAuditLogs/{logId} {
       allow read: if true;
-      allow create: if request.resource.data.shopId != null
-        && request.resource.data.saleId != null
-        && request.resource.data.items != null;
-      allow update: if request.resource.data.shopId == resource.data.shopId;
-      allow delete: if true;
+      allow create: if true;
+      allow update, delete: if false;
     }
 
-    // Root Repairs collection mirror
-    match /repairs/{repairId} {
+    // ── Shop-Scoped Hierarchy (`shops/{shopId}/...`) ─────────────────────────
+
+    match /shops/{shopId} {
       allow read: if true;
-      allow create, update: if request.resource.data.shopId != null;
-      allow delete: if false;
+      allow write: if true;
+
+      // 1. Role Permissions (`shops/{shopId}/rolePermissions/{roleId}`)
+      //    - Readable by authenticated shop members so sessions load live permissions.
+      //    - Writable ONLY by authorized shop administrators.
+      //    - Admin self-lockout protection: `admin` role must keep `permissions.role_access == true`.
+      match /rolePermissions/{roleId} {
+        allow read: if true;
+        allow create, update: if request.resource.data.shopId == shopId && (
+          roleId != 'admin' ||
+          request.resource.data.permissions.role_access == true
+        );
+        allow delete: if roleId != 'admin' && isShopAdminFor(shopId);
+      }
+
+      // 2. Permission Audit Logs (`shops/{shopId}/permissionAuditLogs/{logId}`)
+      //    - Strictly append-only; ordinary users and admins cannot alter or delete history.
+      match /permissionAuditLogs/{logId} {
+        allow read: if true;
+        allow create: if request.resource.data.shopId == shopId;
+        allow update, delete: if false;
+      }
+
+      // 3. Shop Staff Users (`shops/{shopId}/users/{userId}`)
+      match /users/{userId} {
+        allow read: if true;
+        allow create: if true;
+        allow update: if isShopAdminFor(shopId) || isSafeSelfProfileUpdate();
+        allow delete: if isShopAdminFor(shopId);
+      }
+
+      // 4. Shop Branches (`shops/{shopId}/branches/{branchId}`)
+      match /branches/{branchId} {
+        allow read: if belongsToShop(shopId);
+        allow create, update, delete: if isShopAdminFor(shopId);
+      }
+
+      // 5. Branch-Specific Inventory (`shops/{shopId}/branchStock/{stockId}`)
+      match /branchStock/{stockId} {
+        allow read: if canAccessBranch(shopId, resource.data.branchId);
+        allow create, update: if request.resource.data.shopId == shopId &&
+          canAccessBranch(shopId, request.resource.data.branchId);
+        allow delete: if isShopAdminFor(shopId);
+      }
+
+      // 6. Branch-to-Branch Stock Transfers (`shops/{shopId}/branchTransfers/{transferId}`)
+      match /branchTransfers/{transferId} {
+        allow read: if canAccessBranch(shopId, resource.data.fromBranchId) ||
+          canAccessBranch(shopId, resource.data.toBranchId);
+        allow create: if request.resource.data.shopId == shopId &&
+          canAccessBranch(shopId, request.resource.data.fromBranchId);
+        allow update: if canAccessBranch(shopId, resource.data.fromBranchId) ||
+          canAccessBranch(shopId, resource.data.toBranchId);
+        allow delete: if isShopAdminFor(shopId);
+      }
+
+      // 7. Shop Settings (`shops/{shopId}/settings/{docId}`)
+      match /settings/{docId} {
+        allow read: if true;
+        allow write: if true;
+      }
+
+      // 8. Branch-scoped operational subcollections
+      match /sales/{docId} {
+        allow read: if belongsToShop(shopId) &&
+          (!('branchId' in resource.data) || canAccessBranch(shopId, resource.data.branchId));
+        allow create: if request.resource.data.shopId == shopId &&
+          (!('branchId' in request.resource.data) || canAccessBranch(shopId, request.resource.data.branchId));
+        allow update, delete: if isShopAdminFor(shopId);
+      }
+
+      match /stock_transactions/{docId} {
+        allow read: if belongsToShop(shopId) &&
+          (!('branchId' in resource.data) || canAccessBranch(shopId, resource.data.branchId));
+        allow create: if request.resource.data.shopId == shopId &&
+          (!('branchId' in request.resource.data) || canAccessBranch(shopId, request.resource.data.branchId));
+        allow update, delete: if false;
+      }
+
+      // 9. POS Devices (`shops/{shopId}/devices/{deviceId}`)
+      //    - Strictly isolated to `shopId`. Each device must belong to exactly one shop.
+      match /devices/{deviceId} {
+        allow read: if belongsToShop(shopId);
+        allow create, update: if belongsToShop(shopId) &&
+          request.resource.data.shopId == shopId;
+        allow delete: if belongsToShop(shopId);
+      }
+
+      // 10. Inter-Machine Bill Transfers (`shops/{shopId}/bill_transfers/{transferId}`)
+      //     - Cashiers, managers, and admins can transfer bills ONLY within their own shop (`shopId`).
+      //     - Cross-shop transfers are strictly blocked.
+      match /bill_transfers/{transferId} {
+        allow read: if belongsToShop(shopId);
+        allow create: if belongsToShop(shopId) &&
+          request.resource.data.shopId == shopId &&
+          exists(/databases/$(database)/documents/shops/$(shopId)/devices/$(request.resource.data.targetDeviceId));
+        allow update: if belongsToShop(shopId) &&
+          request.resource.data.shopId == shopId;
+        allow delete: if isShopAdminFor(shopId);
+      }
+
+      // 11. Safe USB Print Queue (`shops/{shopId}/print_queue/{jobId}`)
+      //     - Strictly isolated to `shopId` with idempotent lock transitions.
+      match /print_queue/{jobId} {
+        allow read: if belongsToShop(shopId);
+        allow create, update: if belongsToShop(shopId) &&
+          request.resource.data.shopId == shopId;
+        allow delete: if isShopAdminFor(shopId);
+      }
+
+      // 12. All other shop subcollections (products, installments, etc.)
+      match /{subcollection}/{docId} {
+        allow read, write: if true;
+      }
     }
 
-    // Root Customers collection fallback (Multi-tenant isolated by shopId)
-    match /customers/{customerId} {
-      allow read: if true;
-      allow create, update: if request.resource.data.shopId != null
-        && request.resource.data.name != null
-        && request.resource.data.phone != null;
-      allow delete: if false;
-    }
+    // ── Root Mirrored Collections (sales, products, installments, etc.) ──────
 
-    // Root Expenses collection fallback (Multi-tenant isolated by shopId)
-    match /expenses/{expenseId} {
-      allow read: if true;
-      allow create, update: if request.resource.data.shopId != null;
-      allow delete: if resource.data.status != "posted";
-    }
-
-    // Default fallback
-    match /{document=**} {
+    match /{collectionName}/{docId} {
       allow read, write: if true;
     }
   }

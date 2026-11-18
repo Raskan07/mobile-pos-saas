@@ -23,13 +23,15 @@ import {
   Query,
 } from "firebase/firestore";
 import { createUserWithEmailAndPassword } from "firebase/auth";
-import { db, getSecondaryAuth } from "../firebase";
-import { ShopUser, CreateUserInput, UserRole } from "../types/user";
-
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { db, storage, getSecondaryAuth } from "../firebase";
+import { ShopUser, CreateUserInput, UserRole, UserPersonalNote } from "../types/user";
+import { DEFAULT_BRANCH_PERMISSIONS_BY_ROLE } from "../rbac/permissions";
 import { hashPassword } from "./shopAuthService";
 
 const USERS_COLLECTION = "users";
 const SHOPS_COLLECTION = "shops";
+const USER_IMAGES_COLLECTION = "user_images";
 
 /**
  * Create a staff user with password & assign strictly to one shop
@@ -88,6 +90,19 @@ export async function createUserAndAssignToShop(
 
   const now = Date.now();
   const displayName = input.displayName?.trim() || username;
+  const cleanRole = (input.role || "cashier").toLowerCase();
+  const primaryBranchId = (input.primaryBranchId || input.branchId || "main").trim();
+  const assignedBranchIds = Array.from(
+    new Set([primaryBranchId, ...(input.assignedBranchIds || [])])
+  );
+  const allBranchesAccess =
+    input.allBranchesAccess !== undefined
+      ? Boolean(input.allBranchesAccess)
+      : cleanRole === "admin";
+  const defaultBranchPerms =
+    DEFAULT_BRANCH_PERMISSIONS_BY_ROLE[cleanRole] ||
+    DEFAULT_BRANCH_PERMISSIONS_BY_ROLE.cashier;
+
   const userData: ShopUser = {
     uid: authUid,
     username,
@@ -99,8 +114,12 @@ export async function createUserAndAssignToShop(
     role: input.role,
     shopId: normalizedShopId,
     shopName,
-    branchId: input.branchId || "main",
+    branchId: primaryBranchId,
     branchName: input.branchName || "Main Branch",
+    primaryBranchId,
+    assignedBranchIds,
+    allBranchesAccess,
+    branchPermissions: input.branchPermissions || defaultBranchPerms,
     permissions: input.permissions || [input.role],
     status: "active",
     createdAt: now,
@@ -311,4 +330,152 @@ export function filterDataByShop<T = DocumentData>(
     where("shopId", "==", normalizedShopId)
   ) as Query<T>;
 }
+
+/**
+ * Upload user profile avatar to Firebase Storage (`shops/{shopId}/user_images/...`)
+ * and register metadata in Firestore `user_images` collection + user document.
+ */
+export async function uploadUserProfileImage(
+  shopId: string,
+  userId: string,
+  file: File
+): Promise<string> {
+  const normShopId = (shopId || "DEFAULT").trim().toUpperCase();
+  const cleanUserId = (userId || "staff").trim();
+
+  const cleanFileName = file.name.replace(/[^a-zA-Z0-9.-]/g, "_");
+  const uniqueName = `${cleanUserId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}_${cleanFileName}`;
+  const storagePath = `shops/${normShopId}/${USER_IMAGES_COLLECTION}/${uniqueName}`;
+
+  const storageRef = ref(storage, storagePath);
+  const snapshot = await uploadBytes(storageRef, file, {
+    contentType: file.type || "image/jpeg",
+    customMetadata: {
+      shopId: normShopId,
+      userId: cleanUserId,
+      originalName: file.name,
+    },
+  });
+
+  const downloadUrl = await getDownloadURL(snapshot.ref);
+  const now = Date.now();
+
+  const imageRecord = {
+    id: uniqueName,
+    shopId: normShopId,
+    userId: cleanUserId,
+    storagePath,
+    downloadUrl,
+    fileName: file.name,
+    fileSize: file.size,
+    contentType: file.type || "image/jpeg",
+    uploadedAt: now,
+  };
+
+  // 1. Store record in shop-scoped Firestore `shops/{shopId}/user_images/{id}`
+  try {
+    const shopImgRef = doc(db, SHOPS_COLLECTION, normShopId, USER_IMAGES_COLLECTION, uniqueName);
+    await setDoc(shopImgRef, imageRecord);
+  } catch (err) {
+    console.warn("[UserService] Notice writing to shop user_images collection:", err);
+  }
+
+  // 2. Mirror record to root `user_images/{id}` collection
+  try {
+    const rootImgRef = doc(db, USER_IMAGES_COLLECTION, uniqueName);
+    await setDoc(rootImgRef, imageRecord);
+  } catch (err) {
+    console.warn("[UserService] Notice writing to root user_images collection:", err);
+  }
+
+  // 3. Persist avatarUrl onto user profile documents
+  await updateUserProfileDetails(normShopId, cleanUserId, { avatarUrl: downloadUrl });
+
+  return downloadUrl;
+}
+
+/**
+ * Update user profile details (displayName, username, email, phone, jobTitle, bio,
+ * avatarUrl, scratchpadNote, personalNotes) in Firestore (`users/{uid}` and `shops/{shopId}/users/{uid}`).
+ */
+export async function updateUserProfileDetails(
+  shopId: string,
+  userId: string,
+  updates: {
+    displayName?: string;
+    username?: string;
+    email?: string;
+    phone?: string;
+    jobTitle?: string;
+    bio?: string;
+    avatarUrl?: string;
+    scratchpadNote?: string;
+    personalNotes?: UserPersonalNote[];
+  }
+): Promise<void> {
+  const normShopId = (shopId || "DEFAULT").trim().toUpperCase();
+  const cleanUserId = (userId || "").trim();
+  if (!cleanUserId) return;
+
+  const now = Date.now();
+  const payload: Record<string, any> = {
+    shopId: normShopId,
+    updatedAt: now,
+  };
+
+  if (updates.displayName !== undefined) payload.displayName = updates.displayName.trim();
+  if (updates.username !== undefined) payload.username = updates.username.trim();
+  if (updates.email !== undefined) payload.email = updates.email.trim();
+  if (updates.phone !== undefined) payload.phone = updates.phone.trim();
+  if (updates.jobTitle !== undefined) payload.jobTitle = updates.jobTitle.trim();
+  if (updates.bio !== undefined) payload.bio = updates.bio.trim();
+  if (updates.avatarUrl !== undefined) payload.avatarUrl = updates.avatarUrl;
+  if (updates.scratchpadNote !== undefined) payload.scratchpadNote = updates.scratchpadNote;
+  if (updates.personalNotes !== undefined) payload.personalNotes = updates.personalNotes;
+
+  try {
+    const rootUserRef = doc(db, USERS_COLLECTION, cleanUserId);
+    await setDoc(rootUserRef, payload, { merge: true });
+  } catch (err) {
+    console.warn("[UserService] Notice updating root users doc:", err);
+  }
+
+  try {
+    const shopUserRef = doc(db, SHOPS_COLLECTION, normShopId, USERS_COLLECTION, cleanUserId);
+    await setDoc(shopUserRef, payload, { merge: true });
+  } catch (err) {
+    console.warn("[UserService] Notice updating shop users doc:", err);
+  }
+}
+
+/**
+ * Fetch latest persisted user profile fields (including avatarUrl and personalNotes) from Firestore.
+ */
+export async function fetchUserProfileDetails(
+  shopId: string,
+  userId: string
+): Promise<Partial<ShopUser> | null> {
+  const normShopId = (shopId || "DEFAULT").trim().toUpperCase();
+  const cleanUserId = (userId || "").trim();
+  if (!cleanUserId) return null;
+
+  try {
+    const shopUserRef = doc(db, SHOPS_COLLECTION, normShopId, USERS_COLLECTION, cleanUserId);
+    const shopSnap = await getDoc(shopUserRef);
+    if (shopSnap.exists()) {
+      return shopSnap.data() as Partial<ShopUser>;
+    }
+
+    const rootUserRef = doc(db, USERS_COLLECTION, cleanUserId);
+    const rootSnap = await getDoc(rootUserRef);
+    if (rootSnap.exists()) {
+      return rootSnap.data() as Partial<ShopUser>;
+    }
+  } catch (err) {
+    console.warn("[UserService] Notice fetching user profile details:", err);
+  }
+
+  return null;
+}
+
 

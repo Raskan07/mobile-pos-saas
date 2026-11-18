@@ -40,6 +40,8 @@ export interface Supplier {
 export interface Category {
   id: string;
   shopId: string;
+  branchId?: string;
+  branchName?: string;
   name: string;
   description?: string;
   icon?: string;
@@ -55,6 +57,8 @@ export interface Category {
 export interface Subcategory {
   id: string;
   shopId: string;
+  branchId?: string;
+  branchName?: string;
   categoryId: string;
   categoryName?: string;
   name: string;
@@ -80,6 +84,8 @@ export interface ProductVariant {
 export interface ProductItem {
   id: string;
   shopId: string;
+  branchId?: string;
+  branchName?: string;
   categoryId: string;
   categoryName?: string;
   subcategoryId: string;
@@ -108,6 +114,8 @@ export interface ProductItem {
 }
 
 export interface CreateCategoryInput {
+  branchId?: string;
+  branchName?: string;
   name: string;
   description?: string;
   icon?: string;
@@ -115,6 +123,8 @@ export interface CreateCategoryInput {
 }
 
 export interface CreateSubcategoryInput {
+  branchId?: string;
+  branchName?: string;
   categoryId: string;
   categoryName?: string;
   name: string;
@@ -122,9 +132,11 @@ export interface CreateSubcategoryInput {
 }
 
 export interface CreateProductInput {
+  branchId?: string;
+  branchName?: string;
   categoryId: string;
   categoryName?: string;
-  subcategoryId: string;
+  subcategoryId?: string;
   subcategoryName?: string;
   name: string;
   images?: string[];

@@ -56,6 +56,7 @@ export const NAV_CONFIG: NavSection[] = [
       { label: "Add Shop", href: "/sa-9x8f2k/shops?action=add-shop", icon: Plus, actionId: "add-shop" },
       { label: "Staff", href: "/sa-9x8f2k/staff", icon: Users },
       { label: "Roles", href: "/sa-9x8f2k/staff", icon: ShieldCheck },
+      { label: "Messages", href: "/sa-9x8f2k/notifications", icon: Bell },
     ],
   },
   {
@@ -87,7 +88,7 @@ export const NAV_CONFIG: NavSection[] = [
     icon: Settings,
     subItems: [
       { label: "General", href: "/sa-9x8f2k/settings", icon: SlidersHorizontal },
-      { label: "Notifications", href: "/sa-9x8f2k/settings/notifications", icon: Bell },
+      { label: "Messages", href: "/sa-9x8f2k/settings/notifications", icon: Bell },
       { label: "Security", href: "/sa-9x8f2k/settings/security", icon: Lock },
       { label: "Localization", href: "/sa-9x8f2k/settings/locale", icon: Globe },
       { label: "Appearance", href: "/sa-9x8f2k/settings/appearance", icon: Palette },

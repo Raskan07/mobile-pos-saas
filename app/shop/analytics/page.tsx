@@ -63,6 +63,8 @@ import { downloadReturnsExcel } from "@/lib/exporters/returnsExcelExporter";
 
 import IOSFeaturedCard from "@/components/analytics/IOSFeaturedCard";
 import SalesTrendChart from "@/components/analytics/SalesTrendChart";
+import MonthlySalesPerformanceChart from "@/components/analytics/MonthlySalesPerformanceChart";
+import SalesByTimeHeatmap from "@/components/analytics/SalesByTimeHeatmap";
 import PaymentBreakdownSection from "@/components/analytics/PaymentBreakdownSection";
 import ProductAnalyticsSection from "@/components/analytics/ProductAnalyticsSection";
 import CategoryAnalyticsSection from "@/components/analytics/CategoryAnalyticsSection";
@@ -155,7 +157,7 @@ function getDateRangeBounds(
 
 export default function ShopSalesAnalyticsPage() {
   const router = useRouter();
-  const { shop, user, activeBranchName, isAuthenticated, isLoading: isAuthLoading } = useShopAuth();
+  const { shop, user, activeBranchId, activeBranchName, isAuthenticated, isLoading: isAuthLoading } = useShopAuth();
   const { hasPermission, isShopAdmin } = useRBAC();
 
   // Role-Based Access Control: View sales permission or Shop Admin
@@ -221,13 +223,14 @@ export default function ShopSalesAnalyticsPage() {
         console.error(`[SalesAnalytics] Error fetching sales for shop ${shop.shopId}:`, err);
         setFetchError(err.message || "Failed to load sales data.");
         setIsLoadingSales(false);
-      }
+      },
+      activeBranchId
     );
 
     return () => {
       unsubscribe();
     };
-  }, [shop?.shopId, isAuthenticated, canViewSales]);
+  }, [shop?.shopId, isAuthenticated, canViewSales, activeBranchId]);
 
   // ---------------------------------------------------------------------------
   // 2. Single reusable filtered dataset by authenticated shop ID & date range
@@ -708,8 +711,28 @@ export default function ShopSalesAnalyticsPage() {
         {/* ── Tab View: OVERVIEW ── */}
         {activeTab === "overview" && (
           <div className="space-y-4">
-            {/* Sales Trend Chart */}
-            <SalesTrendChart timeline={analytics.timeline} currencySymbol={currencySymbol} />
+            {/* 1. Luminous Bar Chart ("Cash Flow / Sales Volume" with Glowing Orange Spotlight Bar & Star Sparkle) */}
+            <SalesTrendChart
+              timeline={analytics.timeline}
+              sales={allShopSales}
+              currencySymbol={currencySymbol}
+            />
+
+            {/* 2. Dual Dashboard Feature Row: "Monthly Sales performance" (8 cols) + Compact 24-Hour "Sales by time" (4 cols, ~20% smaller footprint) */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-stretch">
+              <div className="lg:col-span-8">
+                <MonthlySalesPerformanceChart
+                  sales={allShopSales}
+                  currencySymbol={currencySymbol}
+                />
+              </div>
+              <div className="lg:col-span-4">
+                <SalesByTimeHeatmap
+                  sales={allShopSales}
+                  currencySymbol={currencySymbol}
+                />
+              </div>
+            </div>
 
             {/* Quick Section Grid: Payment Snapshot & Top Products */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-3.5">

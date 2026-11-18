@@ -54,6 +54,85 @@ const SUPPLIERS_COLLECTION = "suppliers";
 const IMAGES_COLLECTION = "product_images";
 
 // -------------------------------------------------------------
+// FAST IN-MEMORY & SESSIONSTORAGE CATALOG CACHE (SWR, BRANCH-SCOPED)
+// -------------------------------------------------------------
+export interface CatalogCacheSnapshot {
+  categories: Category[];
+  subcategories: Subcategory[];
+  products: ProductItem[];
+  brands: Brand[];
+  suppliers: Supplier[];
+  updatedAt: number;
+}
+
+const memoryCatalogCache = new Map<string, CatalogCacheSnapshot>();
+const CATALOG_STORAGE_PREFIX = "pos_catalog_cache_v2_";
+
+export function resolveEffectiveBranchId(branchId?: string | null): string {
+  const clean = (branchId || "").trim();
+  if (!clean || clean === "ALL") return "main";
+  return clean;
+}
+
+function buildCatalogCacheKey(shopId: string, branchId?: string): string {
+  const normShopId = normalizeShopId(shopId);
+  const normBranch = (branchId || "main").trim() || "main";
+  return `${normShopId}__${normBranch}`;
+}
+
+export function getCachedCatalogSnapshot(
+  shopId: string,
+  branchId?: string
+): CatalogCacheSnapshot | null {
+  const normShopId = normalizeShopId(shopId);
+  if (!normShopId) return null;
+  const cacheKey = buildCatalogCacheKey(normShopId, branchId);
+
+  const inMem = memoryCatalogCache.get(cacheKey);
+  if (inMem) return inMem;
+
+  if (typeof window !== "undefined") {
+    try {
+      const raw = sessionStorage.getItem(`${CATALOG_STORAGE_PREFIX}${cacheKey}`);
+      if (raw) {
+        const parsed = JSON.parse(raw) as CatalogCacheSnapshot;
+        if (parsed && Array.isArray(parsed.products)) {
+          memoryCatalogCache.set(cacheKey, parsed);
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore storage parse error
+    }
+  }
+  return null;
+}
+
+export function saveCachedCatalogSnapshot(
+  shopId: string,
+  snapshot: Omit<CatalogCacheSnapshot, "updatedAt">,
+  branchId?: string
+): void {
+  const normShopId = normalizeShopId(shopId);
+  if (!normShopId) return;
+  const cacheKey = buildCatalogCacheKey(normShopId, branchId);
+
+  const entry: CatalogCacheSnapshot = {
+    ...snapshot,
+    updatedAt: Date.now(),
+  };
+  memoryCatalogCache.set(cacheKey, entry);
+
+  if (typeof window !== "undefined") {
+    try {
+      sessionStorage.setItem(`${CATALOG_STORAGE_PREFIX}${cacheKey}`, JSON.stringify(entry));
+    } catch {
+      // ignore storage quota
+    }
+  }
+}
+
+// -------------------------------------------------------------
 // HELPER: Validate shopId and audit user
 // -------------------------------------------------------------
 function assertValidSession(shopId: string, user?: AuditUser) {
@@ -193,21 +272,69 @@ export async function createSupplier(
 }
 
 // -------------------------------------------------------------
-// CATEGORIES (Level 1)
+// CATEGORIES (Level 1 - Branch Scoped under shops/{shopId}/branches/{branchId}/categories)
 // -------------------------------------------------------------
 
-export async function getCategories(shopId: string): Promise<Category[]> {
+export async function getCategories(
+  shopId: string,
+  branchId?: string
+): Promise<Category[]> {
   const normShopId = normalizeShopId(shopId);
   if (!normShopId) return [];
 
-  const catRef = collection(db, "shops", normShopId, CATEGORIES_COLLECTION);
-  const q = query(catRef, orderBy("createdAt", "desc"));
-  const snap = await getDocs(q);
+  const catMap = new Map<string, Category>();
+  const shopCatRef = collection(db, "shops", normShopId, CATEGORIES_COLLECTION);
+  const queries: Promise<unknown>[] = [getDocs(query(shopCatRef))];
 
-  return snap.docs.map((docSnap) => ({
-    id: docSnap.id,
-    ...(docSnap.data() as Omit<Category, "id">),
-  }));
+  if (branchId && branchId !== "ALL") {
+    const branchCatRef = collection(
+      db,
+      "shops",
+      normShopId,
+      "branches",
+      branchId,
+      CATEGORIES_COLLECTION
+    );
+    queries.unshift(getDocs(query(branchCatRef)));
+  }
+
+  const results = await Promise.allSettled(queries);
+  results.forEach((res) => {
+    if (res.status === "fulfilled" && res.value) {
+      const snap = res.value as Awaited<ReturnType<typeof getDocs>>;
+      snap.docs.forEach((docSnap) => {
+        if (catMap.has(docSnap.id)) return;
+        const data = docSnap.data() as Omit<Category, "id">;
+        const docBranchId = resolveEffectiveBranchId(data.branchId);
+        const catObj: Category = {
+          id: docSnap.id,
+          ...data,
+          branchId: docBranchId,
+        };
+        if (!data.branchId) {
+          // Backfill missing branchId to "main"
+          void setDoc(
+            doc(db, "shops", normShopId, CATEGORIES_COLLECTION, docSnap.id),
+            { branchId: "main" },
+            { merge: true }
+          ).catch(() => {});
+          void setDoc(
+            doc(db, "shops", normShopId, "branches", "main", CATEGORIES_COLLECTION, docSnap.id),
+            catObj,
+            { merge: true }
+          ).catch(() => {});
+        }
+        catMap.set(docSnap.id, catObj);
+      });
+    }
+  });
+
+  let list = Array.from(catMap.values());
+  if (branchId && branchId !== "ALL") {
+    list = list.filter((c) => resolveEffectiveBranchId(c.branchId) === branchId);
+  }
+  list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return list;
 }
 
 export async function createCategory(
@@ -223,12 +350,15 @@ export async function createCategory(
     throw new Error("Category name is required.");
   }
 
+  const targetBranchId = resolveEffectiveBranchId(input.branchId);
   const categoryId = `cat_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const now = Date.now();
 
   const categoryData: Category = {
     id: categoryId,
     shopId: normShopId,
+    branchId: targetBranchId,
+    branchName: input.branchName || "",
     name,
     description: input.description?.trim() || "",
     icon: input.icon || "Package",
@@ -246,7 +376,19 @@ export async function createCategory(
   };
 
   const docRef = doc(db, "shops", normShopId, CATEGORIES_COLLECTION, categoryId);
-  await setDoc(docRef, categoryData);
+  const branchDocRef = doc(
+    db,
+    "shops",
+    normShopId,
+    "branches",
+    targetBranchId,
+    CATEGORIES_COLLECTION,
+    categoryId
+  );
+  await Promise.all([
+    setDoc(docRef, categoryData),
+    setDoc(branchDocRef, categoryData).catch(() => {}),
+  ]);
 
   return categoryData;
 }
@@ -290,22 +432,72 @@ export async function deleteCategory(shopId: string, categoryId: string): Promis
 
 export async function getSubcategories(
   shopId: string,
-  categoryId?: string
+  categoryId?: string,
+  branchId?: string
 ): Promise<Subcategory[]> {
   const normShopId = normalizeShopId(shopId);
   if (!normShopId) return [];
 
+  const subMap = new Map<string, Subcategory>();
   const subRef = collection(db, "shops", normShopId, SUBCATEGORIES_COLLECTION);
-  let q = query(subRef, orderBy("createdAt", "desc"));
-  if (categoryId) {
-    q = query(subRef, where("categoryId", "==", categoryId), orderBy("createdAt", "desc"));
+  const queries: Promise<unknown>[] = [
+    getDocs(categoryId ? query(subRef, where("categoryId", "==", categoryId)) : query(subRef)),
+  ];
+
+  if (branchId && branchId !== "ALL") {
+    const branchSubRef = collection(
+      db,
+      "shops",
+      normShopId,
+      "branches",
+      branchId,
+      SUBCATEGORIES_COLLECTION
+    );
+    queries.unshift(
+      getDocs(
+        categoryId
+          ? query(branchSubRef, where("categoryId", "==", categoryId))
+          : query(branchSubRef)
+      )
+    );
   }
 
-  const snap = await getDocs(q);
-  return snap.docs.map((docSnap) => ({
-    id: docSnap.id,
-    ...(docSnap.data() as Omit<Subcategory, "id">),
-  }));
+  const results = await Promise.allSettled(queries);
+  results.forEach((res) => {
+    if (res.status === "fulfilled" && res.value) {
+      const snap = res.value as Awaited<ReturnType<typeof getDocs>>;
+      snap.docs.forEach((docSnap) => {
+        if (subMap.has(docSnap.id)) return;
+        const data = docSnap.data() as Omit<Subcategory, "id">;
+        const docBranchId = resolveEffectiveBranchId(data.branchId);
+        const subObj: Subcategory = {
+          id: docSnap.id,
+          ...data,
+          branchId: docBranchId,
+        };
+        if (!data.branchId) {
+          void setDoc(
+            doc(db, "shops", normShopId, SUBCATEGORIES_COLLECTION, docSnap.id),
+            { branchId: "main" },
+            { merge: true }
+          ).catch(() => {});
+          void setDoc(
+            doc(db, "shops", normShopId, "branches", "main", SUBCATEGORIES_COLLECTION, docSnap.id),
+            subObj,
+            { merge: true }
+          ).catch(() => {});
+        }
+        subMap.set(docSnap.id, subObj);
+      });
+    }
+  });
+
+  let list = Array.from(subMap.values());
+  if (branchId && branchId !== "ALL") {
+    list = list.filter((s) => resolveEffectiveBranchId(s.branchId) === branchId);
+  }
+  list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return list;
 }
 
 export async function createSubcategory(
@@ -324,12 +516,15 @@ export async function createSubcategory(
     throw new Error("Parent category is required.");
   }
 
+  const targetBranchId = resolveEffectiveBranchId(input.branchId);
   const subcategoryId = `subcat_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const now = Date.now();
 
   const subcategoryData: Subcategory = {
     id: subcategoryId,
     shopId: normShopId,
+    branchId: targetBranchId,
+    branchName: input.branchName || "",
     categoryId: input.categoryId,
     categoryName: input.categoryName || "",
     name,
@@ -346,7 +541,19 @@ export async function createSubcategory(
   };
 
   const docRef = doc(db, "shops", normShopId, SUBCATEGORIES_COLLECTION, subcategoryId);
-  await setDoc(docRef, subcategoryData);
+  const branchDocRef = doc(
+    db,
+    "shops",
+    normShopId,
+    "branches",
+    targetBranchId,
+    SUBCATEGORIES_COLLECTION,
+    subcategoryId
+  );
+  await Promise.all([
+    setDoc(docRef, subcategoryData),
+    setDoc(branchDocRef, subcategoryData).catch(() => {}),
+  ]);
 
   // Increment subcategories count on parent category
   try {
@@ -417,59 +624,103 @@ export async function deleteSubcategory(
 export async function getProducts(
   shopId: string,
   subcategoryId?: string,
-  categoryId?: string
+  categoryId?: string,
+  branchId?: string
 ): Promise<ProductItem[]> {
   const normShopId = normalizeShopId(shopId);
   if (!normShopId) return [];
 
   const productMap = new Map<string, ProductItem>();
 
-  // 1. Fetch from shops/{shopId}/products
-  try {
-    const prodRef = collection(db, "shops", normShopId, PRODUCTS_COLLECTION);
-    let q = query(prodRef, orderBy("createdAt", "desc"));
-
-    if (subcategoryId) {
-      q = query(prodRef, where("subcategoryId", "==", subcategoryId), orderBy("createdAt", "desc"));
-    } else if (categoryId) {
-      q = query(prodRef, where("categoryId", "==", categoryId), orderBy("createdAt", "desc"));
-    }
-
-    const snap = await getDocs(q);
-    snap.docs.forEach((docSnap) => {
-      productMap.set(docSnap.id, {
-        id: docSnap.id,
-        ...(docSnap.data() as Omit<ProductItem, "id">),
-      });
-    });
-  } catch (err) {
-    console.warn("[CatalogService] Subcollection products fetch warning:", err);
+  const prodRef = collection(db, "shops", normShopId, PRODUCTS_COLLECTION);
+  let subQ = query(prodRef);
+  if (subcategoryId) {
+    subQ = query(prodRef, where("subcategoryId", "==", subcategoryId));
+  } else if (categoryId) {
+    subQ = query(prodRef, where("categoryId", "==", categoryId));
   }
 
-  // 2. Also fetch from root collection "products" where shopId == normShopId
-  try {
-    const rootRef = collection(db, PRODUCTS_COLLECTION);
-    let rootQ = query(rootRef, where("shopId", "==", normShopId));
-    if (subcategoryId) {
-      rootQ = query(rootRef, where("shopId", "==", normShopId), where("subcategoryId", "==", subcategoryId));
-    } else if (categoryId) {
-      rootQ = query(rootRef, where("shopId", "==", normShopId), where("categoryId", "==", categoryId));
-    }
+  const rootRef = collection(db, PRODUCTS_COLLECTION);
+  let rootQ = query(rootRef, where("shopId", "==", normShopId));
+  if (subcategoryId) {
+    rootQ = query(
+      rootRef,
+      where("shopId", "==", normShopId),
+      where("subcategoryId", "==", subcategoryId)
+    );
+  } else if (categoryId) {
+    rootQ = query(
+      rootRef,
+      where("shopId", "==", normShopId),
+      where("categoryId", "==", categoryId)
+    );
+  }
 
-    const rootSnap = await getDocs(rootQ);
-    rootSnap.docs.forEach((docSnap) => {
-      if (!productMap.has(docSnap.id)) {
-        productMap.set(docSnap.id, {
+  const queries: Promise<unknown>[] = [getDocs(subQ), getDocs(rootQ)];
+
+  // Also query the hierarchical branch products path: shops/{shopId}/branches/{branchId}/products
+  if (branchId && branchId !== "ALL") {
+    const branchProdRef = collection(
+      db,
+      "shops",
+      normShopId,
+      "branches",
+      branchId,
+      PRODUCTS_COLLECTION
+    );
+    let branchQ = query(branchProdRef);
+    if (subcategoryId) {
+      branchQ = query(branchProdRef, where("subcategoryId", "==", subcategoryId));
+    } else if (categoryId) {
+      branchQ = query(branchProdRef, where("categoryId", "==", categoryId));
+    }
+    queries.unshift(getDocs(branchQ));
+  }
+
+  const results = await Promise.allSettled(queries);
+
+  results.forEach((res) => {
+    if (res.status === "fulfilled" && res.value) {
+      const snap = res.value as Awaited<ReturnType<typeof getDocs>>;
+      snap.docs.forEach((docSnap) => {
+        if (productMap.has(docSnap.id)) return;
+        const data = docSnap.data() as Omit<ProductItem, "id">;
+        const resolvedBranchId = resolveEffectiveBranchId(data.branchId);
+        const prodObj: ProductItem = {
           id: docSnap.id,
-          ...(docSnap.data() as Omit<ProductItem, "id">),
-        });
-      }
-    });
-  } catch (err) {
-    console.warn("[CatalogService] Root collection products fetch warning:", err);
-  }
+          ...data,
+          branchId: resolvedBranchId,
+          name: (data.name || "").toUpperCase(),
+        };
 
-  const list = Array.from(productMap.values());
+        // If a legacy product has no branchId, set it to "main" and backfill in Firestore
+        if (!data.branchId) {
+          void setDoc(
+            doc(db, "shops", normShopId, PRODUCTS_COLLECTION, docSnap.id),
+            { branchId: "main" },
+            { merge: true }
+          ).catch(() => {});
+          void setDoc(
+            doc(db, PRODUCTS_COLLECTION, docSnap.id),
+            { branchId: "main" },
+            { merge: true }
+          ).catch(() => {});
+          void setDoc(
+            doc(db, "shops", normShopId, "branches", "main", PRODUCTS_COLLECTION, docSnap.id),
+            prodObj,
+            { merge: true }
+          ).catch(() => {});
+        }
+
+        productMap.set(docSnap.id, prodObj);
+      });
+    }
+  });
+
+  let list = Array.from(productMap.values());
+  if (branchId && branchId !== "ALL") {
+    list = list.filter((p) => resolveEffectiveBranchId(p.branchId) === branchId);
+  }
   list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   return list;
 }
@@ -481,29 +732,90 @@ export async function getProductById(
   const normShopId = normalizeShopId(shopId);
   if (!normShopId || !productId) return null;
 
-  // Check subcollection
-  try {
-    const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
-    const snap = await getDoc(docRef);
-    if (snap.exists()) {
-      return { id: snap.id, ...(snap.data() as Omit<ProductItem, "id">) };
-    }
-  } catch (err) {
-    console.warn("[CatalogService] Subcollection product get warning:", err);
-  }
+  const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
+  const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
 
-  // Check root collection "products"
-  try {
-    const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
-    const rootSnap = await getDoc(rootDocRef);
-    if (rootSnap.exists()) {
-      return { id: rootSnap.id, ...(rootSnap.data() as Omit<ProductItem, "id">) };
-    }
-  } catch (err) {
-    console.warn("[CatalogService] Root product get warning:", err);
+  const [subSnap, rootSnap] = await Promise.allSettled([
+    getDoc(docRef),
+    getDoc(rootDocRef),
+  ]);
+
+  if (subSnap.status === "fulfilled" && subSnap.value.exists()) {
+    const data = subSnap.value.data() as Omit<ProductItem, "id">;
+    return {
+      id: subSnap.value.id,
+      ...data,
+      branchId: resolveEffectiveBranchId(data.branchId),
+      name: (data.name || "").toUpperCase(),
+    };
+  }
+  if (rootSnap.status === "fulfilled" && rootSnap.value.exists()) {
+    const data = rootSnap.value.data() as Omit<ProductItem, "id">;
+    return {
+      id: rootSnap.value.id,
+      ...data,
+      branchId: resolveEffectiveBranchId(data.branchId),
+      name: (data.name || "").toUpperCase(),
+    };
   }
 
   return null;
+}
+
+export async function ensureCommonCategory(
+  shopId: string,
+  user: AuditUser,
+  branchId?: string
+): Promise<Category> {
+  const normShopId = normalizeShopId(shopId);
+  assertValidSession(normShopId, user);
+  const targetBranchId = resolveEffectiveBranchId(branchId);
+
+  const existingCats = await getCategories(normShopId, targetBranchId);
+  const found = existingCats.find(
+    (c) =>
+      c.name.trim().toLowerCase() === "common" &&
+      resolveEffectiveBranchId(c.branchId) === targetBranchId
+  );
+  if (found) return found;
+
+  const now = Date.now();
+  const commonCatId = targetBranchId === "main" ? "cat_common" : `cat_common_${targetBranchId}`;
+  const commonCategory: Category = {
+    id: commonCatId,
+    shopId: normShopId,
+    branchId: targetBranchId,
+    name: "Common",
+    description: "Quick products & general catalog items (no subcategory required)",
+    icon: "Package",
+    color: "#10b981",
+    subcategoriesCount: 0,
+    productsCount: 0,
+    createdBy: {
+      userId: user.userId,
+      username: user.username,
+      role: user.role,
+      displayName: user.displayName || user.username,
+    },
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const docRef = doc(db, "shops", normShopId, CATEGORIES_COLLECTION, commonCatId);
+  const branchDocRef = doc(
+    db,
+    "shops",
+    normShopId,
+    "branches",
+    targetBranchId,
+    CATEGORIES_COLLECTION,
+    commonCatId
+  );
+  await Promise.all([
+    setDoc(docRef, commonCategory),
+    setDoc(branchDocRef, commonCategory).catch(() => {}),
+  ]);
+  return commonCategory;
 }
 
 export async function createProduct(
@@ -514,21 +826,23 @@ export async function createProduct(
   const normShopId = normalizeShopId(shopId);
   assertValidSession(normShopId, user);
 
-  const name = input.name?.trim();
+  const name = input.name?.trim().toUpperCase();
   if (!name) throw new Error("Product name is required.");
   if (!input.sku?.trim()) throw new Error("SKU is required.");
   if (!input.categoryId) throw new Error("Parent category is required.");
-  if (!input.subcategoryId) throw new Error("Parent subcategory is required.");
 
+  const targetBranchId = resolveEffectiveBranchId(input.branchId);
   const productId = `prod_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
   const now = Date.now();
 
   const productData: ProductItem = {
     id: productId,
     shopId: normShopId,
+    branchId: targetBranchId,
+    branchName: input.branchName || "",
     categoryId: input.categoryId,
-    categoryName: input.categoryName || "",
-    subcategoryId: input.subcategoryId,
+    categoryName: input.categoryName || "Common",
+    subcategoryId: input.subcategoryId || "",
     subcategoryName: input.subcategoryName || "",
     name,
     images: input.images && input.images.length > 0 ? input.images : [],
@@ -545,7 +859,7 @@ export async function createProduct(
     hasVariants: Boolean(input.hasVariants),
     variants: input.variants && input.variants.length > 0 ? input.variants : [],
     stockQuantity: input.stockQuantity !== undefined ? Number(input.stockQuantity) : 100,
-    minStockLevel: input.minStockLevel !== undefined ? Number(input.minStockLevel) : 10,
+    minStockLevel: input.minStockLevel !== undefined ? Number(input.minStockLevel) : 5,
     status: input.status || "active",
     createdBy: {
       userId: user.userId,
@@ -557,29 +871,35 @@ export async function createProduct(
     updatedAt: now,
   };
 
-  // 1. Save to shops/{shopId}/products/{productId}
+  // Primary hierarchical path: shops/{shopId}/branches/{branchId}/products/{productId}
+  const branchDocRef = doc(
+    db,
+    "shops",
+    normShopId,
+    "branches",
+    targetBranchId,
+    PRODUCTS_COLLECTION,
+    productId
+  );
   const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
-  await setDoc(docRef, productData);
+  const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
+  const catRef = doc(db, "shops", normShopId, CATEGORIES_COLLECTION, input.categoryId);
 
-  // 2. Save directly to root collection "products" as well so it is stored under the products collection
-  try {
-    const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
-    await setDoc(rootDocRef, productData);
-  } catch (rootErr) {
-    console.warn("[CatalogService] Notice mirroring product to root products collection:", rootErr);
-  }
+  const tasks: Promise<unknown>[] = [
+    setDoc(branchDocRef, productData),
+    setDoc(docRef, productData),
+    setDoc(rootDocRef, productData).catch((e) =>
+      console.warn("[CatalogService] Notice mirroring product to root products collection:", e)
+    ),
+    updateDoc(catRef, { productsCount: increment(1), updatedAt: now }).catch(() => {}),
+  ];
 
-  // Increment products count on category and subcategory
-  try {
-    const catRef = doc(db, "shops", normShopId, CATEGORIES_COLLECTION, input.categoryId);
-    await updateDoc(catRef, { productsCount: increment(1), updatedAt: now });
-
+  if (input.subcategoryId) {
     const subRef = doc(db, "shops", normShopId, SUBCATEGORIES_COLLECTION, input.subcategoryId);
-    await updateDoc(subRef, { productsCount: increment(1), updatedAt: now });
-  } catch (e) {
-    console.warn("Could not increment productsCount on category/subcategory:", e);
+    tasks.push(updateDoc(subRef, { productsCount: increment(1), updatedAt: now }).catch(() => {}));
   }
 
+  await Promise.all(tasks);
   return productData;
 }
 
@@ -592,8 +912,22 @@ export async function updateProduct(
   const normShopId = normalizeShopId(shopId);
   assertValidSession(normShopId, user);
 
+  const existing = await getProductById(normShopId, productId);
+  const targetBranchId = resolveEffectiveBranchId(updates.branchId || existing?.branchId);
+
+  const branchDocRef = doc(
+    db,
+    "shops",
+    normShopId,
+    "branches",
+    targetBranchId,
+    PRODUCTS_COLLECTION,
+    productId
+  );
   const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
+  const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
   const patch: Record<string, unknown> = {
+    branchId: targetBranchId,
     updatedAt: Date.now(),
     updatedBy: {
       userId: user.userId,
@@ -603,7 +937,7 @@ export async function updateProduct(
     },
   };
 
-  if (updates.name !== undefined) patch.name = updates.name.trim();
+  if (updates.name !== undefined) patch.name = updates.name.trim().toUpperCase();
   if (updates.sku !== undefined) patch.sku = updates.sku.trim().toUpperCase();
   if (updates.barcode !== undefined) patch.barcode = updates.barcode.trim();
   if (updates.sellingPrice !== undefined) patch.sellingPrice = Number(updates.sellingPrice) || 0;
@@ -620,56 +954,160 @@ export async function updateProduct(
   if (updates.stockQuantity !== undefined) patch.stockQuantity = Number(updates.stockQuantity);
   if (updates.minStockLevel !== undefined) patch.minStockLevel = Number(updates.minStockLevel);
   if (updates.status !== undefined) patch.status = updates.status;
+  if (updates.categoryId !== undefined) patch.categoryId = updates.categoryId;
+  if (updates.categoryName !== undefined) patch.categoryName = updates.categoryName;
+  if (updates.subcategoryId !== undefined) patch.subcategoryId = updates.subcategoryId;
+  if (updates.subcategoryName !== undefined) patch.subcategoryName = updates.subcategoryName;
 
-  await updateDoc(docRef, patch);
+  await Promise.all([
+    setDoc(branchDocRef, patch, { merge: true }).catch(() => {}),
+    setDoc(docRef, patch, { merge: true }),
+    setDoc(rootDocRef, patch, { merge: true }).catch((e) =>
+      console.warn("[CatalogService] Notice updating root products doc:", e)
+    ),
+  ]);
+}
 
-  // Mirror patch to root collection "products"
-  try {
-    const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
-    await setDoc(rootDocRef, patch, { merge: true });
-  } catch (rootErr) {
-    console.warn("[CatalogService] Notice updating root products doc:", rootErr);
+export async function moveProductToSubcategory(
+  shopId: string,
+  productId: string,
+  user: AuditUser,
+  target: {
+    branchId?: string;
+    categoryId: string;
+    categoryName: string;
+    subcategoryId: string;
+    subcategoryName: string;
+    previousCategoryId?: string;
+    previousSubcategoryId?: string;
   }
+): Promise<void> {
+  const normShopId = normalizeShopId(shopId);
+  assertValidSession(normShopId, user);
+
+  const targetBranchId = resolveEffectiveBranchId(target.branchId);
+  const now = Date.now();
+  const patch = {
+    branchId: targetBranchId,
+    categoryId: target.categoryId,
+    categoryName: target.categoryName,
+    subcategoryId: target.subcategoryId || "",
+    subcategoryName: target.subcategoryName || "",
+    updatedAt: now,
+    updatedBy: {
+      userId: user.userId,
+      username: user.username,
+      role: user.role,
+      displayName: user.displayName || user.username,
+    },
+  };
+
+  const branchDocRef = doc(
+    db,
+    "shops",
+    normShopId,
+    "branches",
+    targetBranchId,
+    PRODUCTS_COLLECTION,
+    productId
+  );
+  const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
+  const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
+
+  const tasks: Promise<unknown>[] = [
+    setDoc(branchDocRef, patch, { merge: true }).catch(() => {}),
+    setDoc(docRef, patch, { merge: true }),
+    setDoc(rootDocRef, patch, { merge: true }).catch(() => {}),
+  ];
+
+  if (
+    target.previousSubcategoryId &&
+    target.previousSubcategoryId !== target.subcategoryId
+  ) {
+    const oldSubRef = doc(
+      db,
+      "shops",
+      normShopId,
+      SUBCATEGORIES_COLLECTION,
+      target.previousSubcategoryId
+    );
+    tasks.push(updateDoc(oldSubRef, { productsCount: increment(-1), updatedAt: now }).catch(() => {}));
+  }
+
+  if (target.subcategoryId && target.subcategoryId !== target.previousSubcategoryId) {
+    const newSubRef = doc(
+      db,
+      "shops",
+      normShopId,
+      SUBCATEGORIES_COLLECTION,
+      target.subcategoryId
+    );
+    tasks.push(updateDoc(newSubRef, { productsCount: increment(1), updatedAt: now }).catch(() => {}));
+  }
+
+  if (target.previousCategoryId && target.previousCategoryId !== target.categoryId) {
+    const oldCatRef = doc(
+      db,
+      "shops",
+      normShopId,
+      CATEGORIES_COLLECTION,
+      target.previousCategoryId
+    );
+    const newCatRef = doc(
+      db,
+      "shops",
+      normShopId,
+      CATEGORIES_COLLECTION,
+      target.categoryId
+    );
+    tasks.push(updateDoc(oldCatRef, { productsCount: increment(-1), updatedAt: now }).catch(() => {}));
+    tasks.push(updateDoc(newCatRef, { productsCount: increment(1), updatedAt: now }).catch(() => {}));
+  }
+
+  await Promise.all(tasks);
 }
 
 export async function deleteProduct(
   shopId: string,
   productId: string,
   categoryId?: string,
-  subcategoryId?: string
+  subcategoryId?: string,
+  branchId?: string
 ): Promise<void> {
   const normShopId = normalizeShopId(shopId);
   if (!normShopId || !productId) return;
 
+  const targetBranchId = resolveEffectiveBranchId(branchId);
+  const branchDocRef = doc(
+    db,
+    "shops",
+    normShopId,
+    "branches",
+    targetBranchId,
+    PRODUCTS_COLLECTION,
+    productId
+  );
   const docRef = doc(db, "shops", normShopId, PRODUCTS_COLLECTION, productId);
-  await deleteDoc(docRef);
+  const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
+  const now = Date.now();
 
-  // Also remove from root collection "products"
-  try {
-    const rootDocRef = doc(db, PRODUCTS_COLLECTION, productId);
-    await deleteDoc(rootDocRef);
-  } catch (rootErr) {
-    console.warn("[CatalogService] Notice deleting from root products collection:", rootErr);
-  }
+  const tasks: Promise<unknown>[] = [
+    deleteDoc(branchDocRef).catch(() => {}),
+    deleteDoc(docRef),
+    deleteDoc(rootDocRef).catch(() => {}),
+  ];
 
-  // Decrement counts
   if (categoryId) {
-    try {
-      const catRef = doc(db, "shops", normShopId, CATEGORIES_COLLECTION, categoryId);
-      await updateDoc(catRef, { productsCount: increment(-1), updatedAt: Date.now() });
-    } catch (e) {
-      console.warn("Could not decrement productsCount on category:", e);
-    }
+    const catRef = doc(db, "shops", normShopId, CATEGORIES_COLLECTION, categoryId);
+    tasks.push(updateDoc(catRef, { productsCount: increment(-1), updatedAt: now }).catch(() => {}));
   }
 
   if (subcategoryId) {
-    try {
-      const subRef = doc(db, "shops", normShopId, SUBCATEGORIES_COLLECTION, subcategoryId);
-      await updateDoc(subRef, { productsCount: increment(-1), updatedAt: Date.now() });
-    } catch (e) {
-      console.warn("Could not decrement productsCount on subcategory:", e);
-    }
+    const subRef = doc(db, "shops", normShopId, SUBCATEGORIES_COLLECTION, subcategoryId);
+    tasks.push(updateDoc(subRef, { productsCount: increment(-1), updatedAt: now }).catch(() => {}));
   }
+
+  await Promise.all(tasks);
 }
 
 // -------------------------------------------------------------

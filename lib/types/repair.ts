@@ -18,6 +18,7 @@ import { AuditUser } from "./catalog";
 // ── Repair Status State-Machine ──────────────────────────────────────────────
 
 export type RepairStatus =
+  | "pending"
   | "received"
   | "diagnosing"
   | "awaiting_approval"
@@ -26,6 +27,7 @@ export type RepairStatus =
   | "quality_check"
   | "ready_for_collection"
   | "collected"
+  | "delivered"
   | "cancelled"
   | "irreparable"
   | "customer_declined"
@@ -110,11 +112,24 @@ export interface RepairTicket {
 
   // Financial summary (Denormalized snapshot from subcollections)
   estimatedCost: number; // In base currency units
+  serviceChargeAmount?: number;
+  discountAmount?: number;
+  additionalCharges?: number;
+  internalPartsCost?: number; // Internal component purchase cost (Hidden from customer receipts)
   depositPaid: number;
   totalPaid: number;
+  intakeReceiptNumber?: string;
   finalInvoiceNumber?: string;
   finalSaleId?: string;
   balanceDue: number; // estimatedCost - totalPaid
+  intakeLineItems?: {
+    type: "labor" | "part" | "service_fee" | "express_surcharge";
+    description: string;
+    sku?: string;
+    quantity: number;
+    unitSellingPrice: number;
+    totalPrice: number;
+  }[];
 
   // Dates & Timestamps
   estimatedCompletionDate?: string;
@@ -332,11 +347,23 @@ export interface CreateRepairTicketInput {
   assignedTechnicianId?: string;
   assignedTechnicianName?: string;
   estimatedCost?: number;
+  serviceChargeAmount?: number;
+  discountAmount?: number;
+  additionalCharges?: number;
   initialDepositAmount?: number;
   depositPaymentMethod?: "cash" | "card" | "bank_transfer" | "qr";
   estimatedCompletionDate?: string;
   branchId?: string;
   branchName?: string;
+  initialLineItems?: {
+    type: "labor" | "part" | "service_fee" | "express_surcharge";
+    description: string;
+    sku?: string;
+    quantity: number;
+    unitCost: number;
+    unitSellingPrice: number;
+    totalPrice: number;
+  }[];
 }
 
 export interface RepairFilterOptions {

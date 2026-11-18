@@ -97,9 +97,16 @@ export function exportAccountingReportToPdf(options: ReportExportOptions): void 
   switch (reportType) {
     case "pnl": {
       const p = reportData.pnl;
+      const prodRev = p.productSalesRevenue !== undefined ? p.productSalesRevenue : (p.netRevenue > 0 ? p.netRevenue : p.grossSales);
+      const repRev = p.repairServiceRevenue || 0;
+      const prodCogs = p.productCogs !== undefined ? p.productCogs : p.cogs;
+      const repCogs = p.repairPartsCost || 0;
+
       drawSectionHeading("REVENUE CHANNELS");
-      drawTableRow("Product Invoices Revenue (Sales revenue)", fmtCurrency(p.netRevenue > 0 ? p.netRevenue : p.grossSales, currency));
-      drawTableRow("Wholesale cost of goods sold (COGS)", `- ${fmtCurrency(p.cogs, currency)}`, 14);
+      drawTableRow("Product Invoices Revenue (Retail sales)", fmtCurrency(prodRev, currency));
+      drawTableRow("Workshop Repair & Service Revenue (Repairs & labor)", fmtCurrency(repRev, currency));
+      drawTableRow("Wholesale cost of goods sold (Product COGS)", `- ${fmtCurrency(prodCogs, currency)}`, 14);
+      drawTableRow("Repair replacement parts & component cost (Repair COGS)", `- ${fmtCurrency(repCogs, currency)}`, 14);
       drawTotalRow("GROSS PROFIT", fmtCurrency(p.grossProfit, currency), `Gross Margin: ${p.grossMarginPct.toFixed(1)}%`);
 
       y += 5;
@@ -264,6 +271,42 @@ export function exportAccountingReportToPdf(options: ReportExportOptions): void 
           inv.paymentMethod,
           String(inv.itemCount),
           fmtCurrency(inv.grandTotal, currency),
+        ]);
+      });
+      break;
+    }
+
+    case "repair_statement": {
+      const rs = reportData.repairStatement;
+      drawSectionHeading("WORKSHOP REPAIR REVENUE & COST SUMMARY");
+      drawTableRow("Total Repair Tickets Processed", `${rs.totalTicketsCount} (${rs.completedTicketsCount} Completed / ${rs.activeTicketsCount} Active)`);
+      drawTableRow("Replacement Parts Selling Revenue", fmtCurrency(rs.totalPartsRevenue, currency));
+      drawTableRow("Technical Service & Labor Revenue", fmtCurrency(rs.totalServiceRevenue, currency));
+      if (rs.totalDiscounts > 0) {
+        drawTableRow("Less: Repair Discounts Allowed", `- ${fmtCurrency(rs.totalDiscounts, currency)}`, 14);
+      }
+      drawTotalRow("TOTAL GROSS REPAIR REVENUE", fmtCurrency(rs.totalGrossRepairRevenue, currency));
+      drawTableRow("Less: Internal Replacement Component Cost (COGS)", `- ${fmtCurrency(rs.totalPartsCost, currency)}`, 14);
+      drawDoubleUnderlineTotal("NET WORKSHOP REPAIR PROFIT", fmtCurrency(rs.netRepairProfit, currency), `Margin: ${rs.repairMarginPct.toFixed(1)}%`);
+
+      y += 4;
+      drawSectionHeading("COLLECTIONS & RECEIVABLES");
+      drawTableRow("Total Repair Cash & Digital Collected", fmtCurrency(rs.totalCollectedRevenue, currency));
+      drawTableRow("Outstanding Repair Balance Due (Receivables)", fmtCurrency(rs.totalOutstandingReceivables, currency));
+
+      y += 6;
+      drawSectionHeading("WORKSHOP REPAIR TICKET FINANCIAL LEDGER");
+      drawGridHeader(["Ticket #", "Date", "Customer & Device", "Status", "Revenue", "Part Cost", "Profit"]);
+      rs.tickets.slice(0, 25).forEach((t) => {
+        checkPageBreak(8);
+        drawGridRow([
+          t.ticketNumber,
+          t.date,
+          `${t.customerName} (${t.device})`.slice(0, 20),
+          t.status,
+          fmtCurrency(t.totalBillableRevenue, currency),
+          fmtCurrency(t.partsCost, currency),
+          fmtCurrency(t.grossProfit, currency),
         ]);
       });
       break;
@@ -608,12 +651,20 @@ export function exportAccountingReportToExcel(options: ReportExportOptions): voi
   switch (reportType) {
     case "pnl": {
       const p = reportData.pnl;
+      const prodRev = p.productSalesRevenue !== undefined ? p.productSalesRevenue : (p.netRevenue > 0 ? p.netRevenue : p.grossSales);
+      const repRev = p.repairServiceRevenue || 0;
+      const prodCogs = p.productCogs !== undefined ? p.productCogs : p.cogs;
+      const repCogs = p.repairPartsCost || 0;
+
       sheetData = [
         ...metaRows,
         ["ACCOUNT CATEGORY", "AMOUNT (LKR)", "NOTES / RATIO"],
         ["REVENUE CHANNELS", "", ""],
-        ["  Product Invoices Revenue (Sales revenue)", p.netRevenue > 0 ? p.netRevenue : p.grossSales, ""],
-        ["  Wholesale cost of goods sold (COGS)", -p.cogs, ""],
+        ["  Product Invoices Revenue (Retail sales)", prodRev, ""],
+        ["  Workshop Repair & Service Revenue (Repairs & labor)", repRev, ""],
+        ["  Total Net Revenue", p.netRevenue, ""],
+        ["  Wholesale cost of goods sold (Product COGS)", -prodCogs, ""],
+        ["  Repair replacement parts & component cost (Repair COGS)", -repCogs, ""],
         ["GROSS PROFIT", p.grossProfit, `${p.grossMarginPct.toFixed(1)}% Margin`],
         [],
         ["OPERATING EXPENSES (OPEX)", "", ""],
@@ -713,6 +764,44 @@ export function exportAccountingReportToExcel(options: ReportExportOptions): voi
         ]),
         [],
         ["TOTALS", "", "", "", "", ss.totalInvoices, "", ss.totalDiscounts, ss.totalTaxCollected, ss.totalNetSales, "COMPLETED"],
+      ];
+      break;
+    }
+
+    case "repair_statement": {
+      const rs = reportData.repairStatement;
+      sheetData = [
+        ...metaRows,
+        ["WORKSHOP REPAIR SUMMARY", "AMOUNT (LKR)", "NOTES"],
+        ["Replacement Parts Selling Revenue", rs.totalPartsRevenue, "Billed replacement components"],
+        ["Technical Service & Labor Revenue", rs.totalServiceRevenue, "Service & labor charges"],
+        ["Less: Repair Discounts Allowed", -rs.totalDiscounts, ""],
+        ["Total Gross Repair Revenue", rs.totalGrossRepairRevenue, `${rs.totalTicketsCount} Tickets`],
+        ["Less: Internal Replacement Component Cost (COGS)", -rs.totalPartsCost, "Internal part purchase cost"],
+        ["NET WORKSHOP REPAIR PROFIT", rs.netRepairProfit, `${rs.repairMarginPct.toFixed(1)}% Margin`],
+        ["Total Cash / Digital Collected", rs.totalCollectedRevenue, ""],
+        ["Outstanding Repair Balance Due", rs.totalOutstandingReceivables, ""],
+        [],
+        ["TICKET #", "DATE", "CUSTOMER", "PHONE", "DEVICE", "FAULTS", "STATUS", "PARTS REVENUE", "SERVICE REVENUE", "TOTAL REVENUE", "PARTS COST", "NET PROFIT", "MARGIN %", "PAID", "BALANCE DUE"],
+        ...rs.tickets.map((t) => [
+          t.ticketNumber,
+          t.date,
+          t.customerName,
+          t.customerPhone,
+          t.device,
+          t.faultsSummary,
+          t.status,
+          t.partsRevenue,
+          t.serviceRevenue,
+          t.totalBillableRevenue,
+          t.partsCost,
+          t.grossProfit,
+          t.marginPct,
+          t.amountPaid,
+          t.balanceDue,
+        ]),
+        [],
+        ["TOTALS", `${rs.totalTicketsCount} Tickets`, "", "", "", "", "", rs.totalPartsRevenue, rs.totalServiceRevenue, rs.totalGrossRepairRevenue, rs.totalPartsCost, rs.netRepairProfit, rs.repairMarginPct, rs.totalCollectedRevenue, rs.totalOutstandingReceivables],
       ];
       break;
     }

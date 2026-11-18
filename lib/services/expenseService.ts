@@ -195,6 +195,16 @@ export const DEFAULT_EXPENSE_CATEGORIES: Omit<ExpenseCategory, "id" | "shopId" |
     isActive: true,
     isSystemDefault: true,
   },
+  {
+    name: "Other Expenses",
+    code: "OTHER",
+    type: "OPERATING_EXPENSE",
+    description: "Custom and miscellaneous store operating expenditures.",
+    defaultGlAccount: "6100",
+    isTaxDeductible: true,
+    isActive: true,
+    isSystemDefault: true,
+  },
 ];
 
 // ── Number & ID Generators ───────────────────────────────────────────────────
@@ -1162,12 +1172,19 @@ export function computeExpenseAnalytics(
   const methodMap: Record<string, { total: number; count: number }> = {};
 
   for (const exp of filtered) {
-    const amt = exp.amount;
+    const amt = Number(exp.amount) || Number(exp.salaryDetails?.netSalary) || 0;
     totalExpenses += amt;
-    totalPaid += exp.amountPaid;
-    totalBalanceDue += exp.balanceDue;
+    totalPaid += Number(exp.amountPaid) || 0;
+    totalBalanceDue += Number(exp.balanceDue) || 0;
 
-    if (exp.expenseType === "OPERATING_EXPENSE" || exp.expenseType === "EMPLOYEE_SALARY") {
+    const isSalaryItem =
+      exp.expenseType === "EMPLOYEE_SALARY" ||
+      exp.categoryCode === "SALARY" ||
+      Boolean(exp.salaryDetails) ||
+      (exp.categoryName || "").toLowerCase().includes("salar") ||
+      (exp.categoryName || "").toLowerCase().includes("wage");
+
+    if (exp.expenseType === "OPERATING_EXPENSE" || isSalaryItem) {
       totalOperatingExpenses += amt;
     } else if (exp.expenseType === "CAPITAL_ASSET") {
       totalCapitalAssets += amt;
@@ -1175,6 +1192,8 @@ export function computeExpenseAnalytics(
       totalLiabilitiesPaid += amt;
     } else if (exp.expenseType === "OWNER_WITHDRAWAL") {
       totalOwnerWithdrawals += amt;
+    } else {
+      totalOperatingExpenses += amt;
     }
 
     if (exp.status === "posted") postedCount++;

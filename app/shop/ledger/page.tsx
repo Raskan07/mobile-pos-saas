@@ -76,11 +76,25 @@ import { downloadReturnsExcel } from "@/lib/exporters/returnsExcelExporter";
 import { downloadExchangesPdf } from "@/lib/exporters/exchangesPdfExporter";
 import { downloadExchangesXml } from "@/lib/exporters/exchangesXmlExporter";
 import { downloadExchangesExcel } from "@/lib/exporters/exchangesExcelExporter";
+import { getStoredReceiptSettings, fetchReceiptSettings } from "@/lib/services/receiptSettingsService";
 
 export default function ShopSalesLedgerPage() {
   const router = useRouter();
-  const { shop, user, activeBranchName, isAuthenticated, isLoading: isAuthLoading } = useShopAuth();
+  const { shop, user, activeBranchId, activeBranchName, isAuthenticated, isLoading: isAuthLoading } = useShopAuth();
   const { hasPermission, isShopAdmin } = useRBAC();
+
+  const [currency, setCurrency] = useState<string>(() =>
+    getStoredReceiptSettings(shop?.shopId || "DEFAULT", shop?.shopName || "POS Store").currency || "LKR"
+  );
+
+  useEffect(() => {
+    if (!shop?.shopId) return;
+    const local = getStoredReceiptSettings(shop.shopId, shop.shopName);
+    setCurrency(local.currency || "LKR");
+    fetchReceiptSettings(shop.shopId, shop.shopName).then((remote) => {
+      setCurrency(remote.currency || "LKR");
+    });
+  }, [shop?.shopId, shop?.shopName]);
 
   // Role permissions
   const canViewSales = hasPermission("sales:view") || isShopAdmin;
@@ -187,11 +201,12 @@ export default function ShopSalesLedgerPage() {
       (err) => {
         console.error("[SalesLedger] Subscription error:", err);
         setIsLoading(false);
-      }
+      },
+      activeBranchId
     );
 
     return () => unsubscribe();
-  }, [shop?.shopId, canViewSales]);
+  }, [shop?.shopId, canViewSales, activeBranchId]);
 
   // Date boundary calculator
   const dateBoundaries = useMemo(() => {
@@ -485,7 +500,7 @@ export default function ShopSalesLedgerPage() {
 
   // Format currency
   const fmt = (val: number) =>
-    `LKR ${(val || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    `${currency} ${(val || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
   // Payment method icon
   const getPaymentIcon = (method: string) => {
@@ -677,7 +692,7 @@ export default function ShopSalesLedgerPage() {
     if (shop?.shopId && catalogProducts.length === 0) {
       setIsLoadingCatalog(true);
       try {
-        const prods = await getProducts(shop.shopId);
+        const prods = await getProducts(shop.shopId, undefined, undefined, activeBranchId);
         setCatalogProducts(prods);
       } catch (err) {
         console.error("[SalesLedger] Catalog fetch error for exchange:", err);
@@ -1930,7 +1945,7 @@ export default function ShopSalesLedgerPage() {
                 )}
                 {selectedSale.taxAmount > 0 && (
                   <div className="flex justify-between text-zinc-400">
-                    <span>Tax ({((selectedSale.taxRate || 0.08) * 100).toFixed(0)}%)</span>
+                    <span>Tax ({((selectedSale.taxRate ?? 0) * 100).toFixed(0)}%)</span>
                     <span className="font-mono">{fmt(selectedSale.taxAmount)}</span>
                   </div>
                 )}
