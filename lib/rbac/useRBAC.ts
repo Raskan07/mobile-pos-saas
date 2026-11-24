@@ -20,6 +20,8 @@ import {
   SettingsSubPermissionId,
 } from "../types/user";
 import { BranchPermissionKey } from "../types/branch";
+import { isFeatureEnabledForShop } from "../services/subscriptionService";
+import { SubscriptionFeatureKey } from "../types/subscription";
 
 /**
  * useRBAC
@@ -58,9 +60,19 @@ export function useRBAC() {
 
   const checkModuleAccess = useCallback(
     (module: AppModule | PosModuleId) => {
+      if (!isFeatureEnabledForShop(shop, module)) {
+        return false;
+      }
       return canAccessModule(user, module, rolePermissions);
     },
-    [user, rolePermissions]
+    [shop, user, rolePermissions]
+  );
+
+  const checkFeatureEnabled = useCallback(
+    (featureKey: SubscriptionFeatureKey | string) => {
+      return isFeatureEnabledForShop(shop, featureKey);
+    },
+    [shop]
   );
 
   const checkSubPermissionAccess = useCallback(
@@ -112,6 +124,8 @@ export function useRBAC() {
     hasAnyPermission: checkAnyPermission,
     hasBranchPermission: checkBranchPermission,
     canAccessModule: checkModuleAccess,
+    isFeatureEnabled: checkFeatureEnabled,
+    subscription: shop?.subscription || null,
     canAccessSubPermission: checkSubPermissionAccess,
     canAccessSettingsSubmenu: checkSettingsSubmenu,
   };

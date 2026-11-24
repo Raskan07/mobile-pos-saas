@@ -4,6 +4,8 @@
  * Types for Shop registration, geolocation, and management
  */
 
+import { ShopSubscription, SubscriptionLifecycleStatus } from "./subscription";
+
 export interface Shop {
   id?: string;             // Firestore auto doc ID
   shopId: string;          // Unique Shop identifier (e.g., SHOP-7294 or user custom)
@@ -14,7 +16,9 @@ export interface Shop {
   address?: string;        // Physical store location
   latitude?: number;       // Geolocation latitude
   longitude?: number;      // Geolocation longitude
-  status: "active" | "inactive" | "pending";
+  status: "active" | "inactive" | "pending" | "suspended";
+  subscriptionStatus?: SubscriptionLifecycleStatus;
+  subscription?: ShopSubscription;
   isHidden?: boolean;      // Visibility status toggle (hidden vs visible)
   createdAt: number;       // Unix timestamp in ms
   updatedAt: number;       // Unix timestamp in ms

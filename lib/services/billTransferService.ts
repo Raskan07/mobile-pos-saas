@@ -51,6 +51,26 @@ const PRINTED_JOBS_DEDUPE_STORAGE_PREFIX = "skyfox_printed_jobs_v1_";
 const inFlightPrintJobLocks = new Set<string>();
 
 /**
+ * Recursively strips `undefined` properties from any object/array before writing to Firestore
+ * so `setDoc` and `Transaction.set()` never fail on optional undefined fields.
+ */
+function stripUndefinedDeep<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripUndefinedDeep(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === "object") {
+    const cleaned: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined) {
+        cleaned[k] = stripUndefinedDeep(v);
+      }
+    }
+    return cleaned as T;
+  }
+  return value;
+}
+
+/**
  * Sanitizes any user-entered friendly name so IPv4/IPv6 addresses are never shown or stored.
  */
 export function sanitizeFriendlyDeviceName(rawName: string, fallback = "Main Billing"): string {
@@ -451,25 +471,37 @@ export async function createInterMachineBillTransfer(
     grandTotal: Number(input.grandTotal) || 0,
     currency: input.currency || "LKR",
     preferredPaymentMethod: input.preferredPaymentMethod || "cash",
-    customer: input.customer || null,
+    customer: input.customer
+      ? {
+          customerId: input.customer.customerId || "",
+          name: input.customer.name || "Walk-in Guest",
+          phone: input.customer.phone || "",
+          ...(input.customer.email ? { email: input.customer.email } : {}),
+          ...(typeof input.customer.pointsBalance === "number"
+            ? { pointsBalance: input.customer.pointsBalance }
+            : {}),
+        }
+      : null,
 
     status: "pending",
-    printJobId: input.autoTriggerUsbPrint ? deterministicPrintJobId : undefined,
+    ...(input.autoTriggerUsbPrint ? { printJobId: deterministicPrintJobId } : {}),
     printStatus: input.autoTriggerUsbPrint ? "queued" : "not_queued",
     createdAt: now,
     updatedAt: now,
   };
 
+  const sanitizedTransferRecord = stripUndefinedDeep(transferRecord);
+
   // 1. Write transfer record under `shops/{shopId}/bill_transfers/{transferId}`
   const transferRef = doc(db, "shops", normShopId, BILL_TRANSFERS_SUBCOLLECTION, transferId);
-  await setDoc(transferRef, transferRecord);
+  await setDoc(transferRef, sanitizedTransferRecord);
 
   // 2. If USB Print is requested, enqueue an idempotent Safe Print Queue job
   if (input.autoTriggerUsbPrint) {
-    await enqueueSafeUsbPrintJob(normShopId, transferRecord, targetDeviceData);
+    await enqueueSafeUsbPrintJob(normShopId, sanitizedTransferRecord, targetDeviceData);
   }
 
-  return transferRecord;
+  return sanitizedTransferRecord;
 }
 
 /**
@@ -487,30 +519,30 @@ export async function enqueueSafeUsbPrintJob(
   const jobRef = doc(db, "shops", normShopId, PRINT_QUEUE_SUBCOLLECTION, jobId);
 
   const now = Date.now();
-  const newJob: SafePrintJobRecord = {
+  const newJob: SafePrintJobRecord = stripUndefinedDeep({
     id: jobId,
     idempotencyKey,
     shopId: normShopId,
-    branchId: transfer.branchId,
+    branchId: transfer.branchId || "main",
     transferId: transfer.id,
     transferCode: transfer.transferCode,
     targetDeviceId: transfer.targetDeviceId,
-    targetDeviceName: transfer.targetDeviceName,
+    targetDeviceName: transfer.targetDeviceName || "Main Billing",
     printerFriendlyName:
       targetDevice?.usbPrinterFriendlyName || "USB Thermal Receipt Printer (80mm)",
     paperWidth: targetDevice?.usbPaperWidth || "80mm",
     status: "queued",
     attemptCount: 0,
     payloadSummary: {
-      itemCount: transfer.itemCount,
-      grandTotal: transfer.grandTotal,
-      currency: transfer.currency,
-      customerName: transfer.customer?.name,
-      senderDisplayName: transfer.senderDisplayName,
+      itemCount: Number(transfer.itemCount) || 0,
+      grandTotal: Number(transfer.grandTotal) || 0,
+      currency: transfer.currency || "LKR",
+      customerName: transfer.customer?.name || "Walk-in Guest",
+      senderDisplayName: transfer.senderDisplayName || "Cashier",
     },
     createdAt: now,
     updatedAt: now,
-  };
+  });
 
   await runTransaction(db, async (tx) => {
     const existing = await tx.get(jobRef);

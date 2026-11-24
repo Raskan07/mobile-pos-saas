@@ -368,6 +368,14 @@ export async function createSaleRecord(
                 );
               })
           : Promise.resolve(),
+        import("./subscriptionService")
+          .then(({ assertAndTrackShopStorageUsage }) =>
+            assertAndTrackShopStorageUsage(
+              normShopId,
+              JSON.stringify(saleData).length * 2 + 512
+            )
+          )
+          .catch(() => {}),
       ]);
     } catch (bgErr) {
       console.warn("[SalesService] Background post-sale sync notice:", bgErr);

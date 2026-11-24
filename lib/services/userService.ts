@@ -28,6 +28,10 @@ import { db, storage, getSecondaryAuth } from "../firebase";
 import { ShopUser, CreateUserInput, UserRole, UserPersonalNote } from "../types/user";
 import { DEFAULT_BRANCH_PERMISSIONS_BY_ROLE } from "../rbac/permissions";
 import { hashPassword } from "./shopAuthService";
+import {
+  assertShopUserLimit,
+  assertAndTrackShopStorageUsage,
+} from "./subscriptionService";
 
 const USERS_COLLECTION = "users";
 const SHOPS_COLLECTION = "shops";
@@ -41,6 +45,10 @@ export async function createUserAndAssignToShop(
   password?: string
 ): Promise<ShopUser> {
   const normalizedShopId = input.shopId.trim().toUpperCase();
+
+  // Back-end Subscription User Limit & Storage Quota Check
+  await assertShopUserLimit(normalizedShopId);
+  void assertAndTrackShopStorageUsage(normalizedShopId, 1536).catch(() => {});
   const username = input.username?.trim().toLowerCase() || "user";
   const normalizedEmail = input.email?.trim().toLowerCase() || `${username}@${normalizedShopId.toLowerCase().replace(/[^a-z0-9]/g, "")}.pos`;
   const rawPassword = (password || input.password || "shop123456").trim();

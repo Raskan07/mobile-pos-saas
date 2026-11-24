@@ -813,10 +813,25 @@ export default function ShopDashboardPOS() {
             <button
               type="button"
               onClick={() => setIsNavOpen(true)}
-              className="w-10 h-10 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] active:scale-95 border border-white/[0.08] flex items-center justify-center text-zinc-300 hover:text-white transition-all cursor-pointer shadow-sm group"
+              className="w-10 h-10 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] active:scale-95 border border-white/[0.08] flex items-center justify-center text-zinc-200 hover:text-white transition-all cursor-pointer shadow-sm group"
               title="Open Navigation Hub"
             >
-              <Menu className="w-5 h-5 group-hover:text-zinc-400 transition-colors" />
+              <svg
+                viewBox="0 0 24 24"
+                fill="currentColor"
+                className="w-5 h-5 group-hover:text-zinc-300 transition-colors"
+                aria-hidden="true"
+              >
+                <rect x="3" y="3" width="4.2" height="4.2" rx="0.8" />
+                <rect x="9.9" y="3" width="4.2" height="4.2" rx="0.8" />
+                <rect x="16.8" y="3" width="4.2" height="4.2" rx="0.8" />
+                <rect x="3" y="9.9" width="4.2" height="4.2" rx="0.8" />
+                <rect x="9.9" y="9.9" width="4.2" height="4.2" rx="0.8" />
+                <rect x="16.8" y="9.9" width="4.2" height="4.2" rx="0.8" />
+                <rect x="3" y="16.8" width="4.2" height="4.2" rx="0.8" />
+                <rect x="9.9" y="16.8" width="4.2" height="4.2" rx="0.8" />
+                <rect x="16.8" y="16.8" width="4.2" height="4.2" rx="0.8" />
+              </svg>
             </button>
 
             {/* Brand Logo */}

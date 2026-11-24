@@ -224,6 +224,29 @@ export function ShopAuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!shop?.shopId || !user?.uid) return;
 
+    const normShopId = normalizeShopId(shop.shopId);
+    const shopRef = doc(db, "shops", normShopId);
+    const unsubShop = onSnapshot(
+      shopRef,
+      (snap) => {
+        if (!snap.exists()) return;
+        const remoteShop: Shop = {
+          id: snap.id,
+          ...(snap.data() as Omit<Shop, "id">),
+        };
+        setShop(remoteShop);
+        if (typeof window !== "undefined") {
+          try {
+            sessionStorage.setItem(
+              `${SHOP_CACHE_PREFIX}${normShopId}`,
+              JSON.stringify(remoteShop)
+            );
+          } catch {}
+        }
+      },
+      () => {}
+    );
+
     const userRef = doc(db, "users", user.uid);
     const unsubUser = onSnapshot(
       userRef,
@@ -269,7 +292,10 @@ export function ShopAuthProvider({ children }: { children: React.ReactNode }) {
       }
     );
 
-    return () => unsubUser();
+    return () => {
+      unsubShop();
+      unsubUser();
+    };
   }, [shop?.shopId, user?.uid]);
 
   // Real-time listener on `shops/{shopId}/rolePermissions/{roleId}` so role permission updates apply immediately
@@ -465,10 +491,15 @@ export function ShopAuthProvider({ children }: { children: React.ReactNode }) {
     setOriginalAdminUser(null);
     setActiveBranchId(DEFAULT_BRANCH_ID);
     setActiveBranchName("Main Branch");
+    let redirectLogin = "/shop";
     if (typeof window !== "undefined") {
       sessionStorage.removeItem(STORAGE_KEY);
+      if (window.location.pathname.startsWith("/v1-shop")) {
+        redirectLogin = "/v1-shop";
+      }
     }
-    router.push("/shop");
+    void fetch("/api/auth/shop/session", { method: "DELETE" }).catch(() => {});
+    router.push(redirectLogin);
   }, [router]);
 
   const switchUser = useCallback((targetUser: ShopUser) => {

@@ -182,10 +182,17 @@ export async function authenticateShopUser(
 ): Promise<{ user: ShopUser; shop: Shop; session: ShopSession }> {
   const normalizedShopId = normalizeShopId(shopId);
 
-  // 1. Verify Shop exists
+  // 1. Verify Shop exists & evaluate subscription lifecycle (grace period / suspension)
   const shop = await verifyShopExists(normalizedShopId);
   if (!shop) {
     throw new Error("Shop not found.");
+  }
+
+  if (shop.status === "suspended" || shop.subscription?.status === "suspended") {
+    throw new Error(
+      shop.subscription?.suspensionReason ||
+        "This shop's subscription is currently suspended. Please contact Root Administration to renew and reactivate."
+    );
   }
 
   // 2. Verify User exists WITHIN this shop's nested subcollection

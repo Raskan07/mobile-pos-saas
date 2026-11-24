@@ -322,7 +322,27 @@ export default function SpaceFoxShopAuthPage() {
         targetBranchName
       );
 
+      // Issue server-side HttpOnly signed session cookie for /v1-shop/* and /shop/* route protection
+      await fetch("/api/auth/shop/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          shopId: verifiedShop.shopId,
+          username: username.trim(),
+          password,
+          selectedBranchId,
+          selectedBranchName: targetBranchName,
+        }),
+      }).catch(() => {});
+
       login(session, verifiedShop, user, selectedBranchId, targetBranchName);
+
+      const isV1ShopRoute =
+        typeof window !== "undefined" &&
+        window.location.pathname.startsWith("/v1-shop");
+      const nextDashboardUrl = isV1ShopRoute
+        ? "/v1-shop/dashboard"
+        : "/shop/dashboard";
 
       // Smooth cinematic exit transition: subtle fade + slight scale
       setIsExiting(true);
@@ -333,11 +353,11 @@ export default function SpaceFoxShopAuthPage() {
           duration: 0.65,
           ease: "power2.inOut",
           onComplete: () => {
-            router.push("/shop/dashboard");
+            router.push(nextDashboardUrl);
           },
         });
       } else {
-        router.push("/shop/dashboard");
+        router.push(nextDashboardUrl);
       }
     } catch (err: any) {
       console.error("Login failed:", err);

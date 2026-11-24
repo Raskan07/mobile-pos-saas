@@ -826,6 +826,16 @@ export async function createProduct(
   const normShopId = normalizeShopId(shopId);
   assertValidSession(normShopId, user);
 
+  // Back-end Subscription Feature & Storage Quota Check
+  const { assertShopFeatureAccess, assertAndTrackShopStorageUsage } = await import(
+    "./subscriptionService"
+  );
+  await assertShopFeatureAccess(normShopId, "products");
+  await assertAndTrackShopStorageUsage(
+    normShopId,
+    JSON.stringify(input || {}).length * 2 + 512
+  );
+
   const name = input.name?.trim().toUpperCase();
   if (!name) throw new Error("Product name is required.");
   if (!input.sku?.trim()) throw new Error("SKU is required.");

@@ -41,6 +41,10 @@ import {
 } from "../types/branch";
 import { ProductItem } from "../types/catalog";
 import { ShopUser } from "../types/user";
+import {
+  assertShopBranchLimit,
+  assertAndTrackShopStorageUsage,
+} from "./subscriptionService";
 
 export const BRANCHES_SUBCOLLECTION = "branches";
 export const BRANCH_STOCK_SUBCOLLECTION = "branchStock";
@@ -155,6 +159,10 @@ export async function createBranch(
   const normShopId = normalizeShopId(shopId);
   const name = (input.name || "").trim();
   if (!name) throw new Error("Branch name is required.");
+
+  // Back-end Subscription Branch Limit & Feature Access Check
+  await assertShopBranchLimit(normShopId);
+  void assertAndTrackShopStorageUsage(normShopId, 1536).catch(() => {});
 
   const branchId = generateBranchId(name);
   const now = Date.now();

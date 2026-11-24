@@ -56,6 +56,7 @@ export const NAV_CONFIG: NavSection[] = [
       { label: "Add Shop", href: "/sa-9x8f2k/shops?action=add-shop", icon: Plus, actionId: "add-shop" },
       { label: "Staff", href: "/sa-9x8f2k/staff", icon: Users },
       { label: "Roles", href: "/sa-9x8f2k/staff", icon: ShieldCheck },
+      { label: "Subscriptions", href: "/sa-9x8f2k/subscriptions", icon: CreditCard },
       { label: "Messages", href: "/sa-9x8f2k/notifications", icon: Bell },
     ],
   },
