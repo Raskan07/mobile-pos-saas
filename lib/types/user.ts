@@ -41,6 +41,7 @@ export type PosModuleId =
   | "messages"
   | "settings"
   | "installment_sales"
+  | "promotions"
   | string;
 
 /**

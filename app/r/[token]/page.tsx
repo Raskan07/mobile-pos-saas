@@ -290,11 +290,22 @@ export default function PublicDigitalReceiptPage() {
                 <div className="flex justify-between items-center mt-0.5 text-zinc-700">
                   <span>
                     {item.quantity} × {formatMoney(item.unitPrice)}
+                    {item.originalUnitPrice && item.originalUnitPrice > item.unitPrice && (
+                      <span className="ml-1 line-through text-zinc-400">
+                        {formatMoney(item.originalUnitPrice)}
+                      </span>
+                    )}
                   </span>
                   <span className="font-bold text-zinc-900">
                     {formatMoney(item.subtotal)}
                   </span>
                 </div>
+                {item.promotionName && (
+                  <div className="text-[10px] text-emerald-700">
+                    Promo: {item.promotionName}
+                    {item.promotionDiscountLabel ? ` (${item.promotionDiscountLabel})` : ""}
+                  </div>
+                )}
                 {item.discount > 0 && (
                   <div className="text-[10px] text-emerald-700">
                     - {formatMoney(item.discount)} (Item Disc.)
@@ -310,6 +321,15 @@ export default function PublicDigitalReceiptPage() {
               <span>Subtotal</span>
               <span>{formatMoney(receipt.subtotal)}</span>
             </div>
+
+            {receiptSettings.showDiscount &&
+              typeof receipt.promotionSavings === "number" &&
+              receipt.promotionSavings > 0 && (
+                <div className="flex justify-between text-emerald-700 font-medium">
+                  <span>Promotional Savings</span>
+                  <span>(Saved {formatMoney(receipt.promotionSavings)})</span>
+                </div>
+              )}
 
             {receiptSettings.showDiscount && receipt.discountAmount > 0 && (
               <div className="flex justify-between text-emerald-700 font-medium">

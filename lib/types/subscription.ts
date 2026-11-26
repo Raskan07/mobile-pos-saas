@@ -118,6 +118,12 @@ export const SUBSCRIPTION_FEATURE_CATALOG: SubscriptionFeatureDefinition[] = [
     description: "Installment payment plans, down payments, and overdue reminders.",
   },
   {
+    key: "promotions",
+    label: "Discount Management",
+    category: "finance",
+    description: "Scheduled percentage, fixed LKR, and special-price promotions with analytics.",
+  },
+  {
     key: "customers",
     label: "Customers & Loyalty",
     category: "core_pos",

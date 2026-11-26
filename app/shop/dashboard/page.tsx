@@ -49,11 +49,27 @@ import {
   Product,
   CartItem,
   DiscountSetting,
+  getCartLineKey,
 } from "./posData";
 import { getProducts, getCategories } from "@/lib/services/catalogService";
 import { createSaleRecord } from "@/lib/services/salesService";
 import { SaleRecord } from "@/lib/types/sale";
-import { Category } from "@/lib/types/catalog";
+import { Category, ProductVariant } from "@/lib/types/catalog";
+import type {
+  AppliedPromotion,
+  Promotion,
+  SalePromotionSummary,
+  SalePromotionSummaryEntry,
+} from "@/lib/types/promotion";
+import {
+  subscribeToShopPromotions,
+  promotionApi,
+} from "@/lib/services/promotionService";
+import {
+  findBestPromotionForLine,
+  priceCartLines,
+  roundMoney,
+} from "@/lib/promotions/engine";
 import ProductImage from "./ProductImage";
 import PaymentModal from "./PaymentModal";
 import ReceiptModal from "./ReceiptModal";
@@ -430,6 +446,20 @@ export default function ShopDashboardPOS() {
   const [shopCategories, setShopCategories] = useState<Category[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [isLoadingCatalog, setIsLoadingCatalog] = useState<boolean>(true);
+  const [shopPromotions, setShopPromotions] = useState<Promotion[]>([]);
+  const [promoClockMs, setPromoClockMs] = useState<number>(() => Date.now());
+  const [variantPickerProduct, setVariantPickerProduct] = useState<Product | null>(null);
+
+  // Real-time shop-scoped promotions listener + 15s schedule tick
+  useEffect(() => {
+    if (!shop?.shopId) return;
+    const unsub = subscribeToShopPromotions(shop.shopId, setShopPromotions);
+    const timer = setInterval(() => setPromoClockMs(Date.now()), 15_000);
+    return () => {
+      unsub();
+      clearInterval(timer);
+    };
+  }, [shop?.shopId]);
 
   useEffect(() => {
     if (!shop?.shopId) return;
@@ -463,6 +493,9 @@ export default function ShopDashboardPOS() {
           costPrice: item.costPrice ?? 0,
           unit: item.unit || "pcs",
           brand: item.brand || "",
+          brandId: item.brandId || "",
+          hasVariants: Boolean(item.hasVariants && item.variants && item.variants.length > 0),
+          variants: item.variants || [],
         }));
         setProducts(mapped);
       } catch (err) {
@@ -519,30 +552,67 @@ export default function ShopDashboardPOS() {
   }, []);
 
 
-  // Cart operations
-  const addToCart = (product: Product) => {
-    // Subtle visual animation trigger
+  // Cart operations (supports both single products and specific product variants)
+  const addProductOrVariantToCart = (product: Product, chosenVariant?: ProductVariant) => {
     setAddedAnimationId(product.id);
     setTimeout(() => setAddedAnimationId(null), 300);
 
+    const variantId = chosenVariant?.id || product.variantId;
+    const variantLabel = chosenVariant
+      ? [chosenVariant.size, chosenVariant.color].filter(Boolean).join(" / ") || chosenVariant.sku
+      : product.variant;
+    const lineProduct: Product = chosenVariant
+      ? {
+          ...product,
+          price: chosenVariant.sellingPrice,
+          costPrice: chosenVariant.costPrice ?? product.costPrice,
+          sku: chosenVariant.sku || product.sku,
+          barcode: chosenVariant.barcode || product.barcode,
+          stock: chosenVariant.stockQuantity ?? product.stock,
+          variant: variantLabel,
+          variantId,
+        }
+      : product;
+
+    const targetKey = getCartLineKey(lineProduct.id, variantId);
+
     setCart((prev) => {
-      const existing = prev.find((item) => item.product.id === product.id);
+      const existing = prev.find(
+        (item) => getCartLineKey(item.product.id, item.variantId) === targetKey
+      );
       if (existing) {
         return prev.map((item) =>
-          item.product.id === product.id
+          getCartLineKey(item.product.id, item.variantId) === targetKey
             ? { ...item, quantity: item.quantity + 1 }
             : item
         );
       }
-      return [...prev, { product, quantity: 1 }];
+      return [
+        ...prev,
+        {
+          product: lineProduct,
+          quantity: 1,
+          ...(variantLabel ? { variant: variantLabel } : {}),
+          ...(variantId ? { variantId } : {}),
+        },
+      ];
     });
   };
 
-  const updateQuantity = (productId: string, delta: number) => {
+  const addToCart = (product: Product) => {
+    if (product.variants && product.variants.length > 0 && !product.variantId) {
+      setVariantPickerProduct(product);
+      return;
+    }
+    addProductOrVariantToCart(product);
+  };
+
+  const updateQuantity = (lineKeyOrProductId: string, delta: number) => {
     setCart((prev) =>
       prev
         .map((item) => {
-          if (item.product.id === productId) {
+          const itemKey = getCartLineKey(item.product.id, item.variantId);
+          if (itemKey === lineKeyOrProductId || item.product.id === lineKeyOrProductId) {
             const newQty = item.quantity + delta;
             return newQty > 0 ? { ...item, quantity: newQty } : null;
           }
@@ -552,8 +622,13 @@ export default function ShopDashboardPOS() {
     );
   };
 
-  const removeItem = (productId: string) => {
-    setCart((prev) => prev.filter((item) => item.product.id !== productId));
+  const removeItem = (lineKeyOrProductId: string) => {
+    setCart((prev) =>
+      prev.filter((item) => {
+        const itemKey = getCartLineKey(item.product.id, item.variantId);
+        return itemKey !== lineKeyOrProductId && item.product.id !== lineKeyOrProductId;
+      })
+    );
   };
 
   const clearCart = () => {
@@ -566,44 +641,76 @@ export default function ShopDashboardPOS() {
     }
   };
 
-  // Helper: compute discount amount for a single cart item in "item" scope
+  // Centralized Promotion Evaluation across all cart lines (no stacking; highest valid discount wins)
+  const cartPromotionPricing = useMemo(() => {
+    const lines = cart.map((item) => ({
+      lineKey: getCartLineKey(item.product.id, item.variantId),
+      productId: item.product.id,
+      variantId: item.variantId,
+      categoryId: item.product.category,
+      brandId: item.product.brandId,
+      brandName: item.product.brand,
+      unitPrice: item.product.price,
+      quantity: item.quantity,
+      hasManualPrice: item.customPrice !== undefined,
+    }));
+    return priceCartLines(lines, shopPromotions, promoClockMs, currency);
+  }, [cart, shopPromotions, promoClockMs, currency]);
+
+  const getEffectiveUnitPrice = (item: CartItem): number => {
+    if (item.customPrice !== undefined) return item.customPrice;
+    const key = getCartLineKey(item.product.id, item.variantId);
+    const promo = cartPromotionPricing.byLineKey[key];
+    return promo ? promo.promoUnitPrice : item.product.price;
+  };
+
+  // Helper: compute manual cashier discount amount for a single cart item in "item" scope
   const getItemDiscountAmount = (item: CartItem): number => {
-    const gross = (item.customPrice ?? item.product.price) * item.quantity;
+    const gross = getEffectiveUnitPrice(item) * item.quantity;
     if (gross <= 0) return 0;
     const val = Math.max(0, Number(item.itemDiscountValue) || 0);
     if (val <= 0) return 0;
     if (item.itemDiscountType === "percentage") {
-      return (gross * Math.min(100, val)) / 100;
+      return roundMoney((gross * Math.min(100, val)) / 100);
     }
-    return Math.min(gross, val);
+    return roundMoney(Math.min(gross, val));
   };
 
   const updateItemDiscount = (
-    productId: string,
+    lineKeyOrProductId: string,
     type: "percentage" | "fixed",
     value: number
   ) => {
     const cleanVal = Math.max(0, Number(value) || 0);
     setCart((prev) =>
-      prev.map((item) =>
-        item.product.id === productId
+      prev.map((item) => {
+        const itemKey = getCartLineKey(item.product.id, item.variantId);
+        return itemKey === lineKeyOrProductId || item.product.id === lineKeyOrProductId
           ? {
               ...item,
               itemDiscountType: type,
               itemDiscountValue: cleanVal,
             }
-          : item
-      )
+          : item;
+      })
     );
   };
 
-  // Financial calculations
-  const subtotal = useMemo(() => {
-    return cart.reduce(
-      (acc, item) => acc + (item.customPrice ?? item.product.price) * item.quantity,
-      0
+  // Financial calculations (Subtotal reflects promotional unit prices automatically)
+  const originalCatalogSubtotal = useMemo(() => {
+    return roundMoney(
+      cart.reduce(
+        (acc, item) => acc + (item.customPrice ?? item.product.price) * item.quantity,
+        0
+      )
     );
   }, [cart]);
+
+  const subtotal = useMemo(() => {
+    return roundMoney(
+      cart.reduce((acc, item) => acc + getEffectiveUnitPrice(item) * item.quantity, 0)
+    );
+  }, [cart, cartPromotionPricing]);
 
   const activeDiscountScope = discountSetting.scope || "group";
 
@@ -651,19 +758,113 @@ export default function ShopDashboardPOS() {
 
     setIsSavingSale(true);
     try {
-      // 1. Build product snapshots for all items in the cart
+      // 0. Server-side promotion & price revalidation right before completing checkout
+      //    Handles promotions expiring, pausing, or changing while the cart was open.
+      let verifiedByLine: Record<string, AppliedPromotion | null> =
+        cartPromotionPricing.byLineKey;
+      let validationMode: SalePromotionSummary["validation"] =
+        cartPromotionPricing.appliedCount > 0 ? "client_only" : "none";
+      let validatedAt = Date.now();
+
+      if (shopPromotions.length > 0) {
+        try {
+          const checkRes = await promotionApi.validateCheckout(
+            cart.map((ci) => ({
+              lineKey: getCartLineKey(ci.product.id, ci.variantId),
+              productId: ci.product.id,
+              variantId: ci.variantId,
+              quantity: ci.quantity,
+              hasManualPrice: ci.customPrice !== undefined,
+            }))
+          );
+          validatedAt = checkRes.serverTime;
+          validationMode = "server";
+          const serverMap: Record<string, AppliedPromotion | null> = {};
+          for (const row of checkRes.lines) {
+            serverMap[row.lineKey] = row.promotion;
+          }
+
+          // If a promotion expired, activated, or product price changed mid-checkout, refresh & prompt cashier
+          const clientDiscount = roundMoney(cartPromotionPricing.totalPromotionDiscount);
+          const serverDiscount = roundMoney(checkRes.totalPromotionDiscount);
+          if (Math.abs(clientDiscount - serverDiscount) >= 0.01) {
+            setPromoClockMs(checkRes.serverTime);
+            // Sync any catalog price updates returned by the server
+            const serverPriceByLine = new Map(
+              checkRes.lines
+                .filter((l) => l.productFound)
+                .map((l) => [l.lineKey, l.originalUnitPrice])
+            );
+            if (serverPriceByLine.size > 0) {
+              setCart((prev) =>
+                prev.map((ci) => {
+                  const key = getCartLineKey(ci.product.id, ci.variantId);
+                  const freshPrice = serverPriceByLine.get(key);
+                  return freshPrice !== undefined && freshPrice !== ci.product.price
+                    ? { ...ci, product: { ...ci.product, price: freshPrice } }
+                    : ci;
+                })
+              );
+            }
+            setIsPaymentModalOpen(false);
+            alert(
+              `Promotional pricing updated at checkout (was -${currency} ${clientDiscount.toFixed(
+                2
+              )}, now -${currency} ${serverDiscount.toFixed(
+                2
+              )}). Totals have been refreshed — please review and confirm payment.`
+            );
+            return;
+          }
+          verifiedByLine = serverMap;
+        } catch (verifyErr) {
+          console.warn("[DashboardPOS] Checkout promo validation fallback:", verifyErr);
+        }
+      }
+
+      // 1. Build product snapshots + promotion summary for historical reporting accuracy
+      const promoSummaryMap = new Map<string, SalePromotionSummaryEntry>();
+
       const snapshotItems = cart.map((cartItem) => {
-        const unitPrice = cartItem.customPrice ?? cartItem.product.price;
-        const itemTotal = unitPrice * cartItem.quantity;
-        // Calculate line discount based on selected scope ("item" vs "group")
+        const lineKey = getCartLineKey(cartItem.product.id, cartItem.variantId);
+        const appliedPromo =
+          cartItem.customPrice !== undefined ? null : verifiedByLine[lineKey] || null;
+        const unitPrice =
+          cartItem.customPrice ??
+          (appliedPromo ? appliedPromo.promoUnitPrice : cartItem.product.price);
+        const itemTotal = roundMoney(unitPrice * cartItem.quantity);
+
+        // Calculate manual cashier discount based on selected scope ("item" vs "group")
         let lineDiscount = 0;
         if (activeDiscountScope === "item") {
           lineDiscount = getItemDiscountAmount(cartItem);
         } else {
           const ratio = subtotal > 0 ? itemTotal / subtotal : 0;
-          lineDiscount = discountAmount * ratio;
+          lineDiscount = roundMoney(discountAmount * ratio);
         }
-        const lineSubtotal = Math.max(0, itemTotal - lineDiscount);
+        const lineSubtotal = roundMoney(Math.max(0, itemTotal - lineDiscount));
+
+        if (appliedPromo) {
+          const existing = promoSummaryMap.get(appliedPromo.promotionId);
+          if (existing) {
+            existing.unitsSold += cartItem.quantity;
+            existing.discountTotal = roundMoney(
+              existing.discountTotal + appliedPromo.discountTotal
+            );
+            existing.revenue = roundMoney(existing.revenue + lineSubtotal);
+          } else {
+            promoSummaryMap.set(appliedPromo.promotionId, {
+              promotionId: appliedPromo.promotionId,
+              promotionName: appliedPromo.promotionName,
+              promotionVersion: appliedPromo.promotionVersion,
+              discountType: appliedPromo.discountType,
+              discountValue: appliedPromo.discountValue,
+              unitsSold: cartItem.quantity,
+              discountTotal: appliedPromo.discountTotal,
+              revenue: lineSubtotal,
+            });
+          }
+        }
 
         return {
           productId: cartItem.product.id,
@@ -673,6 +874,12 @@ export default function ShopDashboardPOS() {
           sku: cartItem.product.sku || cartItem.product.barcode || "SKU-GEN",
           barcode: cartItem.product.barcode || "",
           unitPrice,
+          ...(appliedPromo
+            ? {
+                originalUnitPrice: appliedPromo.originalUnitPrice,
+                promotion: appliedPromo,
+              }
+            : {}),
           costPrice: cartItem.product.costPrice ?? 0,
           quantity: cartItem.quantity,
           discount: lineDiscount,
@@ -683,6 +890,21 @@ export default function ShopDashboardPOS() {
           imageUrl: cartItem.product.imageUrl || "",
         };
       });
+
+      const promotionSummary: SalePromotionSummary | undefined =
+        promoSummaryMap.size > 0
+          ? {
+              promotions: [...promoSummaryMap.values()],
+              totalPromotionDiscount: roundMoney(
+                [...promoSummaryMap.values()].reduce(
+                  (acc, p) => acc + p.discountTotal,
+                  0
+                )
+              ),
+              validation: validationMode,
+              validatedAt,
+            }
+          : undefined;
 
       // 2. Persist to Firestore via salesService
       const savedSale = await createSaleRecord(shop.shopId, {
@@ -700,13 +922,14 @@ export default function ShopDashboardPOS() {
         items: snapshotItems,
         subtotal,
         discountSetting,
-        discountAmount,
+        discountAmount: roundMoney(discountAmount),
         taxRate,
-        taxAmount,
-        grandTotal,
+        taxAmount: roundMoney(taxAmount),
+        grandTotal: roundMoney(grandTotal),
         paymentMethod: method,
         cashReceived: tendered,
         change,
+        ...(promotionSummary ? { promotionSummary } : {}),
         // Attach registered customer if selected (walk-in = undefined)
         ...(selectedCustomer
           ? {
@@ -1007,17 +1230,44 @@ export default function ShopDashboardPOS() {
                 <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-2">
                   {filteredProducts.map((prod) => {
                     const isJustAdded = addedAnimationId === prod.id;
+                    const cardPromo =
+                      shopPromotions.length > 0
+                        ? findBestPromotionForLine(
+                            {
+                              lineKey: prod.id,
+                              productId: prod.id,
+                              categoryId: prod.category,
+                              brandId: prod.brandId,
+                              brandName: prod.brand,
+                              unitPrice: prod.price,
+                              quantity: 1,
+                            },
+                            shopPromotions,
+                            promoClockMs,
+                            currency
+                          )
+                        : null;
+
                     return (
                       <div
                         key={prod.id}
                         onClick={() => addToCart(prod)}
-                        className={`group relative p-2 rounded-xl bg-[#11131d]/70 hover:bg-[#151724]/90 backdrop-blur-xl border border-white/[0.07] hover:border-zinc-500/40 transition-all duration-150 active:scale-[0.98] cursor-pointer flex flex-col justify-between h-[116px] shadow-sm hover:shadow-xl hover:shadow-zinc-900/20 ${
-                          isJustAdded ? "ring-2 ring-zinc-400 scale-[0.98]" : ""
-                        }`}
+                        className={`group relative p-2 rounded-xl bg-[#11131d]/70 hover:bg-[#151724]/90 backdrop-blur-xl border transition-all duration-150 active:scale-[0.98] cursor-pointer flex flex-col justify-between h-[116px] shadow-sm hover:shadow-xl hover:shadow-zinc-900/20 ${
+                          cardPromo
+                            ? "border-emerald-500/30 hover:border-emerald-400/50"
+                            : "border-white/[0.07] hover:border-zinc-500/40"
+                        } ${isJustAdded ? "ring-2 ring-zinc-400 scale-[0.98]" : ""}`}
                       >
                         {/* Top Badges */}
-                        <div className="flex justify-between items-start w-full leading-none">
-                          {prod.badge ? (
+                        <div className="flex justify-between items-start w-full leading-none gap-1">
+                          {cardPromo ? (
+                            <span
+                              className="text-[7px] font-mono font-bold px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/35 truncate max-w-[75%]"
+                              title={`${cardPromo.promotionName}: ${cardPromo.discountLabel}`}
+                            >
+                              {cardPromo.discountLabel}
+                            </span>
+                          ) : prod.badge ? (
                             <span className="text-[7px] font-mono font-bold px-1 py-0.5 rounded bg-zinc-500/20 text-zinc-300 border border-zinc-500/30">
                               {prod.badge}
                             </span>
@@ -1026,7 +1276,7 @@ export default function ShopDashboardPOS() {
                               #{prod.barcode.slice(-4)}
                             </span>
                           )}
-                          <span className="text-[7px] font-mono text-zinc-500">
+                          <span className="text-[7px] font-mono text-zinc-500 shrink-0">
                             {prod.stock} stk
                           </span>
                         </div>
@@ -1042,9 +1292,20 @@ export default function ShopDashboardPOS() {
                             <h3 className="text-[9px] font-bold text-zinc-100 truncate group-hover:text-zinc-300 transition-colors leading-tight">
                               {prod.name}
                             </h3>
-                            <div className="text-[9.5px] font-black text-white mt-0.5 font-mono">
-                              {currency} {prod.price.toLocaleString()}
-                            </div>
+                            {cardPromo ? (
+                              <div className="flex items-baseline gap-1 mt-0.5 font-mono">
+                                <span className="text-[9.5px] font-black text-emerald-300">
+                                  {currency} {cardPromo.promoUnitPrice.toLocaleString()}
+                                </span>
+                                <span className="text-[7.5px] text-zinc-500 line-through">
+                                  {prod.price.toLocaleString()}
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="text-[9.5px] font-black text-white mt-0.5 font-mono">
+                                {currency} {prod.price.toLocaleString()}
+                              </div>
+                            )}
                           </div>
 
                           {/* Plus Add Button */}
@@ -1164,15 +1425,22 @@ export default function ShopDashboardPOS() {
                 </div>
               ) : (
                 cart.map((item) => {
-                  const grossLineTotal = (item.customPrice ?? item.product.price) * item.quantity;
+                  const lineKey = getCartLineKey(item.product.id, item.variantId);
+                  const appliedPromo =
+                    item.customPrice !== undefined
+                      ? null
+                      : cartPromotionPricing.byLineKey[lineKey] || null;
+                  const originalGross = item.product.price * item.quantity;
+                  const effectiveUnit = getEffectiveUnitPrice(item);
+                  const grossLineTotal = roundMoney(effectiveUnit * item.quantity);
                   const itemDiscAmt =
                     activeDiscountScope === "item" ? getItemDiscountAmount(item) : 0;
-                  const netLineTotal = Math.max(0, grossLineTotal - itemDiscAmt);
-                  const isEditingThisItemDiscount = editingItemDiscountId === item.product.id;
+                  const netLineTotal = roundMoney(Math.max(0, grossLineTotal - itemDiscAmt));
+                  const isEditingThisItemDiscount = editingItemDiscountId === lineKey;
 
                   return (
                     <div
-                      key={item.product.id}
+                      key={lineKey}
                       className="p-3 rounded-xl bg-white/[0.025] hover:bg-white/[0.04] border border-white/[0.06] transition-all flex flex-col gap-2 group"
                     >
                       <div className="flex items-center justify-between gap-3">
@@ -1187,15 +1455,41 @@ export default function ShopDashboardPOS() {
                             {item.product.name}
                           </div>
                           <div className="text-[10px] text-zinc-400 truncate">
-                            {item.product.specs}
+                            {item.variant
+                              ? `${item.variant}${item.product.specs ? ` • ${item.product.specs}` : ""}`
+                              : item.product.specs}
                           </div>
+
+                          {/* Applied Promotion Info (Original vs Promo Price, Discount Label & Promotion Name) */}
+                          {appliedPromo && (
+                            <div className="mt-1 space-y-0.5">
+                              <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-[9.5px] text-emerald-300 font-medium max-w-full">
+                                <Tag className="w-2.5 h-2.5 shrink-0" />
+                                <span className="truncate">{appliedPromo.promotionName}</span>
+                                <span className="font-mono font-bold shrink-0">
+                                  ({appliedPromo.discountLabel})
+                                </span>
+                              </div>
+                              <div className="text-[10px] font-mono text-zinc-400">
+                                <span className="line-through text-zinc-500 mr-1.5">
+                                  {currency} {appliedPromo.originalUnitPrice.toLocaleString()}
+                                </span>
+                                <span className="text-emerald-300 font-semibold">
+                                  {currency} {appliedPromo.promoUnitPrice.toLocaleString()}
+                                </span>
+                                <span className="text-zinc-500 ml-1">
+                                  (-{currency} {appliedPromo.discountTotal.toLocaleString()})
+                                </span>
+                              </div>
+                            </div>
+                          )}
 
                           {/* Quantity Stepper + Per-Product Discount Pill */}
                           <div className="flex items-center gap-2 mt-1.5 flex-wrap">
                             <div className="flex items-center gap-1.5">
                               <button
                                 type="button"
-                                onClick={() => updateQuantity(item.product.id, -1)}
+                                onClick={() => updateQuantity(lineKey, -1)}
                                 className="w-5 h-5 rounded-md bg-white/[0.06] hover:bg-white/[0.12] active:scale-95 text-zinc-300 flex items-center justify-center text-xs transition-colors cursor-pointer"
                               >
                                 <Minus className="w-3 h-3" />
@@ -1205,7 +1499,7 @@ export default function ShopDashboardPOS() {
                               </span>
                               <button
                                 type="button"
-                                onClick={() => updateQuantity(item.product.id, 1)}
+                                onClick={() => updateQuantity(lineKey, 1)}
                                 className="w-5 h-5 rounded-md bg-white/[0.06] hover:bg-white/[0.12] active:scale-95 text-zinc-300 flex items-center justify-center text-xs transition-colors cursor-pointer"
                               >
                                 <Plus className="w-3 h-3" />
@@ -1225,7 +1519,7 @@ export default function ShopDashboardPOS() {
                                   if (isEditingThisItemDiscount) {
                                     setEditingItemDiscountId(null);
                                   } else {
-                                    setEditingItemDiscountId(item.product.id);
+                                    setEditingItemDiscountId(lineKey);
                                     setItemDiscountMode(item.itemDiscountType || "fixed");
                                     setItemDiscountInput(
                                       item.itemDiscountValue ? String(item.itemDiscountValue) : ""
@@ -1256,16 +1550,21 @@ export default function ShopDashboardPOS() {
                         <div className="text-right shrink-0 flex flex-col items-end justify-between h-full">
                           <button
                             type="button"
-                            onClick={() => removeItem(item.product.id)}
+                            onClick={() => removeItem(lineKey)}
                             className="text-zinc-600 hover:text-red-400 transition-colors p-1"
                             title="Remove item"
                           >
                             <X className="w-3.5 h-3.5" />
                           </button>
                           <div className="mt-1">
-                            {activeDiscountScope === "item" && itemDiscAmt > 0 && (
+                            {(appliedPromo ||
+                              (activeDiscountScope === "item" && itemDiscAmt > 0)) && (
                               <div className="text-[10px] font-mono text-zinc-500 line-through">
-                                {currency} {grossLineTotal.toLocaleString(undefined, { minimumFractionDigits: 0 })}
+                                {currency}{" "}
+                                {(appliedPromo ? originalGross : grossLineTotal).toLocaleString(
+                                  undefined,
+                                  { minimumFractionDigits: 0 }
+                                )}
                               </div>
                             )}
                             <div className="text-xs font-black text-white font-mono">
@@ -1284,7 +1583,7 @@ export default function ShopDashboardPOS() {
                               onClick={() => {
                                 setItemDiscountMode("fixed");
                                 updateItemDiscount(
-                                  item.product.id,
+                                  lineKey,
                                   "fixed",
                                   parseFloat(itemDiscountInput) || 0
                                 );
@@ -1302,7 +1601,7 @@ export default function ShopDashboardPOS() {
                               onClick={() => {
                                 setItemDiscountMode("percentage");
                                 updateItemDiscount(
-                                  item.product.id,
+                                  lineKey,
                                   "percentage",
                                   parseFloat(itemDiscountInput) || 0
                                 );
@@ -1326,7 +1625,7 @@ export default function ShopDashboardPOS() {
                               const raw = e.target.value;
                               setItemDiscountInput(raw);
                               updateItemDiscount(
-                                item.product.id,
+                                lineKey,
                                 itemDiscountMode,
                                 parseFloat(raw) || 0
                               );
@@ -1344,7 +1643,7 @@ export default function ShopDashboardPOS() {
                               type="button"
                               onClick={() => {
                                 setItemDiscountInput("");
-                                updateItemDiscount(item.product.id, itemDiscountMode, 0);
+                                updateItemDiscount(lineKey, itemDiscountMode, 0);
                               }}
                               className="px-2 py-1 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 text-[10px] text-rose-300 font-semibold cursor-pointer"
                             >
@@ -1369,6 +1668,26 @@ export default function ShopDashboardPOS() {
 
             {/* Billing Financial Summary */}
             <div className="p-4 border-t border-white/[0.07] bg-[#0e0f19]/70 space-y-2.5 shrink-0">
+              {cartPromotionPricing.totalPromotionDiscount > 0 && (
+                <>
+                  <div className="flex justify-between text-xs text-zinc-500">
+                    <span>Original Price</span>
+                    <span className="font-mono line-through">
+                      {currency} {originalCatalogSubtotal.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-xs text-emerald-300">
+                    <span>
+                      Promotions ({cartPromotionPricing.appliedCount}{" "}
+                      {cartPromotionPricing.appliedCount === 1 ? "line" : "lines"})
+                    </span>
+                    <span className="font-mono font-semibold">
+                      -{currency} {cartPromotionPricing.totalPromotionDiscount.toFixed(2)}
+                    </span>
+                  </div>
+                </>
+              )}
+
               {/* Subtotal */}
               <div className="flex justify-between text-xs text-zinc-400">
                 <span>Subtotal</span>
@@ -2216,7 +2535,92 @@ export default function ShopDashboardPOS() {
         );
       })()}
 
-      {/* 8. Real-Time Bill Transfer Notification Toast */}
+      {/* 8. Product Variant Selector Modal */}
+      {variantPickerProduct && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl bg-[#10121a] border border-white/10 shadow-2xl overflow-hidden">
+            <div className="px-4 py-3.5 border-b border-white/10 flex items-center justify-between">
+              <div>
+                <h3 className="text-xs font-bold text-white">
+                  Select Variant — {variantPickerProduct.name}
+                </h3>
+                <p className="text-[10px] text-zinc-400">
+                  Choose a variant to add to the current bill
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setVariantPickerProduct(null)}
+                className="p-1 rounded-lg bg-white/5 text-zinc-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-3 max-h-72 overflow-y-auto space-y-2">
+              {(variantPickerProduct.variants || []).map((v) => {
+                const vLabel =
+                  [v.size, v.color].filter(Boolean).join(" / ") || v.sku;
+                const vPromo = findBestPromotionForLine(
+                  {
+                    lineKey: `${variantPickerProduct.id}__${v.id}`,
+                    productId: variantPickerProduct.id,
+                    variantId: v.id,
+                    categoryId: variantPickerProduct.category,
+                    brandId: variantPickerProduct.brandId,
+                    brandName: variantPickerProduct.brand,
+                    unitPrice: v.sellingPrice,
+                    quantity: 1,
+                  },
+                  shopPromotions,
+                  promoClockMs,
+                  currency
+                );
+                return (
+                  <button
+                    key={v.id}
+                    type="button"
+                    onClick={() => {
+                      addProductOrVariantToCart(variantPickerProduct, v);
+                      setVariantPickerProduct(null);
+                    }}
+                    className="w-full p-3 rounded-xl bg-white/[0.03] hover:bg-white/[0.07] border border-white/10 flex items-center justify-between text-left cursor-pointer"
+                  >
+                    <div>
+                      <div className="text-xs font-bold text-white">{vLabel}</div>
+                      <div className="text-[10px] text-zinc-400 font-mono">
+                        SKU: {v.sku} • {v.stockQuantity} in stock
+                      </div>
+                      {vPromo && (
+                        <div className="text-[10px] text-emerald-300 mt-0.5">
+                          {vPromo.promotionName} ({vPromo.discountLabel})
+                        </div>
+                      )}
+                    </div>
+                    <div className="text-right font-mono text-xs">
+                      {vPromo ? (
+                        <>
+                          <div className="text-[10px] text-zinc-500 line-through">
+                            {currency} {v.sellingPrice.toLocaleString()}
+                          </div>
+                          <div className="font-bold text-emerald-300">
+                            {currency} {vPromo.promoUnitPrice.toLocaleString()}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="font-bold text-white">
+                          {currency} {v.sellingPrice.toLocaleString()}
+                        </div>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 9. Real-Time Bill Transfer Notification Toast */}
       {transferToast && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-full bg-[#111422]/95 border border-indigo-500/40 text-white text-xs font-semibold shadow-2xl flex items-center gap-2 backdrop-blur animate-in fade-in duration-150">
           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />

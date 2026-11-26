@@ -39,6 +39,9 @@ export interface PublicDigitalReceiptItem {
   sku?: string;
   quantity: number;
   unitPrice: number;
+  originalUnitPrice?: number;
+  promotionName?: string;
+  promotionDiscountLabel?: string;
   discount: number;
   subtotal: number;
 }
@@ -58,6 +61,7 @@ export interface PublicDigitalReceipt {
   items: PublicDigitalReceiptItem[];
   itemCount: number;
   subtotal: number;
+  promotionSavings?: number;
   discountLabel?: string;
   discountAmount: number;
   taxName: string;
@@ -91,6 +95,7 @@ export interface InitiateWhatsAppHandoffInput {
   items: PublicDigitalReceiptItem[];
   itemCount: number;
   subtotal: number;
+  promotionSavings?: number;
   discountLabel?: string;
   discountAmount: number;
   taxName: string;
@@ -250,6 +255,13 @@ export async function initiateWhatsAppEReceiptHandoff(
     ...(item.sku ? { sku: String(item.sku) } : {}),
     quantity: Number(item.quantity) || 1,
     unitPrice: Number(item.unitPrice) || 0,
+    ...(typeof item.originalUnitPrice === "number" && item.originalUnitPrice > Number(item.unitPrice || 0)
+      ? { originalUnitPrice: Number(item.originalUnitPrice) }
+      : {}),
+    ...(item.promotionName ? { promotionName: String(item.promotionName) } : {}),
+    ...(item.promotionDiscountLabel
+      ? { promotionDiscountLabel: String(item.promotionDiscountLabel) }
+      : {}),
     discount: Number(item.discount) || 0,
     subtotal: Number(item.subtotal) || 0,
   }));
@@ -276,6 +288,9 @@ export async function initiateWhatsAppEReceiptHandoff(
     items: safeItems,
     itemCount: input.itemCount || safeItems.reduce((sum, item) => sum + item.quantity, 0),
     subtotal: Number(input.subtotal) || 0,
+    ...(typeof input.promotionSavings === "number" && input.promotionSavings > 0
+      ? { promotionSavings: Number(input.promotionSavings) }
+      : {}),
     ...(input.discountLabel ? { discountLabel: input.discountLabel } : {}),
     discountAmount: Number(input.discountAmount) || 0,
     taxName: input.taxName || safeReceiptSettings.taxName || "Tax / SST",

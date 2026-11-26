@@ -188,6 +188,9 @@ export default function ReceiptModal({
         sku: item.sku,
         quantity: item.quantity,
         unitPrice: item.unitPrice,
+        originalUnitPrice: item.originalUnitPrice,
+        promotionName: item.promotion?.promotionName,
+        promotionDiscountLabel: item.promotion?.discountLabel,
         discount: item.discount || 0,
         subtotal: item.subtotal,
       }));
@@ -202,10 +205,13 @@ export default function ReceiptModal({
       return {
         key: item.product.id,
         name: item.product.name,
-        variant: item.product.specs,
+        variant: item.variant || item.product.specs,
         sku: item.product.sku,
         quantity: item.quantity,
         unitPrice,
+        originalUnitPrice: undefined as number | undefined,
+        promotionName: undefined as string | undefined,
+        promotionDiscountLabel: undefined as string | undefined,
         discount: Math.round(itemDisc * 100) / 100,
         subtotal: Math.max(0, Math.round((lineGross - itemDisc) * 100) / 100),
       };
@@ -266,11 +272,15 @@ export default function ReceiptModal({
           sku: it.sku,
           quantity: it.quantity,
           unitPrice: it.unitPrice,
+          originalUnitPrice: it.originalUnitPrice,
+          promotionName: it.promotionName,
+          promotionDiscountLabel: it.promotionDiscountLabel,
           discount: it.discount,
           subtotal: it.subtotal,
         })),
         itemCount: totalItems,
         subtotal: finalSubtotal,
+        promotionSavings: persistedSale?.promotionSummary?.totalPromotionDiscount,
         discountLabel,
         discountAmount: finalDiscountAmount,
         taxName: receiptSettings.taxName || "Tax / SST",
@@ -518,11 +528,22 @@ export default function ReceiptModal({
                     <div className="flex justify-between items-center mt-0.5 text-zinc-700">
                       <span>
                         {item.quantity} × {formatMoney(item.unitPrice)}
+                        {item.originalUnitPrice && item.originalUnitPrice > item.unitPrice && (
+                          <span className="ml-1 line-through text-zinc-400">
+                            {formatMoney(item.originalUnitPrice)}
+                          </span>
+                        )}
                       </span>
                       <span className="font-bold text-zinc-900">
                         {formatMoney(item.subtotal)}
                       </span>
                     </div>
+                    {item.promotionName && (
+                      <div className="text-[10px] text-emerald-700">
+                        Promo: {item.promotionName}
+                        {item.promotionDiscountLabel ? ` (${item.promotionDiscountLabel})` : ""}
+                      </div>
+                    )}
                     {item.discount > 0 && (
                       <div className="text-[10px] text-emerald-700">
                         - {formatMoney(item.discount)} (Item Disc.)
@@ -538,6 +559,19 @@ export default function ReceiptModal({
                   <span>Subtotal</span>
                   <span>{formatMoney(finalSubtotal)}</span>
                 </div>
+                {receiptSettings.showDiscount &&
+                  (persistedSale?.promotionSummary?.totalPromotionDiscount ?? 0) > 0 && (
+                    <div className="flex justify-between text-emerald-700 font-medium">
+                      <span>Promotional Savings</span>
+                      <span>
+                        (Saved{" "}
+                        {formatMoney(
+                          persistedSale!.promotionSummary!.totalPromotionDiscount
+                        )}
+                        )
+                      </span>
+                    </div>
+                  )}
                 {receiptSettings.showDiscount && finalDiscountAmount > 0 && (
                   <div className="flex justify-between text-emerald-700 font-medium">
                     <span>

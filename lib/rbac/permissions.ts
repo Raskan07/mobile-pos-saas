@@ -471,6 +471,22 @@ export const MAIN_MENU_MODULE_REGISTRY: RegisteredModulePermission[] = [
     },
   },
   {
+    id: "promotions",
+    displayName: "Discount Management",
+    parentModule: null,
+    description: "Create, schedule, prioritize, and analyze promotional discounts across products, variants, categories, and brands.",
+    href: "/shop/promotions",
+    routePrefixes: ["/shop/promotions", "/v1-shop/promotions"],
+    iconName: "Percent",
+    defaultAccessByRole: {
+      admin: true,
+      manager: true,
+      partner: true,
+      cashier: false,
+      technician: false,
+    },
+  },
+  {
     id: "branch_management",
     displayName: "Branches",
     parentModule: null,

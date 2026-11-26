@@ -243,7 +243,34 @@ service cloud.firestore {
         allow delete: if isShopAdminFor(shopId);
       }
 
-      // 12. All other shop subcollections (products, installments, etc.)
+      // 12. Promotions & Discount Management (`shops/{shopId}/promotions/{promotionId}`)
+      //     - Strictly isolated by `shopId`.
+      //     - Readable by shop members (including cashiers for POS cart calculation).
+      //     - Writable only by shop admins or roles with `promotions` module permission.
+      match /promotions/{promotionId} {
+        allow read: if (!isSignedIn() || belongsToShop(shopId));
+        allow create, update: if request.resource.data.shopId == shopId && (
+          !isSignedIn() ||
+          isShopAdminFor(shopId) ||
+          hasModulePermission(shopId, 'promotions')
+        );
+        allow delete: if isShopAdminFor(shopId);
+      }
+
+      // 13. Promotion Analytics & Usage Ledger (`promotion_stats`, `promotion_usages`)
+      match /promotion_stats/{promotionId} {
+        allow read: if (!isSignedIn() || belongsToShop(shopId));
+        allow create, update: if request.resource.data.shopId == shopId;
+        allow delete: if false;
+      }
+
+      match /promotion_usages/{usageId} {
+        allow read: if (!isSignedIn() || belongsToShop(shopId));
+        allow create: if request.resource.data.shopId == shopId;
+        allow update, delete: if false;
+      }
+
+      // 14. All other shop subcollections (products, installments, etc.)
       match /{subcollection}/{docId} {
         allow read, write: if true;
       }

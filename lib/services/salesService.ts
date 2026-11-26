@@ -122,6 +122,10 @@ export async function createSaleRecord(
       sku: (item.sku || item.barcode || "SKU-GEN").trim().toUpperCase(),
       barcode: item.barcode?.trim() || "",
       unitPrice,
+      ...(typeof item.originalUnitPrice === "number"
+        ? { originalUnitPrice: Number(item.originalUnitPrice) }
+        : {}),
+      ...(item.promotion ? { promotion: item.promotion } : {}),
       costPrice: Number(item.costPrice) || 0,
       quantity,
       discount,
@@ -192,6 +196,7 @@ export async function createSaleRecord(
     updatedAt: now,
 
     // Optional fields — only include when defined (never write undefined to Firestore)
+    ...(input.promotionSummary ? { promotionSummary: input.promotionSummary } : {}),
     ...(input.customer && Object.values(input.customer).some(Boolean)
       ? {
           customer: {
@@ -376,6 +381,15 @@ export async function createSaleRecord(
             )
           )
           .catch(() => {}),
+        saleData.promotionSummary && saleData.promotionSummary.promotions.length > 0
+          ? import("./promotionService")
+              .then(({ recordPromotionUsageForSale }) =>
+                recordPromotionUsageForSale(normShopId, saleData)
+              )
+              .catch((promoErr) => {
+                console.warn("[SalesService] Promotion usage tracking notice:", promoErr);
+              })
+          : Promise.resolve(),
       ]);
     } catch (bgErr) {
       console.warn("[SalesService] Background post-sale sync notice:", bgErr);

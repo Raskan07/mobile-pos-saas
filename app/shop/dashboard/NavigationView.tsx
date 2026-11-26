@@ -22,6 +22,8 @@ import {
   Wrench,
   Lock,
   Building2,
+  Percent,
+  Tag,
 } from "lucide-react";
 import {
   subscribeToShopNotifications,
@@ -60,6 +62,8 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   Settings,
   CreditCard,
   Building2,
+  Percent,
+  Tag,
 };
 
 export default function NavigationView({ onClose, shopId }: NavigationViewProps) {

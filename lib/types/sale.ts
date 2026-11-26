@@ -11,6 +11,9 @@
  *   stay 100% accurate even if catalog items are updated, repriced, or deleted later.
  */
 
+import type { AppliedPromotion, SalePromotionSummary } from "./promotion";
+
+
 export interface SaleItemSnapshot {
   productId: string;           // Reference to original product ID
   name: string;                // Product name at time of sale
@@ -18,7 +21,9 @@ export interface SaleItemSnapshot {
   variantId?: string;          // Optional variant ID if applicable
   sku: string;                 // Product or variant SKU
   barcode?: string;            // Barcode scanned / used
-  unitPrice: number;           // Unit selling price at time of sale
+  unitPrice: number;           // Unit selling price at time of sale (after any promotion)
+  originalUnitPrice?: number;  // Catalog selling price prior to promotion (when promoted)
+  promotion?: AppliedPromotion; // Frozen promotion snapshot for historical reporting accuracy
   costPrice?: number;          // Cost price at time of sale for margin/profit calculation
   quantity: number;            // Quantity purchased
   discount: number;            // Discount allocated to this line item
@@ -181,6 +186,9 @@ export interface SaleRecord {
   whatsappHandoffCount?: number;
   whatsappTargetPhone?: string;
 
+  // Promotions applied at checkout (absent on pre-promotion sales — fully backward compatible)
+  promotionSummary?: SalePromotionSummary;
+
   // Timestamps
   createdAt: number;           // Unix millisecond timestamp
   createdAtISO: string;        // ISO 8601 string for human-readable audit
@@ -280,6 +288,7 @@ export interface CreateSaleInput {
     email?: string;
   };
   notes?: string;
+  promotionSummary?: SalePromotionSummary;
 }
 
 export interface SalesFilterOptions {

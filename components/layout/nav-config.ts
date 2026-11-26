@@ -27,6 +27,7 @@ import {
   Lock,
   Globe,
   Palette,
+  Percent,
 } from "lucide-react";
 import { LucideIcon } from "lucide-react";
 
@@ -57,6 +58,7 @@ export const NAV_CONFIG: NavSection[] = [
       { label: "Staff", href: "/sa-9x8f2k/staff", icon: Users },
       { label: "Roles", href: "/sa-9x8f2k/staff", icon: ShieldCheck },
       { label: "Subscriptions", href: "/sa-9x8f2k/subscriptions", icon: CreditCard },
+      { label: "Discount Management", href: "/sa-9x8f2k/promotions", icon: Percent },
       { label: "Messages", href: "/sa-9x8f2k/notifications", icon: Bell },
     ],
   },

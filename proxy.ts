@@ -43,6 +43,7 @@ const EXPLICIT_SUP_ADMIN_SUBPATHS = new Set([
   "staff",
   "settings",
   "subscriptions",
+  "promotions",
 ]);
 
 export async function proxy(request: NextRequest) {
